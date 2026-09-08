@@ -1,0 +1,17 @@
+services:
+  funasr:
+    image: funasr-env:local
+    working_dir: /workspace/Fun-ASR
+    stdin_open: true
+    tty: true
+    environment:
+      - HF_HOME=/workspace/.cache/huggingface
+    volumes:
+      - ..:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

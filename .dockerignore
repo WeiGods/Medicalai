@@ -1,0 +1,3 @@
+# Build context whitelist: the Dockerfile only needs requirements.txt.
+*
+!requirements.txt

@@ -9,3 +9,14 @@ build/
 
 # regression models (downloaded, not committed)
 runtime/llama.cpp/tests/models/
+
+# Project-local: model weights, audio and caches stay out of version control
+Fun-ASR-Nano-2512/
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.pt
+*.bin
+*.safetensors
+.cache/
