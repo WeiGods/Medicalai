@@ -1,13 +1,20 @@
 services:
   funasr:
-    image: funasr-env:local
+    image: medicalai-dev:local
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
     working_dir: /workspace/Fun-ASR
     stdin_open: true
     tty: true
+    ports:
+      - "10095:10095"
     environment:
       - HF_HOME=/workspace/.cache/huggingface
+      - VLLM_WSL2_ENABLE_PIN_MEMORY=1
+      - VLLM_USE_FLASHINFER_SAMPLER=0
     volumes:
-      - ..:/workspace
+      - .:/workspace/Fun-ASR
     deploy:
       resources:
         reservations:

@@ -671,7 +671,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fun-ASR-Nano Streaming WebSocket Server")
     parser.add_argument("--port", type=int, default=10095)
-    parser.add_argument("--model", type=str, default="FunAudioLLM/Fun-ASR-Nano-2512")
+    parser.add_argument("--model", type=str, default="./Fun-ASR-Nano-2512")
     parser.add_argument("--hub", type=str, default="ms", choices=["ms", "hf"])
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-context", action="store_true", default=True)
