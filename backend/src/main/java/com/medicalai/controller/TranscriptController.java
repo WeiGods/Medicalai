@@ -1,0 +1,28 @@
+package com.medicalai.controller;
+
+import com.medicalai.domain.AuthenticatedDoctor;
+import com.medicalai.dto.SaveTranscriptRequest;
+import com.medicalai.service.ClinicalWorkflowService;
+import com.medicalai.vo.TranscriptVO;
+import jakarta.validation.Valid;
+import java.util.UUID;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/visits/{visitId}/transcript")
+public class TranscriptController {
+    private final ClinicalWorkflowService service;
+    public TranscriptController(ClinicalWorkflowService service) { this.service = service; }
+
+    @GetMapping
+    public TranscriptVO get(@PathVariable UUID visitId,
+                            @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return service.transcript(visitId, current.doctor().id());
+    }
+
+    @PutMapping
+    public TranscriptVO save(@PathVariable UUID visitId, @Valid @RequestBody SaveTranscriptRequest request,
+                             @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return service.saveTranscript(visitId, current.doctor().id(), request);
+    }
+}

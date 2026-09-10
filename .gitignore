@@ -20,3 +20,6 @@ Fun-ASR-Nano-2512/
 *.bin
 *.safetensors
 .cache/
+**/target/
+**/node_modules/
+backend/.tools/

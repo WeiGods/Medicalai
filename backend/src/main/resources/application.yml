@@ -1,0 +1,36 @@
+server:
+  port: 8189
+logging:
+  level:
+    com.medicalai: INFO
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://192.168.1.30:5432/medicalai}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      connection-timeout: 5000
+  sql:
+    init:
+      mode: never
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    baseline-on-migrate: false
+    validate-on-migrate: true
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  servlet:
+    multipart:
+      max-file-size: 200MB
+      max-request-size: 210MB
+medicalai:
+  auth:
+    mode: ${AUTH_MODE:DEMO}
+  patient-directory:
+    mode: ${PATIENT_DIRECTORY_MODE:LOCAL_DEMO}
+  storage:
+    root: ${STORAGE_ROOT:./data/recordings}
+  ai:
+    base-url: ${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}
+    mock-fallback: ${AI_MOCK_FALLBACK:true}
