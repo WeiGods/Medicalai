@@ -41,7 +41,12 @@ public class GlobalExceptionHandler {
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
-    public ResponseEntity<ErrorVO> conflict(DataIntegrityViolationException e) {
+    public ResponseEntity<ErrorVO> conflict(DataIntegrityViolationException e, HttpServletRequest request) {
+        // Keep the stable API response while retaining the concrete constraint
+        // and endpoint in the server log.  Without this, an export constraint
+        // failure is indistinguishable from a workflow-state conflict.
+        LOG.warn("API data conflict: method={}, uri={}, message={}",
+                request.getMethod(), request.getRequestURI(), e.getMostSpecificCause().getMessage(), e);
         return ResponseEntity.status(409).body(new ErrorVO("DATA_CONFLICT", "数据状态冲突，请刷新后重试"));
     }
 

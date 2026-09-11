@@ -59,6 +59,7 @@ public class ClinicalWorkflowService {
     public RecordingVO upload(UUID visitId, UUID doctorId, MultipartFile file, Long durationMs) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
+        requireRecordEditable(visit.id());
         String name = file.getOriginalFilename() == null ? "" : file.getOriginalFilename();
         if (name.isBlank() || !name.toLowerCase(Locale.ROOT).matches(".*\\.(mp3|wav|m4a|webm)$")) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "INVALID_AUDIO", "仅支持 MP3、WAV、M4A 或 WEBM 录音");
@@ -80,6 +81,7 @@ public class ClinicalWorkflowService {
     public RecordingVO createSample(UUID visitId, UUID doctorId) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
+        requireRecordEditable(visit.id());
         UUID id = UUID.randomUUID();
         Recording recording = recordings.insert(new Recording(id, visit.id(), nextRecordingNo(visit.id()),
                 "SAMPLE", null, patient(visit).name() + "_门诊问诊.wav", "audio/wav", 503808L,
@@ -92,6 +94,7 @@ public class ClinicalWorkflowService {
     public TranscriptVO transcribe(UUID visitId, UUID doctorId) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
+        requireRecordEditable(visit.id());
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
@@ -150,7 +153,7 @@ public class ClinicalWorkflowService {
         Optional<RecordingMapper.TurnState> state = recordings.transcript(visit.id());
         String text = state.map(RecordingMapper.TurnState::transcript).orElse("");
         boolean edited = state.map(RecordingMapper.TurnState::edited).orElse(false);
-        boolean dirty = state.isPresent() && (!state.get().snapshotId().equals(snapshot.get().id()) || edited);
+        boolean dirty = state.isPresent() && !state.get().snapshotId().equals(snapshot.get().id());
         return new TranscriptVO(snapshot.get().id().toString(), snapshot.get().snapshotVersion(),
                 snapshot.get().snapshotHash(), snapshot.get().authorityStatus(), text, edited, dirty, turns);
     }
@@ -164,8 +167,19 @@ public class ClinicalWorkflowService {
         if (isConfirmed(visit.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
         }
-        recordings.saveTranscript(visit.id(), snapshot.id(), request.transcript().strip(), true);
-        records.audit(doctorId, visit.id(), "TRANSCRIPT_EDITED", snapshot.id());
+        String editedText = request.transcript().strip();
+        RecordingMapper.TurnState current = recordings.transcript(visit.id()).orElse(null);
+        if (current != null && editedText.equals(current.transcript())) {
+            return transcript(visitId, doctorId);
+        }
+        List<RecordingMapper.Turn> editedTurns = editedTurns(editedText);
+        if (editedTurns.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "TRANSCRIPT_EMPTY", "转写内容不能为空");
+        }
+        UUID editedSnapshotId = recordings.createEditedSnapshot(visit.id(), snapshot, editedTurns,
+                snapshotHash(visit.id(), editedTurns), doctorId);
+        recordings.saveTranscript(visit.id(), editedSnapshotId, editedText, true);
+        records.audit(doctorId, visit.id(), "TRANSCRIPT_EDITED", editedSnapshotId);
         return transcript(visitId, doctorId);
     }
 
@@ -173,10 +187,18 @@ public class ClinicalWorkflowService {
     public MedicalRecordVO generate(UUID visitId, UUID doctorId) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
+        requireRecordEditable(visit.id());
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
+        if (recordings.list(visit.id()).isEmpty() || recordings.list(visit.id()).stream()
+                .anyMatch(recording -> !"DONE".equals(recording.status()))) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_NOT_TRANSCRIBED", "请先完成全部录音转写");
+        }
         RecordingMapper.TurnState state = recordings.transcript(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "TRANSCRIPT_REQUIRED", "请先完成录音转写"));
+        if (!snapshot.id().equals(state.snapshotId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "SOURCE_CHANGED", "转写已更新，请重新确认当前转写后再生成病历");
+        }
         Patient patient = patient(visit);
         AiServiceClient.GenerateResponse response = ai.generate(snapshot.snapshotHash(),
                 dialogueForAi(state.transcript()), patientInfo(patient, visit));
@@ -259,7 +281,14 @@ public class ClinicalWorkflowService {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "当前病历版本已确认");
         }
         RecordingMapper.TurnState state = recordings.transcript(visit.id()).orElse(null);
-        if (state != null && !state.snapshotId().equals(version.sourceSnapshotId())) {
+        if (recordings.list(visit.id()).isEmpty() || recordings.list(visit.id()).stream()
+                .anyMatch(recording -> !"DONE".equals(recording.status()))) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_NOT_TRANSCRIBED", "请先完成全部录音转写");
+        }
+        DialogueSnapshot latestSnapshot = recordings.latestSnapshot(visit.id())
+                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
+        if (state == null || !latestSnapshot.id().equals(state.snapshotId())
+                || !latestSnapshot.id().equals(version.sourceSnapshotId())) {
             throw new BusinessException(HttpStatus.CONFLICT, "SOURCE_CHANGED", "录音或转写已更新，请重新生成病历");
         }
         MedicalRecordContent content = effectiveContent(version);
@@ -283,17 +312,21 @@ public class ClinicalWorkflowService {
     @Transactional
     public List<RecordExportVO> recordExport(UUID visitId, UUID doctorId, ExportMedicalRecordRequest request) {
         Visit visit = owned(visitId, doctorId, true);
-        requireActive(visit);
+        requireExportable(visit);
         MedicalRecordVersion version = records.currentVersion(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "RECORD_REQUIRED", "请先生成病历草稿"));
-        if (!isConfirmed(visit.id())) {
+        MedicalRecordMapper.ConfirmedVersion confirmedVersion = records.currentConfirmedVersion(visit.id()).orElse(null);
+        if (confirmedVersion == null || !confirmedVersion.versionId().equals(version.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_NOT_CONFIRMED", "请先确认当前病历版本");
         }
-        MedicalRecordMapper.ConfirmationRow confirmation = records.confirmations(visit.id()).stream()
-                .filter(c -> c.versionNo() == version.versionNo()).findFirst()
-                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "CONFIRMATION_REQUIRED", "确认记录不存在"));
-        RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmation.id(),
+        RecordExport reusable = records.reusableExport(version.recordId(), version.id(),
+                confirmedVersion.confirmationId(), request.format()).orElse(null);
+        if (reusable != null) {
+            return exports(visitId, doctorId);
+        }
+        RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
                 version.id(), request.format(), doctorId);
+        records.createExportJob(visit.id(), export.id(), request.format());
         records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", export.id());
         return exports(visitId, doctorId);
     }
@@ -365,6 +398,22 @@ public class ClinicalWorkflowService {
             dialogue.add(Map.of("role", role, "text", text));
         }
         return dialogue;
+    }
+
+    private List<RecordingMapper.Turn> editedTurns(String transcript) {
+        List<RecordingMapper.Turn> turns = new ArrayList<>();
+        long cursor = 0;
+        for (String line : transcript.split("\\R+")) {
+            String value = line.strip();
+            if (value.isEmpty()) continue;
+            String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR" : "PATIENT";
+            String text = value.replaceFirst("^(医生|患者)[：:]\\s*", "").strip();
+            if (text.isEmpty()) continue;
+            long end = cursor + Math.max(500, text.length() * 120L);
+            turns.add(new RecordingMapper.Turn(role, text, cursor, end));
+            cursor = end + 500;
+        }
+        return turns;
     }
 
     private Map<String, Object> patientInfo(Patient patient, Visit visit) {
@@ -458,6 +507,18 @@ public class ClinicalWorkflowService {
     private void requireActive(Visit visit) {
         if (!"ACTIVE".equals(visit.status())) {
             throw new BusinessException(HttpStatus.CONFLICT, "VISIT_NOT_ACTIVE", "请先开始本次接诊");
+        }
+    }
+
+    private void requireExportable(Visit visit) {
+        if (!Set.of("ACTIVE", "COMPLETED").contains(visit.status())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "VISIT_NOT_EXPORTABLE", "当前接诊状态不允许导出病历");
+        }
+    }
+
+    private void requireRecordEditable(UUID visitId) {
+        if (records.findRecordId(visitId).isPresent() && isConfirmed(visitId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
         }
     }
 

@@ -15,9 +15,9 @@ cd ai_service && pip install -r requirements.txt && uvicorn main:app --reload --
 
 ## 数据库
 
-`backend/src/main/resources/db/migration/V1__initial_schema.sql` 已包含医生、登录会话、患者、接诊、录音、录音会话、ASR utterance、最终对话、病历版本、确认记录和 AI 任务表。
+`backend/src/main/resources/db/migration/schema.sql` 已包含医生、登录会话、患者、接诊、录音、录音会话、ASR utterance、最终对话、病历版本、确认记录和 AI 任务表，并由 Spring Boot 在每次启动时执行。
 
-当前登录和患者列表使用内存 Mock，数据库迁移已准备好；下一步应把认证、患者同步和接诊写入 Repository，再接入 `medicalai_minimal_loop_v2` 的状态机规则。
+当前登录和患者列表使用内存 Mock，数据库初始化脚本已准备好；下一步应把认证、患者同步和接诊写入 Repository，再接入 `medicalai_minimal_loop_v2` 的状态机规则。
 
 ## 当前边界
 

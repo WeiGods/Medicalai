@@ -12,7 +12,6 @@ services:
       DB_URL: jdbc:postgresql://192.168.1.30:5432/medicalai
       DB_USERNAME: postgres
       DB_PASSWORD: postgres
-      FLYWAY_ENABLED: "true"
       AI_SERVICE_BASE_URL: http://ai:8000
       STORAGE_ROOT: /data/recordings
     ports:

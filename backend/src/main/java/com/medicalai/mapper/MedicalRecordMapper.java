@@ -108,14 +108,143 @@ public class MedicalRecordMapper {
                         rs.getString("display_name"), rs.getTimestamp("confirmed_at").toInstant()), visitId);
     }
 
+    public Optional<ConfirmedVersion> currentConfirmedVersion(UUID visitId) {
+        return jdbc.query("""
+                SELECT r.id AS record_id, v.id AS version_id, v.version_no, c.id AS confirmation_id
+                FROM medical_record r
+                JOIN medical_record_version v ON v.record_id=r.id AND v.version_no=r.current_version
+                JOIN medical_record_confirmation c ON c.record_id=r.id AND c.version_id=v.id
+                WHERE r.visit_id=? AND r.status='CONFIRMED'
+                  AND r.confirmed_version=r.current_version AND c.declaration=true
+                """, (rs, n) -> new ConfirmedVersion(rs.getObject("record_id", UUID.class),
+                        rs.getObject("version_id", UUID.class), rs.getInt("version_no"),
+                        rs.getObject("confirmation_id", UUID.class)), visitId).stream().findFirst();
+    }
+
+    public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format) {
+        return jdbc.query("""
+                SELECT e.id,e.record_id,v.version_no,e.format,e.status,d.display_name,e.created_at
+                FROM record_export e
+                JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=e.record_id
+                JOIN doctor d ON d.id=e.created_by
+                WHERE e.record_id=? AND e.version_id=? AND e.confirmation_id=? AND e.format=?
+                  AND e.status IN ('PENDING','RUNNING','SUCCEEDED')
+                ORDER BY e.created_at DESC LIMIT 1
+                """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
+                        rs.getInt("version_no"), rs.getString("format"), rs.getString("status"),
+                        rs.getString("display_name"), rs.getTimestamp("created_at").toInstant()),
+                recordId, versionId, confirmationId, format).stream().findFirst();
+    }
+
     public RecordExport insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
                                      String format, UUID doctorId) {
         UUID id = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO record_export(id,record_id,version_id,confirmation_id,format,status,object_key,created_by)
-                VALUES (?,?,?,?,?, 'SUCCEEDED', ?,?)
-                """, id, recordId, versionId, confirmationId, format, "client-generated", doctorId);
+                VALUES (?,?,?,?,?, 'PENDING', NULL,?)
+                """, id, recordId, versionId, confirmationId, format, doctorId);
         return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst().orElseThrow();
+    }
+
+    public UUID createExportJob(UUID visitId, UUID exportId, String format) {
+        UUID id = UUID.randomUUID();
+        String type = "DOCX".equalsIgnoreCase(format) ? "EXPORT_DOCX" : "EXPORT_PDF";
+        jdbc.update("""
+                INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,result_ref,provider_route)
+                VALUES (?,?,?,?,'PENDING',?,'BACKEND')
+                """, id, type, visitId, "export:" + exportId, exportId);
+        return id;
+    }
+
+    public Optional<ExportJob> claimNextExportJob(UUID leaseToken) {
+        List<ExportJob> jobs = jdbc.query("""
+                WITH candidate AS (
+                    SELECT j.id, j.result_ref
+                    FROM ai_job j
+                    JOIN record_export e ON e.id=j.result_ref
+                    WHERE j.job_type IN ('EXPORT_DOCX','EXPORT_PDF')
+                      AND j.status='PENDING' AND e.status='PENDING'
+                    ORDER BY j.created_at
+                    FOR UPDATE OF j SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE ai_job j
+                SET status='RUNNING', attempt_count=j.attempt_count+1,
+                    started_at=COALESCE(j.started_at,now()), locked_at=now(), lease_token=?
+                FROM candidate c
+                WHERE j.id=c.id
+                RETURNING j.id,j.result_ref,j.attempt_count
+                """, (rs, n) -> new ExportJob(rs.getObject("id", UUID.class),
+                        rs.getObject("result_ref", UUID.class), rs.getInt("attempt_count")), leaseToken);
+        if (jobs.isEmpty()) return Optional.empty();
+        ExportJob job = jobs.getFirst();
+        jdbc.update("UPDATE record_export SET status='RUNNING',error_message=NULL WHERE id=? AND status='PENDING'", job.exportId());
+        return Optional.of(job);
+    }
+
+    public void markExportSucceeded(UUID exportId, UUID jobId, String objectKey) {
+        jdbc.update("""
+                UPDATE record_export SET status='SUCCEEDED',object_key=?,error_message=NULL
+                WHERE id=? AND status='RUNNING'
+                """, objectKey, exportId);
+        jdbc.update("""
+                UPDATE ai_job SET status='SUCCEEDED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                WHERE id=? AND result_ref=?
+                """, jobId, exportId);
+    }
+
+    public void markExportFailed(UUID exportId, UUID jobId, int attempt, String error) {
+        if (attempt < 3) {
+            jdbc.update("UPDATE record_export SET status='PENDING',error_message=? WHERE id=?", error, exportId);
+            jdbc.update("""
+                    UPDATE ai_job SET status='PENDING',last_error=?,locked_at=NULL,lease_token=NULL
+                    WHERE id=? AND result_ref=?
+                    """, error, jobId, exportId);
+        } else {
+            jdbc.update("UPDATE record_export SET status='FAILED',error_message=? WHERE id=?", error, exportId);
+            jdbc.update("""
+                    UPDATE ai_job SET status='FAILED',finished_at=now(),last_error=?,locked_at=NULL,lease_token=NULL
+                    WHERE id=? AND result_ref=?
+                    """, error, jobId, exportId);
+        }
+    }
+
+    public Optional<ExportPayload> exportPayload(UUID exportId) {
+        return jdbc.query("""
+                SELECT e.id,e.format,e.version_id,e.record_id,
+                       r.visit_id,vi.visit_no,p.name AS patient_name,v.version_no,
+                       v.content_json,v.edited_content_json,
+                       d.display_name AS doctor_name,c.confirmed_at
+                FROM record_export e
+                JOIN medical_record r ON r.id=e.record_id
+                JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=r.id
+                JOIN medical_record_confirmation c ON c.id=e.confirmation_id
+                    AND c.record_id=r.id AND c.version_id=v.id
+                JOIN visit vi ON vi.id=r.visit_id
+                JOIN patient p ON p.id=vi.patient_id
+                JOIN doctor d ON d.id=c.doctor_id
+                WHERE e.id=? AND r.status='CONFIRMED'
+                  AND r.current_version=r.confirmed_version
+                  AND v.version_no=r.current_version AND c.declaration=true
+                """, (rs, n) -> new ExportPayload(rs.getObject("id", UUID.class),
+                        rs.getObject("record_id", UUID.class), rs.getObject("version_id", UUID.class),
+                        rs.getObject("visit_id", UUID.class), rs.getString("visit_no"),
+                        rs.getString("patient_name"), rs.getInt("version_no"), rs.getString("format"),
+                        rs.getString("content_json"), rs.getString("edited_content_json"),
+                        rs.getString("doctor_name"), rs.getTimestamp("confirmed_at").toInstant()), exportId)
+                .stream().findFirst();
+    }
+
+    public Optional<ExportDownload> findExportForDownload(UUID exportId, UUID doctorId) {
+        return jdbc.query("""
+                SELECT e.id,e.format,e.status,e.object_key,e.error_message
+                FROM record_export e
+                JOIN medical_record r ON r.id=e.record_id
+                JOIN visit v ON v.id=r.visit_id
+                WHERE e.id=? AND v.doctor_id=?
+                """, (rs, n) -> new ExportDownload(rs.getObject("id", UUID.class),
+                        rs.getString("format"), rs.getString("status"), rs.getString("object_key"),
+                        rs.getString("error_message")), exportId, doctorId).stream().findFirst();
     }
 
     public List<RecordExport> exportsByVisit(UUID visitId) {
@@ -133,19 +262,6 @@ public class MedicalRecordMapper {
                         rs.getTimestamp("created_at").toInstant()), visitId);
     }
 
-    public RecordExport markSucceeded(UUID exportId, UUID doctorId) {
-        jdbc.update("UPDATE record_export SET status='SUCCEEDED' WHERE id=?", exportId);
-        return jdbc.query("""
-                SELECT e.id,e.record_id,ver.version_no,e.format,e.status,d.display_name,e.created_at
-                FROM record_export e JOIN medical_record r ON r.id=e.record_id
-                JOIN visit v ON v.id=r.visit_id JOIN medical_record_version ver ON ver.id=e.version_id
-                JOIN doctor d ON d.id=e.created_by WHERE e.id=? AND v.doctor_id=?
-                """, (rs,n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
-                        rs.getInt("version_no"),
-                        rs.getString("format"), rs.getString("status"), rs.getString("display_name"),
-                        rs.getTimestamp("created_at").toInstant()), exportId, doctorId).stream().findFirst().orElseThrow();
-    }
-
     public void audit(UUID doctorId, UUID visitId, String action, UUID resourceId) {
         jdbc.update("INSERT INTO audit_log(doctor_id,visit_id,action,resource_id) VALUES (?,?,?,?)",
                 doctorId, visitId, action, resourceId);
@@ -157,4 +273,10 @@ public class MedicalRecordMapper {
 
     public record ConfirmationRow(UUID id, int versionNo, String doctorName, Instant confirmedAt) {}
     public record ExportRow(UUID id, int versionNo, String format, String status, String doctorName, Instant createdAt) {}
+    public record ConfirmedVersion(UUID recordId, UUID versionId, int versionNo, UUID confirmationId) {}
+    public record ExportJob(UUID jobId, UUID exportId, int attempt) {}
+    public record ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
+                                String patientName, int versionNo, String format, String contentJson,
+                                String editedContentJson, String doctorName, Instant confirmedAt) {}
+    public record ExportDownload(UUID id, String format, String status, String objectKey, String errorMessage) {}
 }

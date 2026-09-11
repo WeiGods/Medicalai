@@ -15,10 +15,12 @@ public class VisitService {
     private final VisitMapper visits;
     private final PatientMapper patients;
     private final DoctorMapper doctors;
+    private final AudioStorageService storage;
     private final Clock clock;
 
-    public VisitService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, Clock clock) {
-        this.visits=visits; this.patients=patients; this.doctors=doctors; this.clock=clock;
+    public VisitService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors,
+                        AudioStorageService storage, Clock clock) {
+        this.visits=visits; this.patients=patients; this.doctors=doctors; this.storage=storage; this.clock=clock;
     }
 
     public List<VisitVO> list(UUID doctorId) {
@@ -29,7 +31,13 @@ public class VisitService {
 
     @Transactional
     public VisitVO create(CreateVisitRequest request, Doctor doctor) {
-        Patient p=patients.findById(request.patientId()).orElseThrow(BusinessException::notFound);
+        Patient p=patients.findByIdForUpdate(request.patientId()).orElseThrow(BusinessException::notFound);
+        visits.blockingStatusForPatient(p.id(), doctor.id()).ifPresent(status -> {
+            if ("COMPLETED".equals(status) || "ARCHIVED".equals(status)) {
+                throw BusinessException.conflict("PATIENT_VISIT_COMPLETED", "该患者接诊已完成，暂不支持重复接诊");
+            }
+            throw BusinessException.conflict("PATIENT_VISIT_EXISTS", "该患者已有进行中的接诊");
+        });
         LocalDate today=LocalDate.now(clock);
         Integer age=p.birthDate()==null ? null : Period.between(p.birthDate(),today).getYears();
         return VisitVO.from(visits.create(UUID.randomUUID(),p,doctor,age,request.chiefComplaint(),today));
@@ -56,16 +64,19 @@ public class VisitService {
         if (!visits.hasConfirmedCurrentRecord(id)) {
             throw BusinessException.conflict("CONFIRMED_RECORD_REQUIRED","请先生成并确认当前病历");
         }
+        if (!visits.hasSuccessfulExportForCurrentRecord(id)) {
+            throw BusinessException.conflict("EXPORT_REQUIRED", "请至少成功导出一份当前确认病历");
+        }
         return VisitVO.from(visits.updateStatus(id,doctorId,"COMPLETED"));
     }
 
     @Transactional
-    public VisitVO cancel(UUID id, UUID doctorId) {
+    public void cancel(UUID id, UUID doctorId) {
         Visit visit=owned(id,doctorId,true);
-        if ("CANCELLED".equals(visit.status())) return VisitVO.from(visit);
         if (!Set.of("WAITING","ACTIVE").contains(visit.status())) throw invalidState();
         if (visits.hasOpenSession(id)) throw BusinessException.conflict("RECORDING_OPEN","请先停止录音");
-        return VisitVO.from(visits.updateStatus(id,doctorId,"CANCELLED"));
+        visits.deleteCancelledVisit(id, doctorId);
+        storage.deleteVisitAssets(id);
     }
 
     private Visit owned(UUID id, UUID doctorId, boolean lock) {

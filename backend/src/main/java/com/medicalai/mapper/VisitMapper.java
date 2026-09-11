@@ -45,6 +45,14 @@ public class VisitMapper {
                 Boolean.class,doctorId,id));
     }
 
+    public Optional<String> blockingStatusForPatient(UUID patientId, UUID doctorId) {
+        return jdbc.query("""
+                SELECT status FROM visit
+                WHERE patient_id=? AND doctor_id=? AND status IN ('WAITING','ACTIVE','COMPLETED','ARCHIVED')
+                ORDER BY created_at DESC,id DESC LIMIT 1
+                """, (rs, n) -> rs.getString("status"), patientId, doctorId).stream().findFirst();
+    }
+
     public boolean hasConfirmedCurrentRecord(UUID visitId) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS(
@@ -56,10 +64,29 @@ public class VisitMapper {
                 """, Boolean.class,visitId));
     }
 
+    public boolean hasSuccessfulExportForCurrentRecord(UUID visitId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(
+                  SELECT 1 FROM medical_record r
+                  JOIN medical_record_version v ON v.record_id=r.id AND v.version_no=r.current_version
+                  JOIN medical_record_confirmation c ON c.record_id=r.id AND c.version_id=v.id
+                  JOIN record_export e ON e.record_id=r.id AND e.version_id=v.id AND e.confirmation_id=c.id
+                  WHERE r.visit_id=? AND r.status='CONFIRMED' AND r.confirmed_version=r.current_version
+                    AND c.declaration=true AND e.status='SUCCEEDED'
+                    AND e.object_key IS NOT NULL AND e.object_key<>'' )
+                """, Boolean.class, visitId));
+    }
+
     public boolean hasOpenSession(UUID visitId) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS(SELECT 1 FROM recording_session WHERE visit_id=? AND status IN ('OPEN','STOPPING'))
                 """,Boolean.class,visitId));
+    }
+
+    public boolean hasIncompleteRecording(UUID visitId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM recording WHERE visit_id=? AND status<>'DONE')
+                """, Boolean.class, visitId));
     }
 
     public Visit updateStatus(UUID id, UUID doctorId, String status) {
@@ -71,5 +98,34 @@ public class VisitMapper {
                   updated_at=now(),updated_by=?,version=version+1
                 WHERE id=? AND doctor_id=? RETURNING *
                 """,ROW,status,status,status,status,doctorId,id,doctorId);
+    }
+
+    /** Deletes every persisted artifact of one cancelled visit in FK-safe order. */
+    public void deleteCancelledVisit(UUID visitId, UUID doctorId) {
+        jdbc.update("DELETE FROM audit_log WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM ai_job WHERE visit_id=?", visitId);
+        jdbc.update("""
+                DELETE FROM record_export e USING medical_record r
+                WHERE e.record_id=r.id AND r.visit_id=?
+                """, visitId);
+        jdbc.update("""
+                DELETE FROM medical_record_confirmation c USING medical_record r
+                WHERE c.record_id=r.id AND r.visit_id=?
+                """, visitId);
+        jdbc.update("""
+                DELETE FROM medical_record_version v USING medical_record r
+                WHERE v.record_id=r.id AND r.visit_id=?
+                """, visitId);
+        jdbc.update("DELETE FROM medical_record WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM visit_transcript WHERE visit_id=?", visitId);
+        jdbc.update("""
+                DELETE FROM dialogue_snapshot_source s USING dialogue_snapshot d
+                WHERE s.snapshot_id=d.id AND d.visit_id=?
+                """, visitId);
+        jdbc.update("DELETE FROM dialogue_snapshot WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM asr_utterance WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM recording_session WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM recording WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM visit WHERE id=? AND doctor_id=?", visitId, doctorId);
     }
 }

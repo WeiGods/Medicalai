@@ -13,11 +13,8 @@ spring:
       connection-timeout: 5000
   sql:
     init:
-      mode: never
-  flyway:
-    enabled: ${FLYWAY_ENABLED:true}
-    baseline-on-migrate: false
-    validate-on-migrate: true
+      mode: always
+      schema-locations: classpath:db/migration/schema.sql
   jackson:
     property-naming-strategy: SNAKE_CASE
   servlet:

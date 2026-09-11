@@ -6,6 +6,7 @@ import com.medicalai.service.VisitService;
 import com.medicalai.vo.VisitVO;
 import jakarta.validation.Valid;
 import java.util.*;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
@@ -41,7 +42,8 @@ public class VisitController {
     }
 
     @PostMapping("/{id}/cancel")
-    public VisitVO cancel(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return service.cancel(id, current.doctor().id());
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void cancel(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        service.cancel(id, current.doctor().id());
     }
 }
