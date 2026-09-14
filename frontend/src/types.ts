@@ -111,7 +111,7 @@ export interface RecordExport {
   id: string
   version_no: number
   format: 'DOCX' | 'PDF' | string
-  status: 'SUCCEEDED' | 'FAILED' | string
+  status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | string
   doctor_name: string
   created_at: string
 }

@@ -91,25 +91,51 @@ public class RecordingMapper {
 
     public UUID createSnapshot(UUID visitId, UUID recordingId, UUID sessionId, List<Turn> turns,
                                List<UUID> utteranceIds, String snapshotHash) {
+        supersedeAdopted(visitId);
+        UUID snapshotId = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO dialogue_snapshot(id,visit_id,recording_id,session_id,snapshot_version,snapshot_hash,authority_status,turns_json,created_by)
                 SELECT ?,?,?,?,?,?,?,?::jsonb,v.doctor_id FROM visit v WHERE v.id=?
-                """, UUID.randomUUID(), visitId, recordingId, sessionId, nextSnapshotVersion(visitId),
+                """, snapshotId, visitId, recordingId, sessionId, nextSnapshotVersion(visitId),
                 snapshotHash, "ADOPTED", turnsJson(turns), visitId);
-        UUID snapshotId = jdbc.queryForObject("SELECT id FROM dialogue_snapshot WHERE snapshot_hash=?", UUID.class, snapshotHash);
+        snapshotId = jdbc.queryForObject("SELECT id FROM dialogue_snapshot WHERE snapshot_hash=?", UUID.class, snapshotHash);
         for (UUID utteranceId : utteranceIds) {
             jdbc.update("INSERT INTO dialogue_snapshot_source(snapshot_id,utterance_id) VALUES (?,?)", snapshotId, utteranceId);
         }
         return snapshotId;
     }
 
+    /** Create a new adopted snapshot from doctor-edited transcript text. */
+    public UUID createEditedSnapshot(UUID visitId, DialogueSnapshot base, List<Turn> turns,
+                                     String snapshotHash, UUID doctorId) {
+        supersedeAdopted(visitId);
+        UUID snapshotId = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO dialogue_snapshot(id,visit_id,recording_id,session_id,snapshot_version,
+                                              snapshot_hash,authority_status,turns_json,created_by)
+                VALUES (?,?,?,?,?,?, 'ADOPTED',?::jsonb,?)
+                """, snapshotId, visitId, base.recordingId(), base.sessionId(), nextSnapshotVersion(visitId),
+                snapshotHash, turnsJson(turns), doctorId);
+        jdbc.update("""
+                INSERT INTO dialogue_snapshot_source(snapshot_id, utterance_id)
+                SELECT ?, utterance_id FROM dialogue_snapshot_source WHERE snapshot_id=?
+                """, snapshotId, base.id());
+        return snapshotId;
+    }
+
     public Optional<DialogueSnapshot> latestSnapshot(UUID visitId) {
         return jdbc.query("""
-                SELECT * FROM dialogue_snapshot WHERE visit_id=? ORDER BY snapshot_version DESC LIMIT 1
+                SELECT * FROM dialogue_snapshot
+                WHERE visit_id=? AND authority_status='ADOPTED'
+                ORDER BY snapshot_version DESC LIMIT 1
                 """, (rs, n) -> new DialogueSnapshot(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getObject("session_id", UUID.class),
                         rs.getInt("snapshot_version"), rs.getString("snapshot_hash"), rs.getString("authority_status"),
                         rs.getTimestamp("created_at").toInstant()), visitId).stream().findFirst();
+    }
+
+    public Optional<DialogueSnapshot> latestAdoptedSnapshot(UUID visitId) {
+        return latestSnapshot(visitId);
     }
 
     public Optional<Utterance> firstUtterance(UUID sessionId) {
@@ -122,7 +148,7 @@ public class RecordingMapper {
     }
 
     public Optional<TurnState> transcript(UUID visitId) {
-        return jdbc.query("SELECT * FROM visit_transcript WHERE visit_id=?", (rs, n) -> new TurnState(
+                return jdbc.query("SELECT * FROM visit_transcript WHERE visit_id=?", (rs, n) -> new TurnState(
                 rs.getObject("snapshot_id", UUID.class), rs.getString("transcript_text"), rs.getBoolean("edited"),
                 rs.getTimestamp("updated_at").toInstant()), visitId).stream().findFirst();
     }
@@ -140,6 +166,10 @@ public class RecordingMapper {
     private int nextSnapshotVersion(UUID visitId) {
         Integer n = jdbc.queryForObject("SELECT coalesce(max(snapshot_version),0) FROM dialogue_snapshot WHERE visit_id=?", Integer.class, visitId);
         return (n == null ? 0 : n) + 1;
+    }
+
+    private void supersedeAdopted(UUID visitId) {
+        jdbc.update("UPDATE dialogue_snapshot SET authority_status='SUPERSEDED' WHERE visit_id=? AND authority_status='ADOPTED'", visitId);
     }
 
     private String turnsJson(List<Turn> turns) {

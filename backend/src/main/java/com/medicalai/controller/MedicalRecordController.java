@@ -12,6 +12,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import java.util.List;
 import java.util.UUID;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
@@ -60,6 +62,7 @@ public class MedicalRecordController {
     }
 
     @PostMapping("/exports")
+    @ResponseStatus(HttpStatus.ACCEPTED)
     public List<RecordExportVO> export(@PathVariable UUID visitId,
                                        @Valid @RequestBody ExportMedicalRecordRequest request,
                                        @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
@@ -71,4 +74,5 @@ public class MedicalRecordController {
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.exports(visitId, current.doctor().id());
     }
+
 }

@@ -3,6 +3,7 @@ package com.medicalai.service;
 import com.medicalai.exception.BusinessException;
 import java.io.IOException;
 import java.nio.file.*;
+import java.util.Comparator;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.FileSystemResource;
@@ -47,5 +48,31 @@ public class AudioStorageService {
         } catch (InvalidPathException e) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "INVALID_PATH", "录音路径无效");
         }
+    }
+
+    /** Removes local audio and generated exports owned by a cancelled visit. */
+    public void deleteVisitAssets(UUID visitId) {
+        deleteDirectory(root.resolve(visitId.toString()));
+        deleteDirectory(root.resolve("exports").resolve(visitId.toString()));
+    }
+
+    private void deleteDirectory(Path directory) {
+        Path target = directory.normalize();
+        if (!target.startsWith(root) || target.equals(root) || !Files.exists(target)) return;
+        try (var paths = Files.walk(target)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    throw new StorageDeleteException(e);
+                }
+            });
+        } catch (IOException | StorageDeleteException e) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "STORAGE_DELETE_FAILED", "接诊文件清理失败", e);
+        }
+    }
+
+    private static final class StorageDeleteException extends RuntimeException {
+        private StorageDeleteException(IOException cause) { super(cause); }
     }
 }

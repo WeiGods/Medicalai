@@ -10,9 +10,14 @@ services:
       context: ./backend
     environment:
       DB_URL: jdbc:postgresql://192.168.1.30:5432/medicalai
+<<<<<<< HEAD
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       FLYWAY_ENABLED: "true"
+=======
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+>>>>>>> c813c019c75f2b46a2400d94744efb12bfadcbd5
       AI_SERVICE_BASE_URL: http://ai:8000
       STORAGE_ROOT: /data/recordings
     ports:

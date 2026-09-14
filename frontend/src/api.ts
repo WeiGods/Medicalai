@@ -65,7 +65,7 @@ export const api = {
   }),
   startVisit: (id: string) => request<Visit>(`/api/v1/visits/${id}/start`, { method: 'POST' }),
   completeVisit: (id: string) => request<Visit>(`/api/v1/visits/${id}/complete`, { method: 'POST' }),
-  cancelVisit: (id: string) => request<Visit>(`/api/v1/visits/${id}/cancel`, { method: 'POST' }),
+  cancelVisit: (id: string) => request<void>(`/api/v1/visits/${id}/cancel`, { method: 'POST' }),
 
   recordings: (visitId: string) => request<Recording[]>(`/api/v1/visits/${visitId}/recordings`),
   uploadRecording: (visitId: string, file: File, durationMs: number) => {
@@ -99,6 +99,15 @@ export const api = {
     body: JSON.stringify({ format })
   }),
   exports: (visitId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`),
+  exportStatus: (exportId: string) => request<{ id: string; format: string; status: string; object_key?: string | null; error_message?: string | null }>(`/api/v1/exports/${exportId}`),
+  exportBlob: async (exportId: string) => {
+    const headers = new Headers()
+    const token = localStorage.getItem('medicalai_token')
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+    const response = await fetch(`${base}/api/v1/exports/${exportId}/download`, { headers })
+    if (!response.ok) throw new Error(`导出文件下载失败（${response.status}）`)
+    return response.blob()
+  },
   audioUrl: (recordingId: string) => `${base}/api/v1/recordings/${recordingId}/audio`,
   /**
    * Audio is protected by the same bearer-token interceptor as the rest of the

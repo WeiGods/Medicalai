@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../api'
-import { downloadDocx, printRecord, type ExportRecord } from '../exportRecord'
 import Icon from './Icon.vue'
 import type { Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
 
@@ -9,7 +8,8 @@ const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export' | 'audit' | 'config'
-type ModalKind = 'new-visit' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'pdf' | 'help' | 'activity' | null
+type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export'
+type ModalKind = 'new-visit' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | null
 type NewPatientMode = 'existing' | 'manual'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 
@@ -51,6 +51,7 @@ let recorderStream: MediaStream | null = null
 let recordChunks: Blob[] = []
 let audioObjectUrl: string | null = null
 let audioLoadAbort: AbortController | null = null
+let visitStateRevision = 0
 const recordingState = ref<'idle' | 'recording' | 'paused'>('idle')
 
 
@@ -59,7 +60,9 @@ watch(modal, async value => {
   if (value === 'new-visit') {
     modalError.value = ''
     newPatientMode.value = 'existing'
-    newPatientId.value = selectedPatientId.value || patients.value[0]?.id || ''
+    newPatientId.value = canCreateVisit(selectedPatientId.value)
+      ? selectedPatientId.value
+      : patients.value.find(patient => canCreateVisit(patient.id))?.id || ''
     newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
   }
   if (value) {
@@ -74,7 +77,7 @@ const titles: Record<MainView, [string, string]> = {
   transcript: ['转写结果', '回看医患对话，核对并编辑本次接诊采用的转写文本。'],
   record: ['病历展示与编辑', '按照标准模板整理记录，由医生核对与完善。'],
   confirm: ['医生确认', '核对必填信息，确认本次接诊的病历版本。'],
-  export: ['病历导出', '将已确认的病历保存为 Word，或打印为 PDF。'],
+  export: ['病历导出', '将已确认的病历由后端生成 Word 或 PDF 文件。'],
   audit: ['日志审计', '查看当前接诊的确认与导出审计记录。'],
   config: ['系统配置', '查看当前服务的接入环境与健康状态。']
 }
@@ -101,7 +104,9 @@ const recordFields = [
 function patientVisit(patientId: string): Visit | null {
   if (!patientId) return null
   const list = visits.value
-    .filter(visit => visit.patient_id === patientId)
+    // Cancelled visits are deleted by the backend and are ignored here for
+    // compatibility with older data that may still contain a cancelled row.
+    .filter(visit => visit.patient_id === patientId && visit.status !== 'CANCELLED')
     .slice()
     .sort((a, b) => {
       const priority = (status: string) => status === 'ACTIVE' ? 0 : status === 'WAITING' ? 1 : 2
@@ -121,6 +126,15 @@ function statusClass(visit: Visit | null) {
   return ({ WAITING: 'waiting', ACTIVE: 'active', COMPLETED: 'completed', CANCELLED: 'cancelled', ARCHIVED: 'archived' } as Record<string, string>)[status] || 'waiting'
 }
 
+function exportStatusLabel(status: string) {
+  return ({
+    PENDING: '排队中',
+    RUNNING: '生成中',
+    SUCCEEDED: '已完成',
+    FAILED: '失败'
+  } as Record<string, string>)[status] || status
+}
+
 function compactVisitNo(value: string | null | undefined) {
   if (!value) return '待创建'
   const visitNo = String(value)
@@ -133,6 +147,7 @@ function patientVisitNo(patientId: string) {
 }
 
 const currentPatient = computed(() => patients.value.find(p => p.id === selectedPatientId.value) || null)
+const canCreateVisit = (patientId: string) => !patientVisit(patientId)
 const currentVisit = computed(() => {
   return patientVisit(selectedPatientId.value)
 })
@@ -143,6 +158,7 @@ const queuePatients = computed(() => {
     .some(value => String(value || '').toLowerCase().includes(keyword)))
 })
 const closed = computed(() => !!currentVisit.value && ['COMPLETED', 'CANCELLED', 'ARCHIVED'].includes(currentVisit.value.status))
+const completed = computed(() => currentVisit.value?.status === 'COMPLETED')
 const waiting = computed(() => !currentVisit.value || currentVisit.value.status === 'WAITING')
 const active = computed(() => currentVisit.value?.status === 'ACTIVE')
 const allTranscribed = computed(() => recordings.value.length > 0 && recordings.value.every(r => r.status === 'DONE'))
@@ -151,13 +167,23 @@ const exported = computed(() => !!record.value && exports.value.some(item =>
   item.version_no === record.value?.version_no && item.status === 'SUCCEEDED'))
 const sourceDirty = computed(() => !!record.value?.source_dirty)
 const locked = computed(() => closed.value || confirmed.value || !!actionBusy.value)
+const workflowView = computed<WorkflowView>(() => {
+  if (waiting.value) return 'workbench'
+  if (!recordings.value.length || !allTranscribed.value) return 'audio'
+  if (sourceDirty.value) return 'transcript'
+  if (!record.value?.record_id) return 'transcript'
+  if (!confirmed.value) return view.value === 'confirm' ? 'confirm' : 'record'
+  return 'export'
+})
 const stage = computed(() => {
-  if (waiting.value) return 0
-  if (!recordings.value.length) return 1
-  if (!allTranscribed.value) return 2
-  if (!record.value?.record_id) return 3
-  if (!confirmed.value) return 4
-  return 5
+  const stages: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'confirm', 'export']
+  // A completed visit is immutable, but its retained artifacts are still
+  // reviewable. Highlight the page the doctor is reviewing rather than
+  // always pinning the progress indicator to the final step.
+  if (completed.value && view.value !== 'workbench' && stages.includes(view.value as WorkflowView)) {
+    return stages.indexOf(view.value as WorkflowView)
+  }
+  return stages.indexOf(workflowView.value)
 })
 const activeCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'ACTIVE').length)
 const waitingCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'WAITING').length)
@@ -239,6 +265,7 @@ async function refreshCore(keepSelection = true) {
 
 async function refreshVisitState() {
   const visit = currentVisit.value
+  const revision = ++visitStateRevision
   if (!visit) {
     recordings.value = []
     transcript.value = null
@@ -256,6 +283,7 @@ async function refreshVisitState() {
     api.confirmations(visit.id),
     api.exports(visit.id)
   ])
+  if (revision !== visitStateRevision || currentVisit.value?.id !== visit.id) return
   recordings.value = recordingList
   transcript.value = transcriptState
   record.value = recordState
@@ -277,20 +305,51 @@ async function loadAll(keepSelection = true) {
   }
 }
 
-function selectPatient(patientId: string) {
-  if (busy.value) return
+async function selectPatient(patientId: string) {
+  if (busy.value || actionBusy.value) return
+  if (recordingState.value !== 'idle' || recorder) {
+    toast('请先结束当前网页录音，再切换患者。')
+    return
+  }
   stopAudio()
-  stopRecorder()
+  visitStateRevision += 1
   selectedPatientId.value = patientId
   newPatientId.value = patientId
   view.value = 'workbench'
   transcriptTab.value = 'dialogue'
-  loadAll(true)
+  await loadAll(true)
+  navigate(workflowView.value)
 }
 
 function navigate(next: MainView) {
-  view.value = next
+  const workflowViews: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'confirm', 'export']
+  if (!workflowViews.includes(next as WorkflowView)) {
+    view.value = next
+  } else {
+    const requested = next as WorkflowView
+    const current = workflowView.value
+    if (completed.value && requested !== 'workbench') {
+      view.value = requested
+    } else if (completed.value) {
+      view.value = workflowView.value
+      toast('已完成接诊仅支持查看步骤 02 至 06。')
+    } else {
+    const sameStep = requested === current
+    const reviewTransition = (requested === 'record' || requested === 'confirm')
+      && (current === 'record' || current === 'confirm')
+      && !!record.value?.record_id && !confirmed.value
+    if (sameStep || reviewTransition) view.value = requested
+    else {
+      view.value = current
+      toast('请按当前接诊流程完成本步骤后再继续。')
+    }
+    }
+  }
   window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function showWorkflowStep() {
+  navigate(workflowView.value)
 }
 
 async function createAndStart(patientId: string) {
@@ -328,37 +387,19 @@ async function startVisit() {
   }
 }
 
-function nextPatientAfter(patientId: string) {
-  if (!patients.value.length) return null
-  const index = patients.value.findIndex(patient => patient.id === patientId)
-  const ordered = index < 0
-    ? patients.value
-    : [...patients.value.slice(index + 1), ...patients.value.slice(0, index + 1)]
-  return ordered.find(patient => patient.id !== patientId && visits.value.some(visit =>
-    visit.patient_id === patient.id && !['COMPLETED', 'CANCELLED', 'ARCHIVED'].includes(visit.status)
-  )) || ordered.find(patient => patient.id !== patientId) || null
-}
-
-async function switchToNextPatient(previousPatientId: string) {
-  const next = nextPatientAfter(previousPatientId)
-  if (!next) return
-  selectedPatientId.value = next.id
-  newPatientId.value = next.id
-  view.value = 'workbench'
-  transcriptTab.value = 'dialogue'
-  await refreshVisitState()
-}
-
 async function doCancel() {
   if (!currentVisit.value) return
-  const previousPatientId = selectedPatientId.value
+  if (recordingState.value !== 'idle' || recorder) {
+    modalError.value = '请先结束当前网页录音，再取消接诊。'
+    return
+  }
   busy.value = true
   try {
     await api.cancelVisit(currentVisit.value.id)
     modal.value = null
     await loadAll(true)
-    await switchToNextPatient(previousPatientId)
-    toast('本次接诊已取消，可切换下一位患者。')
+    navigate('workbench')
+    toast('本次接诊及其录音、转写、病历和导出文件已清空。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '取消接诊失败')
   } finally {
@@ -368,14 +409,13 @@ async function doCancel() {
 
 async function doFinish() {
   if (!currentVisit.value) return
-  const previousPatientId = selectedPatientId.value
   busy.value = true
   try {
     await api.completeVisit(currentVisit.value.id)
     modal.value = null
     await loadAll(true)
-    await switchToNextPatient(previousPatientId)
-    toast('本次接诊已完成并归档。')
+    navigate('export')
+    toast('本次接诊已完成，完整记录已保留。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '结束接诊失败')
   } finally {
@@ -421,6 +461,10 @@ async function createNewVisit() {
     modalError.value = '请选择一位患者。'
     return
   }
+  if (!canCreateVisit(newPatientId.value)) {
+    modalError.value = '该患者已有接诊，完成接诊后不支持重复接诊。'
+    return
+  }
   modal.value = null
   await createAndStart(newPatientId.value)
 }
@@ -428,7 +472,9 @@ async function createNewVisit() {
 function openNewVisitModal() {
   modalError.value = ''
   newPatientMode.value = 'existing'
-  newPatientId.value = selectedPatientId.value || patients.value[0]?.id || ''
+  newPatientId.value = canCreateVisit(selectedPatientId.value)
+    ? selectedPatientId.value
+    : patients.value.find(patient => canCreateVisit(patient.id))?.id || ''
   newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
   modal.value = 'new-visit'
 }
@@ -501,6 +547,7 @@ async function startTranscription() {
     transcriptDraft.value = transcript.value.transcript
     addLog('完成录音转写')
     await loadAll(true)
+    navigate('transcript')
     toast('转写完成，请核对文本并生成病历。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '转写失败')
@@ -520,6 +567,7 @@ async function saveTranscript() {
     transcript.value = await api.saveTranscript(currentVisit.value.id, transcriptDraft.value.trim())
     addLog('保存采用的转写文本')
     await loadAll(true)
+    navigate('transcript')
     toast('转写文本已保存，可生成病历。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '保存转写失败')
@@ -631,6 +679,7 @@ async function generateRecord() {
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
     addLog(`生成病历草稿 v${record.value.version_no}`)
     await loadAll(true)
+    navigate('record')
     toast('病历草稿已生成，请医生核对。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '病历生成失败')
@@ -646,6 +695,7 @@ async function saveDraft() {
     record.value = await api.saveMedicalRecord(currentVisit.value.id, recordForm.value)
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
     await loadAll(true)
+    navigate('record')
     toast('病历草稿已保存。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '保存病历失败')
@@ -676,6 +726,10 @@ function requestConfirm() {
     toast('请完善：' + missingFields.value.join('、'))
     return
   }
+  if (view.value !== 'confirm') {
+    navigate('confirm')
+    return
+  }
   modalError.value = ''
   confirmChecked.value = false
   modal.value = 'confirm'
@@ -692,6 +746,7 @@ async function doConfirm() {
     addLog(`${props.doctor.display_name}医生确认病历 v${record.value.version_no}`)
     modal.value = null
     await loadAll(true)
+    navigate('export')
     toast('医生确认已保存，现在可以导出当前版本。')
   } catch (error) {
     modalError.value = error instanceof Error ? error.message : '确认失败'
@@ -703,54 +758,74 @@ async function doConfirm() {
 async function recordExportLog(format: 'DOCX' | 'PDF') {
   if (!currentVisit.value) return
   exports.value = await api.recordExport(currentVisit.value.id, format)
-  addLog(format === 'DOCX' ? '发起 Word 导出' : '确认已保存 PDF')
+  addLog(format === 'DOCX' ? '发起 Word 导出' : '发起 PDF 导出')
+}
+
+async function waitForExport(format: 'DOCX' | 'PDF') {
+  if (!currentVisit.value || !record.value) return null
+  const versionNo = record.value.version_no
+  let item = exports.value.find(e => e.format === format && e.version_no === versionNo)
+  // Reuse an already completed export (especially for completed visits) instead
+  // of creating duplicate jobs every time the user opens the export page.
+  if (item?.status === 'SUCCEEDED') return item.id
+  if (!item || item.status === 'FAILED') {
+    await recordExportLog(format)
+    item = exports.value.find(e => e.format === format && e.version_no === versionNo)
+  }
+  if (!item) return null
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const state = await api.exportStatus(item.id)
+    if (state.status === 'SUCCEEDED') return item.id
+    if (state.status === 'FAILED') throw new Error(state.error_message || '病历导出失败')
+    await new Promise(resolve => window.setTimeout(resolve, 500))
+  }
+  throw new Error('导出处理超时，请稍后重试')
+}
+
+async function downloadExport(exportId: string, format: 'DOCX' | 'PDF') {
+  const blob = await api.exportBlob(exportId)
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `medical-record-${exportId}.${format === 'DOCX' ? 'docx' : 'pdf'}`
+  link.click()
+  URL.revokeObjectURL(url)
 }
 
 async function exportWord() {
-  if (!record.value?.content || !confirmed.value) return
-  const content = record.value.content
-  const payload: ExportRecord = {
-    patientName: content.name,
-    visitId: currentVisit.value?.visit_no || '',
-    recordId: `MR-${currentVisit.value?.visit_no || ''}`,
-    version: `v${record.value.version_no}`,
-    doctor: content.doctor,
-    confirmedAt: formatDateTime(record.value.confirmed_at),
-    fields: recordFields.map(field => ({ section: sectionOf(field.key), label: field.label, value: String(record.value?.content?.[field.key] ?? '') }))
-  }
-  downloadDocx(payload)
-  await recordExportLog('DOCX')
-  await loadAll(true)
-  toast('Word 病历已生成并发起下载。')
+  if (busy.value || !record.value?.content || !confirmed.value) return
+  busy.value = true
+  try {
+    const exportId = await waitForExport('DOCX')
+    if (exportId) await downloadExport(exportId, 'DOCX')
+    await loadAll(true)
+    toast('Word 病历已生成并下载。')
+  } catch (error) { toast(error instanceof Error ? error.message : 'Word 导出失败') }
+  finally { busy.value = false }
 }
 
 async function exportPdf() {
-  if (!record.value?.content || !confirmed.value) return
-  const content = record.value.content
-  const payload: ExportRecord = {
-    patientName: content.name,
-    visitId: currentVisit.value?.visit_no || '',
-    recordId: `MR-${currentVisit.value?.visit_no || ''}`,
-    version: `v${record.value.version_no}`,
-    doctor: content.doctor,
-    confirmedAt: formatDateTime(record.value.confirmed_at),
-    fields: recordFields.map(field => ({ section: sectionOf(field.key), label: field.label, value: String(record.value?.content?.[field.key] ?? '') }))
+  if (busy.value || !record.value?.content || !confirmed.value) return
+  busy.value = true
+  try {
+    const exportId = await waitForExport('PDF')
+    if (exportId) await downloadExport(exportId, 'PDF')
+    await loadAll(true)
+    toast('PDF 病历已生成并下载。')
+  } catch (error) { toast(error instanceof Error ? error.message : 'PDF 导出失败') }
+  finally { busy.value = false }
+}
+
+async function exportFromBottom() {
+  if (!confirmed.value || busy.value) return
+  if (view.value !== 'export') {
+    navigate('export')
+    return
   }
-  printRecord(payload)
-  modal.value = 'pdf'
-}
-
-async function pdfSaved() {
-  await recordExportLog('PDF')
-  modal.value = null
-  await loadAll(true)
-  toast('已记录 PDF 保存完成，可以结束接诊。')
-}
-
-function sectionOf(key: string) {
-  if (['name', 'gender', 'age', 'phone'].includes(key)) return '基本信息'
-  if (['chief', 'present', 'past'].includes(key)) return '就诊内容'
-  return '诊疗记录'
+  // The bottom action is available on every workflow page. Once already on
+  // the export page, make it useful by exporting the default Word document;
+  // PDF remains available through the explicit format card above.
+  await exportWord()
 }
 
 async function playRecording(item: Recording) {
@@ -837,6 +912,7 @@ function updateField(key: string, event: Event) {
 
 onMounted(async () => {
   await loadAll(false)
+  navigate(workflowView.value)
 })
 
 onUnmounted(() => {
@@ -859,7 +935,7 @@ defineExpose({ selectPatient })
       </div>
       <div class="nav-label">工作空间</div>
       <nav class="nav-list">
-        <button class="nav-item" :class="{ active: view === 'workbench' }" @click="navigate('workbench')">
+        <button class="nav-item" :class="{ active: view === 'workbench' }" @click="showWorkflowStep()">
           <Icon name="users" /><span>患者 / 接诊</span><span class="nav-count">{{ String(openVisitCount).padStart(2, '0') }}</span>
         </button>
         <button class="nav-item" :class="{ active: view === 'audit' }" @click="navigate('audit')"><Icon name="list" />日志审计</button>
@@ -948,13 +1024,14 @@ defineExpose({ selectPatient })
             <button class="btn" :disabled="!exported || busy" title="当前版本确认并完成导出后可结束接诊" @click="modal='finish'"><Icon name="stop" />结束接诊</button>
             <button class="btn" :disabled="busy" @click="modal='cancel'">取消接诊</button>
           </template>
-          <button v-else class="btn" :disabled="busy" @click="createAndStart(currentPatient?.id || '')"><Icon name="plus" />再次接诊</button>
+          <span v-else class="small-muted">该患者接诊已完成，不支持重复接诊</span>
         </div>
       </section>
 
       <nav class="steps" aria-label="接诊流程">
         <button v-for="(label, index) in ['患者 / 接诊', '录音上传', '转写结果', '病历生成', '医生确认', '病历导出']" :key="label"
                 class="step" :class="{ done: index < stage || exported, current: index === stage }"
+                :disabled="completed && index === 0"
                 @click="navigate((['workbench','audio','transcript','record','confirm','export'] as MainView[])[index])">
           <span class="step-number"><Icon v-if="index < stage || exported" name="check" /><template v-else>{{ String(index + 1).padStart(2, '0') }}</template></span>
           <span class="step-label">{{ label }}<small>{{ ['CONSULTATION','UPLOAD','TRANSCRIPTION','MEDICAL RECORD','CONFIRMATION','EXPORT'][index] }}</small></span>
@@ -970,10 +1047,10 @@ defineExpose({ selectPatient })
             <div class="consultation-start-icon"><Icon :name="waiting ? 'play' : closed ? 'check' : 'mic'" /></div>
             <span class="consultation-state-kicker">{{ waiting ? 'READY TO START' : closed ? 'VISIT CLOSED' : 'VISIT IN PROGRESS' }}</span>
             <h2>{{ waiting ? '准备开始本次接诊' : closed ? `本次接诊${statusText(currentVisit)}` : '本次接诊进行中' }}</h2>
-            <p>{{ waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。你可以为该患者创建一次新的接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
+            <p>{{ waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。已完成接诊的患者不支持重复接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
             <button v-if="waiting" class="btn primary start-consultation-btn" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
             <button v-else-if="active" class="btn primary start-consultation-btn" :disabled="busy" @click="navigate('audio')"><Icon name="mic" />进入录音上传</button>
-            <button v-else class="btn primary start-consultation-btn" :disabled="busy || !currentPatient" @click="createAndStart(currentPatient?.id || '')"><Icon name="plus" />再次接诊</button>
+            <span v-else class="small-muted">该患者接诊已完成，不支持重复接诊</span>
           </div>
           <div class="consultation-start-meta">
             <span><Icon name="user" />当前患者 <b>{{ currentPatient?.name || '未选择患者' }}</b></span>
@@ -1169,12 +1246,28 @@ defineExpose({ selectPatient })
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED')" @click="startTranscription"><Icon name="sparkle" />开始转写</button>
               </div>
             </template>
+            <template v-else-if="completed">
+              <div class="info-banner"><Icon name="lock" />本次接诊已完成，以下录音仅供查看和播放，不能再上传或转写。</div>
+              <div v-if="!recordings.length" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>没有保留的录音</h3><p>该已完成接诊未找到录音记录。</p></div>
+              <div v-for="item in recordings" :key="item.id" class="audio-item">
+                <div class="audio-info">
+                  <div class="file-icon"><Icon name="file" /></div>
+                  <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
+                  <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
+                </div>
+                <div v-if="item.status !== 'PROCESSING'" class="audio-player">
+                  <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
+                  <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
+                  <span class="audio-time">{{ item.source_type === 'SAMPLE' ? '示例音频' : formatDuration(item.duration_ms) }}</span>
+                </div>
+              </div>
+            </template>
             <div v-else class="step-guard archived">
               <div class="empty-icon"><Icon name="lock" /></div>
               <span class="step-guard-kicker">接诊记录已归档</span>
               <h3>本次接诊{{ statusText(currentVisit) }}</h3>
-              <p>已结束或取消的接诊不再支持追加录音。如需继续，请为该患者创建新的接诊。</p>
-              <button class="btn primary" :disabled="busy || !currentPatient" @click="createAndStart(currentPatient?.id || '')"><Icon name="plus" />再次接诊</button>
+              <p>已完成接诊不再支持追加录音，也不支持重复接诊。</p>
+              <span class="small-muted">该患者接诊已完成，不支持重复接诊</span>
             </div>
           </div>
         </section>
@@ -1324,16 +1417,16 @@ defineExpose({ selectPatient })
           <div class="card-head"><h2><Icon name="download" />选择导出格式</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
           <div class="export-options">
             <div class="export-option"><Icon name="file" /><h3>Word 文档</h3><p>保留标准模板字段与确认信息。<br>下载 .docx 文件，便于存档及后续查阅。</p><button class="btn primary" :disabled="!confirmed || busy" @click="exportWord"><Icon name="download" />导出 Word</button></div>
-            <div class="export-option"><Icon name="print" /><h3>打印 / 另存为 PDF</h3><p>打开 A4 病历打印页。<br>在浏览器打印对话框选择「另存为 PDF」。</p><button class="btn" :disabled="!confirmed || busy" @click="exportPdf"><Icon name="print" />打印 / 保存 PDF</button></div>
+            <div class="export-option"><Icon name="file" /><h3>PDF 文档</h3><p>由后端生成标准 A4 PDF 文件。<br>生成完成后自动下载，便于打印和存档。</p><button class="btn" :disabled="!confirmed || busy" @click="exportPdf"><Icon name="download" />导出 PDF</button></div>
           </div>
-          <div class="readonly-note">完成 Word 下载，或保存 PDF 后返回确认，即可结束本次接诊。</div>
+          <div class="readonly-note">导出任务完成后才允许下载；只有当前确认版本可以导出。</div>
         </section>
 
         <section class="card">
           <div class="card-head"><h2><Icon name="clock" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
           <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
             <tr v-if="!exports.length"><td colspan="3">暂无导出记录</td></tr>
-            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.format === 'DOCX' ? 'Word · 已发起下载' : 'PDF · 医生确认已保存' }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
+            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
           </tbody></table></div>
         </section>
       </div>
@@ -1348,7 +1441,7 @@ defineExpose({ selectPatient })
         <section class="card"><div class="card-head"><h2><Icon name="download" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
           <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
             <tr v-if="!exports.length"><td colspan="3">暂无导出记录</td></tr>
-            <tr v-for="item in exports" :key="item.id"><td>v{{ item.version_no }}</td><td>{{ item.format === 'DOCX' ? 'Word · 已发起下载' : 'PDF · 医生确认已保存' }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
+            <tr v-for="item in exports" :key="item.id"><td>v{{ item.version_no }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
           </tbody></table></div>
         </section>
       </div>
@@ -1357,7 +1450,7 @@ defineExpose({ selectPatient })
         <section class="card"><div class="card-head"><h2><Icon name="gear" />接入状态</h2><span class="small-muted">生产环境配置由后端注入</span></div>
           <div class="card-body">
             <div class="info-banner"><Icon name="check" />后端 API、本地演示患者目录、录音存储、Mock ASR 与病历生成服务已接入。</div>
-            <div class="info-banner"><Icon name="info" />病历导出按当前原型策略在浏览器生成 DOCX / 打印 PDF，后端保留导出审计记录。</div>
+            <div class="info-banner"><Icon name="info" />病历导出由后端异步生成并保存，生成完成后通过受保护的下载接口获取文件。</div>
           </div>
         </section>
       </div>
@@ -1373,9 +1466,9 @@ defineExpose({ selectPatient })
       </div>
       <div class="bottom-actions">
         <button v-if="record?.record_id && !closed && !confirmed" class="btn" :disabled="busy" @click="saveDraft"><Icon name="save" />保存草稿</button>
-        <button v-if="!closed" class="btn" :class="{ primary: confirmed }" :disabled="busy" @click="confirmed ? editRecord() : requestConfirm()"><Icon name="check" />{{ confirmed ? '修改病历' : '医生确认' }}</button>
+        <button v-if="!closed" class="btn" :class="{ primary: confirmed }" :disabled="busy || (!confirmed && !record?.record_id)" @click="confirmed ? editRecord() : requestConfirm()"><Icon name="check" />{{ confirmed ? '修改病历' : '医生确认' }}</button>
         <span class="separator"></span>
-        <button class="btn" :class="{ primary: confirmed }" :disabled="!confirmed || busy" @click="navigate('export')"><Icon name="download" />导出病历</button>
+        <button class="btn" :class="{ primary: confirmed }" :disabled="!confirmed || busy" @click="exportFromBottom"><Icon name="download" />导出病历</button>
       </div>
     </footer>
 
@@ -1384,7 +1477,7 @@ defineExpose({ selectPatient })
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-visit':'新增接诊','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认本次病历','pdf':'确认 PDF 保存结果','help':'使用帮助','activity':'当前接诊动态' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-visit':'新增接诊','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认本次病历','help':'使用帮助','activity':'当前接诊动态' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
@@ -1397,10 +1490,10 @@ defineExpose({ selectPatient })
               <div class="modal-field"><label for="new-patient">选择患者</label>
                 <select id="new-patient" v-model="newPatientId" :disabled="!patients.length">
                   <option v-if="!patients.length" value="">暂无已有患者</option>
-                  <option v-for="patient in patients" :key="patient.id" :value="patient.id">{{ patient.name }} · {{ patient.gender }} · {{ patient.age ?? '—' }} 岁 · {{ patient.patient_no }}</option>
+                  <option v-for="patient in patients" :key="patient.id" :value="patient.id" :disabled="!canCreateVisit(patient.id)">{{ patient.name }} · {{ patient.gender }} · {{ patient.age ?? '—' }} 岁 · {{ patient.patient_no }}{{ canCreateVisit(patient.id) ? '' : ' · 已有接诊' }}</option>
                 </select>
               </div>
-              <div class="modal-note">系统将分配新的唯一接诊编号。同一患者可以多次接诊，每次接诊独立保存一份病历。</div>
+               <div class="modal-note">系统将分配新的唯一接诊编号；已完成接诊的患者不支持重复接诊，取消的接诊可重新开始。</div>
             </template>
             <template v-else>
               <div class="manual-patient-grid">
@@ -1414,7 +1507,7 @@ defineExpose({ selectPatient })
               <div v-if="modalError" class="modal-error">{{ modalError }}</div>
             </template>
           </template>
-          <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>已有记录将保留并标记为已取消，随后可切换到下一位患者。</p></template>
+          <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>取消后将清空本次接诊的录音、转写、病历和导出文件；该患者之后可以重新开始接诊。</p></template>
           <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已确认并导出。</p><p>结束后本次接诊将归档。</p></template>
           <template v-else-if="modal === 'regenerate'"><p>将使用当前已采用的转写文本，覆盖 <b>接诊 {{ currentVisit?.visit_no }}</b> 的当前草稿内容，并创建新版本。</p><p>医生手动编辑的内容也会被替换，请确认已保存所需内容。</p></template>
           <template v-else-if="modal === 'confirm'">
@@ -1423,17 +1516,15 @@ defineExpose({ selectPatient })
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
           </template>
-          <template v-else-if="modal === 'pdf'"><p>请在已打开的打印页面选择「另存为 PDF」。</p><p>保存完成后，点击下方「已保存 PDF」。如果取消了打印，可以返回后重新导出。</p></template>
-          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 使用示例或上传录音 → 开始转写 → 生成病历 → 核对编辑 → 医生确认 → 导出 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
+          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 使用示例或上传录音 → 开始转写 → 生成病历 → 核对编辑 → 医生确认 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
         <div class="modal-actions">
           <template v-if="modal === 'new-visit'"><button class="btn" @click="modal=null">取消</button><button class="btn primary" :disabled="busy || (newPatientMode === 'existing' && !newPatientId)" @click="createNewVisit"><Icon name="plus" />创建接诊</button></template>
-          <template v-else-if="modal === 'cancel'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="busy" @click="doCancel">取消接诊并切换</button></template>
-          <template v-else-if="modal === 'finish'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="doFinish"><Icon name="arrow" />结束并切换下一位</button></template>
+          <template v-else-if="modal === 'cancel'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="busy" @click="doCancel">确认取消接诊</button></template>
+          <template v-else-if="modal === 'finish'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="doFinish"><Icon name="check" />完成本次接诊</button></template>
           <template v-else-if="modal === 'regenerate'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="modal=null;generateRecord()"><Icon name="refresh" />重新生成</button></template>
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy" @click="doConfirm"><Icon name="shield" />确认病历</button></template>
-          <template v-else-if="modal === 'pdf'"><button class="btn" @click="modal=null">暂未保存</button><button class="btn primary" @click="pdfSaved"><Icon name="check" />已保存 PDF</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>
         </div>
       </div>
