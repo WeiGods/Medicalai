@@ -10,29 +10,39 @@ services:
       context: ./backend
     environment:
       DB_URL: jdbc:postgresql://192.168.1.30:5432/medicalai
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
       FLYWAY_ENABLED: "true"
       AI_SERVICE_BASE_URL: http://ai:8000
       STORAGE_ROOT: /data/recordings
     ports:
-      - "8080:8080"
+      - "8080:8189"
     depends_on:
-      - postgres
+      - ai
     volumes:
-      - medicalai_recordings:/data/recordings
+      - medicalai_data:/data
   ai:
-    build: ./ai_service
+    build:
+      context: .
+      dockerfile: ai_service/Dockerfile
+    environment:
+      ASR_DEVICE: cuda:0
+      ASR_HUB: ms
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-30}
     ports:
       - "8000:8000"
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: medicalai
-      POSTGRES_USER: medicalai
-      POSTGRES_PASSWORD: medicalai
     volumes:
-      - medicalai_pg:/var/lib/postgresql/data
+      - medicalai_models:/workspace/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -44,30 +54,7 @@ services:
       - "9001:9001"
     volumes:
       - medicalai_minio:/data
-  funasr:
-    image: medicalai-dev:local
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    working_dir: /workspace/Fun-ASR
-    stdin_open: true
-    tty: true
-    ports:
-      - "10095:10095"
-    environment:
-      - HF_HOME=/workspace/.cache/huggingface
-      - VLLM_WSL2_ENABLE_PIN_MEMORY=1
-      - VLLM_USE_FLASHINFER_SAMPLER=0
-    volumes:
-      - .:/workspace/Fun-ASR
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 volumes:
-  medicalai_pg:
+  medicalai_data:
+  medicalai_models:
   medicalai_minio:
-  medicalai_recordings:

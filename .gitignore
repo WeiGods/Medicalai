@@ -23,3 +23,4 @@ Fun-ASR-Nano-2512/
 **/target/
 **/node_modules/
 backend/.tools/
+push-medicalai.*

@@ -1,4 +1,5 @@
-FROM xxxxrt666/torch-base:cu12.6-full
+ARG BASE_IMAGE=xxxxrt666/torch-base:cu12.6-full
+FROM ${BASE_IMAGE}
 
 WORKDIR /workspace/Fun-ASR
 

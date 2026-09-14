@@ -1,3 +1,8 @@
-# Build context whitelist: the Dockerfile only needs requirements.txt.
+# Build context whitelist: the root Dockerfile only needs requirements.txt;
+# the ai_service build additionally needs the ASR model code.
 *
 !requirements.txt
+!model.py
+!serve_realtime_ws.py
+!ai_service
+ai_service/__pycache__

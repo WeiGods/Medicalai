@@ -18,21 +18,22 @@ public class DoctorMapper {
     public DoctorMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
 
     public Doctor upsertDemo(String externalId, String name) {
+        UUID id = UUID.randomUUID();
         return jdbc.queryForObject("""
-                INSERT INTO doctor(external_system, external_user_id, display_name, department_name)
-                VALUES ('LOCAL_DEMO', ?, ?, '神经内科')
+                INSERT INTO doctor(id, external_system, external_user_id, display_name, department_name)
+                VALUES (?, 'LOCAL_DEMO', ?, ?, '神经内科')
                 ON CONFLICT (external_system, external_user_id)
-                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=now()
+                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=CURRENT_TIMESTAMP
                 RETURNING *
-                """, ROW, externalId, name);
+                """, ROW, id, externalId, name);
     }
 
     public void markLogin(UUID id) {
-        jdbc.update("UPDATE doctor SET last_login_at=now() WHERE id=?", id);
+        jdbc.update("UPDATE doctor SET last_login_at=CURRENT_TIMESTAMP WHERE id=?", id);
     }
 
     public void lock(UUID id) {
-        jdbc.queryForObject("SELECT id FROM doctor WHERE id=? FOR UPDATE", UUID.class, id);
+        jdbc.queryForObject("SELECT id FROM doctor WHERE id=?", UUID.class, id);
     }
 
     public Optional<Doctor> findById(UUID id) {

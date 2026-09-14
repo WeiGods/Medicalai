@@ -2,6 +2,7 @@ package com.medicalai.service;
 
 import com.medicalai.exception.BusinessException;
 import java.io.File;
+import java.net.http.HttpClient;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -9,6 +10,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
@@ -30,7 +32,13 @@ public class AiServiceClient {
                            @Value("${medicalai.ai.mock-fallback:true}") boolean mockFallback) {
         this.baseUrl = baseUrl;
         this.mockFallback = mockFallback;
-        this.client = RestClient.builder().baseUrl(baseUrl).build();
+        // JDK HttpClient defaults to HTTP/2 with an h2c upgrade for http:// URLs;
+        // uvicorn rejects the upgrade and the multipart body is lost (422).
+        HttpClient httpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+        this.client = RestClient.builder()
+                .baseUrl(baseUrl)
+                .requestFactory(new JdkClientHttpRequestFactory(httpClient))
+                .build();
     }
 
     public TranscribeResponse transcribe(MultipartFile file) {

@@ -1,6 +1,7 @@
 package com.medicalai.mapper;
 
 import com.medicalai.domain.AuthenticatedDoctor;
+import java.sql.Timestamp;
 import java.time.*;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,24 +16,26 @@ public class LoginSessionMapper {
         jdbc.update("""
                 INSERT INTO login_session(doctor_id, login_type, access_token_hash, expires_at)
                 VALUES (?, 'DEMO', ?, ?)
-                """, doctorId, tokenHash, OffsetDateTime.ofInstant(expiresAt, ZoneOffset.UTC));
+                """, doctorId, tokenHash, Timestamp.from(expiresAt));
     }
 
     public Optional<AuthenticatedDoctor> authenticate(String tokenHash) {
         return jdbc.query("""
                 SELECT d.*, s.id AS session_id FROM login_session s JOIN doctor d ON d.id=s.doctor_id
                 WHERE s.access_token_hash=? AND s.revoked_at IS NULL
-                  AND s.expires_at>now() AND d.status='ACTIVE'
+                  AND s.expires_at>? AND d.status='ACTIVE'
                 """, (rs, n) -> new AuthenticatedDoctor(
-                rs.getObject("session_id", UUID.class), DoctorMapper.ROW.mapRow(rs, n)), tokenHash)
+                rs.getObject("session_id", UUID.class), DoctorMapper.ROW.mapRow(rs, n)),
+                tokenHash, Timestamp.from(Instant.now()))
                 .stream().findFirst();
     }
 
     public void touch(UUID sessionId) {
-        jdbc.update("UPDATE login_session SET last_seen_at=now() WHERE id=? AND last_seen_at<now()-interval '1 minute'", sessionId);
+        jdbc.update("UPDATE login_session SET last_seen_at=CURRENT_TIMESTAMP WHERE id=? AND last_seen_at<?",
+                sessionId, Timestamp.from(Instant.now().minusSeconds(60)));
     }
 
     public void revoke(UUID sessionId) {
-        jdbc.update("UPDATE login_session SET revoked_at=COALESCE(revoked_at,now()) WHERE id=?", sessionId);
+        jdbc.update("UPDATE login_session SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) WHERE id=?", sessionId);
     }
 }
