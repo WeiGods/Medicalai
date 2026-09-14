@@ -5,4 +5,4 @@ import java.util.UUID;
 
 public record Recording(UUID id, UUID visitId, String recordingNo, String sourceType,
                         String objectKey, String fileName, String mimeType, Long sizeBytes,
-                        Long durationMs, String status, Instant createdAt) {}
+                        Long durationMs, String status, String errorMessage, Instant createdAt) {}

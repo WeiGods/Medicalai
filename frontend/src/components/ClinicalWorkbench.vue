@@ -206,11 +206,11 @@ const segments = computed(() => {
   const source = transcript.value
   if (!source) return []
   if (source.turns.length && !source.edited) {
-    return source.turns.map(item => ({ role: item.role === 'DOCTOR' ? '医生' : '患者', time: formatTime(item.start_ms), text: item.text }))
+    return source.turns.map(item => ({ role: item.role === 'DOCTOR' ? '医生' : item.role === 'PATIENT' ? '患者' : '说话人', time: formatTime(item.start_ms), text: item.text }))
   }
   return source.transcript.split(/\n+/).filter(Boolean).map((line, index) => {
     const match = line.match(/^(医生|患者)[：:]\s*(.*)$/)
-    return { role: match ? match[1] : '患者', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
+    return { role: match ? match[1] : '说话人', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
   })
 })
 const facts = computed(() => {
@@ -228,7 +228,7 @@ const statusText = (visit: Visit | null) => {
 }
 const formatBytes = (size: number | null) => size == null ? '—' : `${(size / 1024 / 1024).toFixed(1)} MB`
 const formatDuration = (ms: number | null) => {
-  if (!ms || ms <= 0) return '03:24'
+  if (!ms || ms <= 0) return '—'
   return `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 }
 const formatRecordingDuration = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
@@ -237,8 +237,7 @@ const formatDateTime = (value: string | null) => value ? new Date(value).toLocal
 const visitDate = computed(() => currentVisit.value ? currentVisit.value.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10))
 const isPlaying = (item: Recording) => playingId.value === item.id
 const avatarClass = (patient: Patient | null) => patient?.patient_no === '002' ? 'lilac' : patient?.patient_no === '003' ? 'blue' : ''
-const highlightText = (text: string) => text.split(/(三天|右侧太阳穴|半小时到一小时|没有呕吐|近一周|两周|高血压病史五年)/).filter(Boolean)
-  .map(piece => ({ text: piece, mark: ['三天', '右侧太阳穴', '半小时到一小时', '没有呕吐', '近一周', '两周', '高血压病史五年'].includes(piece) }))
+const highlightText = (text: string) => [{ text, mark: false }]
 const recordingStateLabel = computed(() => ({ idle: '准备录音', recording: '正在录音', paused: '已暂停' })[recordingState.value])
 const recordingTimeLabel = computed(() => formatRecordingDuration(recordingElapsedMs.value))
 
@@ -524,32 +523,34 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
   if (view.value === 'workbench') toast('录音已上传，可开始转写。')
 }
 
-async function addSample() {
-  if (!currentVisit.value || locked.value) return
-  actionBusy.value = 'upload'
-  try {
-    await api.createSampleRecording(currentVisit.value.id)
-    addLog('创建合成示例录音')
-    await loadAll(true)
-    toast('示例录音已添加，可开始转写。')
-  } catch (error) {
-    toast(error instanceof Error ? error.message : '示例录音创建失败')
-  } finally {
-    actionBusy.value = ''
-  }
-}
-
 async function startTranscription() {
   if (!currentVisit.value || locked.value) return
   actionBusy.value = 'transcribe'
   try {
-    transcript.value = await api.transcribe(currentVisit.value.id)
-    transcriptDraft.value = transcript.value.transcript
-    addLog('完成录音转写')
+    const visitId = currentVisit.value.id
+    const job = await api.transcribe(visitId)
     await loadAll(true)
-    navigate('transcript')
-    toast('转写完成，请核对文本并生成病历。')
+    addLog('已提交真实 ASR 转写任务')
+    for (let attempt = 0; attempt < 240; attempt++) {
+      await new Promise(resolve => window.setTimeout(resolve, 3000))
+      const state = await api.transcribeStatus(visitId, job.job_id)
+      await loadAll(true)
+      if (state.status === 'SUCCEEDED') {
+        transcript.value = state.transcript
+        transcriptDraft.value = state.transcript?.transcript || ''
+        addLog('完成真实 ASR 转写')
+        navigate('transcript')
+        toast('转写完成，请核对文本并生成病历。')
+        return
+      }
+      if (state.status === 'FAILED') throw new Error(state.error_message || '转写失败')
+    }
+    throw new Error('转写等待超时，请稍后查看任务状态')
   } catch (error) {
+    // The server may have recovered a stale PROCESSING row before rejecting
+    // this submission (for example, when the public MinIO endpoint is absent).
+    // Reload so the card immediately returns to a retryable state.
+    await loadAll(true)
     toast(error instanceof Error ? error.message : '转写失败')
   } finally {
     actionBusy.value = ''
@@ -1065,7 +1066,7 @@ defineExpose({ selectPatient })
           <section class="card">
             <div class="card-head"><h2><Icon name="mic" />问诊录音</h2><span class="small-muted">{{ String(recordings.length).padStart(2, '0') }} 段录音</span></div>
             <div class="card-body">
-              <div v-if="waiting" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>开始本次接诊</h3><p>开始接诊后，即可上传完整录音或使用示例录音。</p><button class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button></div>
+              <div v-if="waiting" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>开始本次接诊</h3><p>开始接诊后，即可上传完整录音。</p><button class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button></div>
               <div v-else-if="closed" class="small-muted">本次接诊{{ statusText(currentVisit) }}，录音已归档。</div>
               <div v-else-if="confirmed" class="info-banner"><Icon name="lock" />病历已确认。如需追加录音，请先点击「修改病历」。</div>
               <template v-else>
@@ -1079,22 +1080,23 @@ defineExpose({ selectPatient })
                   <button class="btn small" :disabled="locked || !recorder" @click="pauseRecording">暂停/继续</button>
                   <button class="btn small" :disabled="locked || recordingState === 'idle'" @click="stopRecording">结束录音</button>
                 </div>
-                <div class="upload-footer"><span>完整录音上传后，开始转写</span><button class="text-btn" :disabled="locked" @click="addSample">使用示例录音 <Icon name="arrow" /></button></div>
+                <div class="upload-footer"><span>完整录音上传后，开始转写</span></div>
               </template>
               <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
-                  <div><div class="audio-name" :title="item.file_name || ''">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }} · {{ item.source_type === 'SAMPLE' ? '合成示例' : '本地录音' }}</div></div>
+                  <div><div class="audio-name" :title="item.file_name || ''">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
                 </div>
+                <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
                   <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
                   <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ item.source_type === 'SAMPLE' ? '示例音频' : formatDuration(item.duration_ms) }}</span>
+                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
-              <div v-if="recordings.some(item => item.status === 'UPLOADED')" style="margin-top:13px">
-                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED')" @click="startTranscription"><Icon name="sparkle" />开始转写</button>
+              <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" style="margin-top:13px">
+                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
             </div>
           </section>
@@ -1110,9 +1112,9 @@ defineExpose({ selectPatient })
                 <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
               </div>
               <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
-                <div class="transcript-note"><Icon name="info" />合成转写示例 · 已区分说话人 · 请核对后采用</div>
+                <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
                 <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
-                  <span class="speaker">{{ item.role === '医生' ? '医' : '患' }}</span>
+                  <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '人' }}</span>
                   <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
                     <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
                   </div>
@@ -1196,7 +1198,6 @@ defineExpose({ selectPatient })
       </div>
 
       <div v-else-if="view === 'audio'" class="full-view">
-        <div class="info-banner"><Icon name="info" />演示模式：录音仅在本页读取，转写使用合成文本，不识别本地音频内容。</div>
         <section class="card">
           <div class="card-head"><h2><Icon name="mic" />问诊录音</h2><span class="small-muted">{{ String(recordings.length).padStart(2, '0') }} 段录音</span></div>
           <div class="card-body">
@@ -1229,21 +1230,22 @@ defineExpose({ selectPatient })
                   </div>
                 </div>
               </div>
-              <div class="upload-footer"><span>完整录音上传后，点击“开始转写”</span><button class="text-btn" :disabled="locked" @click="addSample"><Icon name="sparkle" />使用示例录音 <Icon name="arrow" /></button></div>
+              <div class="upload-footer"><span>完整录音上传后，点击“开始转写”</span></div>
               <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
                 </div>
+                <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
                   <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
                   <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ item.source_type === 'SAMPLE' ? '示例音频' : formatDuration(item.duration_ms) }}</span>
+                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
-              <div v-if="recordings.some(item => item.status === 'UPLOADED')" class="transcribe-action">
-                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED')" @click="startTranscription"><Icon name="sparkle" />开始转写</button>
+              <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
+                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
             </template>
             <template v-else-if="completed">
@@ -1255,10 +1257,11 @@ defineExpose({ selectPatient })
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
                 </div>
+                <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
                   <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
                   <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ item.source_type === 'SAMPLE' ? '示例音频' : formatDuration(item.duration_ms) }}</span>
+                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
             </template>
@@ -1282,9 +1285,9 @@ defineExpose({ selectPatient })
             <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
           </div>
           <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
-            <div class="transcript-note"><Icon name="info" />合成转写示例 · 已区分说话人 · 请核对后采用</div>
+            <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
             <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
-              <span class="speaker">{{ item.role === '医生' ? '医' : '患' }}</span>
+              <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '人' }}</span>
               <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
                 <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
               </div>
@@ -1449,7 +1452,7 @@ defineExpose({ selectPatient })
       <div v-else-if="view === 'config'" class="full-view">
         <section class="card"><div class="card-head"><h2><Icon name="gear" />接入状态</h2><span class="small-muted">生产环境配置由后端注入</span></div>
           <div class="card-body">
-            <div class="info-banner"><Icon name="check" />后端 API、本地演示患者目录、录音存储、Mock ASR 与病历生成服务已接入。</div>
+            <div class="info-banner"><Icon name="check" />后端 API、录音对象存储与 DashScope ASR 已接入；病历生成服务仍待替换为真实模型。</div>
             <div class="info-banner"><Icon name="info" />病历导出由后端异步生成并保存，生成完成后通过受保护的下载接口获取文件。</div>
           </div>
         </section>
@@ -1516,7 +1519,7 @@ defineExpose({ selectPatient })
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
           </template>
-          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 使用示例或上传录音 → 开始转写 → 生成病历 → 核对编辑 → 医生确认 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
+          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 核对编辑 → 医生确认 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
         <div class="modal-actions">

@@ -6,6 +6,7 @@ import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.RecordingMapper;
 import com.medicalai.service.AudioStorageService;
 import com.medicalai.service.ClinicalWorkflowService;
+import com.medicalai.vo.AsrJobVO;
 import com.medicalai.vo.RecordingVO;
 import java.util.List;
 import java.util.UUID;
@@ -15,13 +16,10 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 @RestController
 @RequestMapping("/api/v1")
 public class RecordingController {
-    private static final Logger LOG = LoggerFactory.getLogger(RecordingController.class);
     private final ClinicalWorkflowService workflow;
     private final RecordingMapper recordings;
     private final AudioStorageService storage;
@@ -46,28 +44,22 @@ public class RecordingController {
         return workflow.upload(visitId, current.doctor().id(), file, durationMs);
     }
 
-    @PostMapping("/visits/{visitId}/recordings/sample")
-    public RecordingVO sample(@PathVariable UUID visitId,
-                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return workflow.createSample(visitId, current.doctor().id());
-    }
-
     @PostMapping("/visits/{visitId}/recordings/transcribe")
-    public Object transcribe(@PathVariable UUID visitId,
+    public AsrJobVO transcribe(@PathVariable UUID visitId,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return workflow.transcribe(visitId, current.doctor().id());
+    }
+
+    @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")
+    public AsrJobVO transcriptionStatus(@PathVariable UUID visitId, @PathVariable UUID jobId,
+                                        @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return workflow.asrJob(visitId, current.doctor().id(), jobId);
     }
 
     @GetMapping("/recordings/{recordingId}/audio")
     public ResponseEntity<ByteArrayResource> audio(@PathVariable UUID recordingId,
                                                    @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         Recording recording = recordings.find(recordingId, current.doctor().id()).orElseThrow(BusinessException::notFound);
-        if ("SAMPLE".equals(recording.sourceType()) && recording.objectKey() == null) {
-            byte[] bytes = sampleWav();
-            LOG.info("Audio download served: recordingId={}, sourceType=SAMPLE, mimeType={}, sizeBytes={}",
-                    recordingId, "audio/wav", bytes.length);
-            return audioResponse(bytes, MediaType.parseMediaType("audio/wav"));
-        }
         if (recording.objectKey() == null || recording.objectKey().isBlank()) {
             throw new BusinessException(org.springframework.http.HttpStatus.NOT_FOUND,
                     "AUDIO_NOT_FOUND", "录音文件不存在");
@@ -75,8 +67,6 @@ public class RecordingController {
         var resource = storage.load(recording.objectKey());
         byte[] bytes = readAll(resource);
         MediaType type = resolveMediaType(recording);
-        LOG.info("Audio download served: recordingId={}, sourceType={}, fileName={}, mimeType={}, sizeBytes={}",
-                recordingId, recording.sourceType(), recording.fileName(), type, bytes.length);
         return audioResponse(bytes, type);
     }
 
@@ -128,33 +118,4 @@ public class RecordingController {
         }
     }
 
-    private byte[] sampleWav() {
-        int rate = 8000;
-        int seconds = 2;
-        int samples = rate * seconds;
-        byte[] data = new byte[44 + samples * 2];
-        writeInt(data, 0, 0x46464952);
-        writeInt(data, 4, 36 + samples * 2);
-        writeInt(data, 8, 0x45564157);
-        writeInt(data, 12, 0x20746d66);
-        writeInt(data, 16, 16);
-        data[20] = 1; data[22] = 1;
-        writeInt(data, 24, rate);
-        writeInt(data, 28, rate * 2);
-        data[32] = 2; data[34] = 16;
-        writeInt(data, 40, samples * 2);
-        for (int i = 0; i < samples; i++) {
-            short value = (short) (Math.sin(2 * Math.PI * 440 * i / rate) * 9000);
-            data[44 + i * 2] = (byte) value;
-            data[45 + i * 2] = (byte) (value >>> 8);
-        }
-        return data;
-    }
-
-    private void writeInt(byte[] data, int offset, int value) {
-        data[offset] = (byte) value;
-        data[offset + 1] = (byte) (value >>> 8);
-        data[offset + 2] = (byte) (value >>> 16);
-        data[offset + 3] = (byte) (value >>> 24);
-    }
 }

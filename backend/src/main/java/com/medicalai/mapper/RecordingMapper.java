@@ -16,7 +16,7 @@ public class RecordingMapper {
             rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
             rs.getString("recording_no"), rs.getString("source_type"), rs.getString("object_key"),
             rs.getString("file_name"), rs.getString("mime_type"), rs.getObject("size_bytes", Long.class),
-            rs.getObject("duration_ms", Long.class), rs.getString("status"),
+            rs.getObject("duration_ms", Long.class), rs.getString("status"), rs.getString("error_message"),
             rs.getTimestamp("created_at").toInstant());
     private static final RowMapper<Utterance> UTTERANCE = (rs, n) -> new Utterance(
             rs.getObject("id", UUID.class), rs.getObject("recording_id", UUID.class),
@@ -49,7 +49,7 @@ public class RecordingMapper {
                 INSERT INTO recording(id,visit_id,recording_no,source_type,object_key,file_name,mime_type,size_bytes,duration_ms,status,asr_route)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING *
                 """, RECORDING, r.id(), r.visitId(), r.recordingNo(), r.sourceType(), r.objectKey(),
-                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), r.sourceType().equals("SAMPLE") ? "MOCK" : "UPLOADED");
+                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), "DASHSCOPE");
     }
 
     public Recording updateStatus(UUID id, String status, String error) {
@@ -62,6 +62,115 @@ public class RecordingMapper {
     public Optional<Recording> findByVisitAndStatus(UUID visitId, String status) {
         return jdbc.query("SELECT * FROM recording WHERE visit_id=? AND status=? ORDER BY created_at LIMIT 1",
                 RECORDING, visitId, status).stream().findFirst();
+    }
+
+    public UUID createAsrJob(UUID visitId) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,provider_route)
+                VALUES (?,?,?,?,'PENDING','DASHSCOPE')
+                """, id, "ASR_TRANSCRIBE", visitId, "asr:" + visitId + ":" + id);
+        return id;
+    }
+
+    public Optional<AsrJob> claimNextAsrJob(UUID leaseToken) {
+        List<AsrJob> jobs = jdbc.query("""
+                WITH candidate AS (
+                    SELECT j.id
+                    FROM ai_job j
+                    WHERE j.job_type='ASR_TRANSCRIBE'
+                      AND j.status IN ('PENDING','RUNNING')
+                      AND (j.locked_at IS NULL OR j.locked_at < now() - interval '2 minutes')
+                    ORDER BY j.created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE ai_job j
+                SET locked_at=now(), lease_token=?
+                FROM candidate c
+                WHERE j.id=c.id
+                RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at
+                """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
+                        rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
+                        rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), leaseToken);
+        return jobs.stream().findFirst();
+    }
+
+    public void updateAsrSubmission(UUID jobId, UUID recordingId, String providerTaskId) {
+        jdbc.update("""
+                UPDATE ai_job SET status='RUNNING',recording_id=?,provider_task_id=?,attempt_count=attempt_count+1,
+                    started_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                WHERE id=? AND job_type='ASR_TRANSCRIBE'
+                """, recordingId, providerTaskId, jobId);
+    }
+
+    /** Bind a pending job to its recording before any provider call can fail. */
+    public void bindAsrRecording(UUID jobId, UUID recordingId) {
+        jdbc.update("""
+                UPDATE ai_job SET recording_id=?
+                WHERE id=? AND job_type='ASR_TRANSCRIBE' AND status='PENDING'
+                """, recordingId, jobId);
+    }
+
+    /** Makes failed jobs, and pre-fix orphaned PROCESSING rows, eligible for an explicit retry. */
+    public void requeueRetryableRecordings(UUID visitId) {
+        jdbc.update("""
+                UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,updated_at=now()
+                WHERE visit_id=?
+                  AND (status='FAILED' OR (
+                    status='PROCESSING' AND NOT EXISTS (
+                      SELECT 1 FROM ai_job
+                      WHERE visit_id=? AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
+                    )
+                  ))
+                """, visitId, visitId);
+    }
+
+    public void prepareNextAsrRecording(UUID jobId) {
+        jdbc.update("""
+                UPDATE ai_job SET status='PENDING',recording_id=NULL,provider_task_id=NULL,
+                    locked_at=NULL,lease_token=NULL WHERE id=? AND job_type='ASR_TRANSCRIBE'
+                """, jobId);
+    }
+
+    public void releaseAsrJob(UUID jobId) {
+        jdbc.update("UPDATE ai_job SET locked_at=NULL,lease_token=NULL WHERE id=? AND job_type='ASR_TRANSCRIBE'", jobId);
+    }
+
+    public void markAsrSucceeded(UUID jobId) {
+        jdbc.update("""
+                UPDATE ai_job SET status='SUCCEEDED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                WHERE id=? AND job_type='ASR_TRANSCRIBE'
+                """, jobId);
+    }
+
+    public void markAsrFailed(UUID jobId, String error) {
+        jdbc.update("""
+                UPDATE ai_job SET status='FAILED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=?
+                WHERE id=? AND job_type='ASR_TRANSCRIBE'
+                """, error, jobId);
+    }
+
+    public Optional<AsrJob> asrJob(UUID jobId, UUID visitId) {
+        return jdbc.query("""
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at
+                FROM ai_job WHERE id=? AND visit_id=? AND job_type='ASR_TRANSCRIBE'
+                """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
+                        rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
+                        rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), jobId, visitId).stream().findFirst();
+    }
+
+    public Optional<AsrJob> latestAsrJob(UUID visitId) {
+        return jdbc.query("""
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at
+                FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'
+                ORDER BY created_at DESC LIMIT 1
+                """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
+                        rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
+                        rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), visitId).stream().findFirst();
     }
 
     public UUID createSession(UUID visitId, UUID recordingId) {
@@ -189,4 +298,6 @@ public class RecordingMapper {
 
     public record Turn(String role, String text, long startMs, long endMs) {}
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
+    public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
+                         int attemptCount, String lastError, Instant startedAt) {}
 }

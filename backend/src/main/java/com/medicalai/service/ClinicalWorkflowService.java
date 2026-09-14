@@ -7,8 +7,6 @@ import com.medicalai.dto.*;
 import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.*;
 import com.medicalai.vo.*;
-import java.io.File;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.*;
@@ -72,71 +70,41 @@ public class ClinicalWorkflowService {
         String objectKey = storage.save(file, visit.id().toString(), id.toString());
         Recording recording = recordings.insert(new Recording(id, visit.id(), nextRecordingNo(visit.id()),
                 "UPLOAD", objectKey, name, file.getContentType(), file.getSize(),
-                durationMs == null || durationMs < 0 ? null : durationMs, "UPLOADED", Instant.now(clock)));
+                durationMs == null || durationMs < 0 ? null : durationMs, "UPLOADED", null, Instant.now(clock)));
         records.audit(doctorId, visit.id(), "RECORDING_UPLOADED", id);
         return RecordingVO.from(recording);
     }
 
-    @Transactional
-    public RecordingVO createSample(UUID visitId, UUID doctorId) {
+    @Transactional(noRollbackFor = BusinessException.class)
+    public AsrJobVO transcribe(UUID visitId, UUID doctorId) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
-        UUID id = UUID.randomUUID();
-        Recording recording = recordings.insert(new Recording(id, visit.id(), nextRecordingNo(visit.id()),
-                "SAMPLE", null, patient(visit).name() + "_门诊问诊.wav", "audio/wav", 503808L,
-                204000L, "UPLOADED", Instant.now(clock)));
-        records.audit(doctorId, visit.id(), "SAMPLE_RECORDING_CREATED", id);
-        return RecordingVO.from(recording);
-    }
-
-    @Transactional
-    public TranscriptVO transcribe(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, true);
-        requireActive(visit);
-        requireRecordEditable(visit.id());
+        Optional<RecordingMapper.AsrJob> active = recordings.latestAsrJob(visit.id())
+                .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
+        if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
+        recordings.requeueRetryableRecordings(visit.id());
+        // Reset stale PROCESSING rows before validating the external endpoint.
+        // This lets a user recover recordings left behind by the old worker
+        // when MINIO_PUBLIC_ENDPOINT was missing, instead of leaving the UI
+        // stuck in "转写中" forever.
+        storage.assertAsrSubmissionReady();
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
-        LOG.info("ASR transcription started: visitId={}, doctorId={}, pendingRecordings={}", visitId, doctorId, pending.size());
-        List<RecordingMapper.Turn> turns = new ArrayList<>();
-        List<UUID> utteranceIds = new ArrayList<>();
-        Recording last = pending.getLast();
-        UUID lastSession = null;
-        try {
-            for (Recording recording : pending) {
-                LOG.info("ASR recording started: visitId={}, recordingId={}, recordingNo={}, sourceType={}, fileName={}, mimeType={}, sizeBytes={}, objectKey={}",
-                        visitId, recording.id(), recording.recordingNo(), recording.sourceType(), safe(recording.fileName()),
-                        safe(recording.mimeType()), recording.sizeBytes(), safe(recording.objectKey()));
-                UUID sessionId = recordings.createSession(visit.id(), recording.id());
-                lastSession = sessionId;
-                List<Map<String, Object>> responseUtterances = transcribeRecording(recording, patient(visit).name());
-                List<RecordingMapper.Turn> currentTurns = toTurns(responseUtterances);
-                turns.addAll(currentTurns);
-                List<UUID> currentIds = recordings.insertUtterances(visit.id(), recording.id(), sessionId, currentTurns);
-                utteranceIds.addAll(currentIds);
-                recordings.updateStatus(recording.id(), "DONE", null);
-                LOG.info("ASR recording succeeded: visitId={}, recordingId={}, sessionId={}, utterances={}",
-                        visitId, recording.id(), sessionId, currentTurns.size());
-            }
-        } catch (BusinessException e) {
-            LOG.error("ASR transcription failed: visitId={}, doctorId={}, code={}, message={}",
-                    visitId, doctorId, e.code(), safe(e.getMessage()), e);
-            throw e;
-        } catch (Exception e) {
-            LOG.error("ASR transcription failed unexpectedly: visitId={}, doctorId={}, pendingRecordings={}",
-                    visitId, doctorId, pending.size(), e);
-            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "ASR_FAILED", "转写失败，请查看后端日志", e);
-        }
-        if (lastSession == null) throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "ASR_FAILED", "转写失败");
-        String hash = snapshotHash(visit.id(), turns);
-        UUID snapshotId = recordings.createSnapshot(visit.id(), last.id(), lastSession, turns, utteranceIds, hash);
-        String transcript = transcriptText(turns);
-        recordings.saveTranscript(visit.id(), snapshotId, transcript, false);
-        records.audit(doctorId, visit.id(), "TRANSCRIPT_CREATED", snapshotId);
-        LOG.info("ASR transcription completed: visitId={}, snapshotId={}, recordings={}, utterances={}",
-                visitId, snapshotId, pending.size(), turns.size());
-        return transcript(visitId, doctorId);
+        UUID jobId = recordings.createAsrJob(visit.id());
+        return asrJob(visitId, doctorId, jobId);
+    }
+
+    @Transactional(readOnly = true)
+    public AsrJobVO asrJob(UUID visitId, UUID doctorId, UUID jobId) {
+        Visit visit = owned(visitId, doctorId, false);
+        RecordingMapper.AsrJob job = recordings.asrJob(jobId, visit.id())
+                .orElseThrow(BusinessException::notFound);
+        List<Recording> all = recordings.list(visit.id());
+        int completed = (int) all.stream().filter(r -> "DONE".equals(r.status())).count();
+        TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId) : null;
+        return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result);
     }
 
     @Transactional(readOnly = true)
@@ -339,61 +307,13 @@ public class ClinicalWorkflowService {
                 .toList();
     }
 
-    private List<Map<String, Object>> transcribeRecording(Recording recording, String patientName) {
-        if ("SAMPLE".equals(recording.sourceType())) {
-            return normalizeUtterances(ai.transcribeSample(patientName).utterances());
-        }
-        File file;
-        try {
-            file = storage.load(recording.objectKey()).getFile();
-        }
-        catch (IOException e) {
-            LOG.error("ASR audio file could not be opened: recordingId={}, objectKey={}", recording.id(),
-                    safe(recording.objectKey()), e);
-            throw new BusinessException(HttpStatus.NOT_FOUND, "AUDIO_NOT_FOUND", "录音文件不存在", e);
-        }
-        return normalizeUtterances(ai.transcribe(file).utterances());
-    }
-
-    private String safe(String value) {
-        if (value == null) return "";
-        return value.replace('\n', ' ').replace('\r', ' ');
-    }
-
-    private List<Map<String, Object>> normalizeUtterances(List<Map<String, Object>> utterances) {
-        if (utterances == null || utterances.isEmpty()) {
-            return List.of(Map.of("role", "DOCTOR", "text", "您好，今天主要有什么不舒服？"),
-                    Map.of("role", "PATIENT", "text", "需要由医生核对话转写内容。"));
-        }
-        return utterances;
-    }
-
-    private List<RecordingMapper.Turn> toTurns(List<Map<String, Object>> utterances) {
-        List<RecordingMapper.Turn> turns = new ArrayList<>();
-        long time = 0;
-        for (Map<String, Object> item : utterances) {
-            String text = String.valueOf(item.getOrDefault("text", "")).strip();
-            if (text.isEmpty()) continue;
-            String role = normalizeRole(String.valueOf(item.getOrDefault("role", "UNKNOWN")));
-            long start = number(firstValue(item, "startMs", "start_ms"));
-            long end = Math.max(start + 500, number(firstValue(item, "endMs", "end_ms")));
-            turns.add(new RecordingMapper.Turn(role, text, start, end));
-            time = end + 500;
-        }
-        return turns;
-    }
-
-    private String transcriptText(List<RecordingMapper.Turn> turns) {
-        return turns.stream().map(t -> ("DOCTOR".equals(t.role()) ? "医生" : "患者") + "：" + t.text())
-                .reduce((a, b) -> a + "\n\n" + b).orElse("");
-    }
-
     private List<Map<String, Object>> dialogueForAi(String transcript) {
         List<Map<String, Object>> dialogue = new ArrayList<>();
         for (String line : transcript.split("\\R+")) {
             String value = line.strip();
             if (value.isEmpty()) continue;
-            String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR" : "PATIENT";
+            String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR"
+                    : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "UNKNOWN";
             String text = value.replaceFirst("^(医生|患者)[：:]\\s*", "");
             dialogue.add(Map.of("role", role, "text", text));
         }
@@ -542,25 +462,6 @@ public class ClinicalWorkflowService {
         } catch (Exception e) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "HASH_FAILED", "快照生成失败");
         }
-    }
-
-    private String normalizeRole(String role) {
-        String value = role == null ? "" : role.toUpperCase(Locale.ROOT);
-        if (value.contains("DOCTOR") || value.contains("医生")) return "DOCTOR";
-        if (value.contains("PATIENT") || value.contains("患者")) return "PATIENT";
-        return "PATIENT";
-    }
-
-    private long number(Object value) {
-        try { return value == null ? 0 : Long.parseLong(String.valueOf(value)); }
-        catch (NumberFormatException e) { return 0; }
-    }
-
-    private Object firstValue(Map<String, Object> item, String... keys) {
-        for (String key : keys) {
-            if (item.containsKey(key)) return item.get(key);
-        }
-        return null;
     }
 
     private Integer integer(Object value) {

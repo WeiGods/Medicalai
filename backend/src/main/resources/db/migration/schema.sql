@@ -273,6 +273,9 @@ ALTER TABLE visit DROP COLUMN IF EXISTS current_record_id;
 ALTER TABLE patient ADD COLUMN IF NOT EXISTS id_no_masked varchar(64);
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS locked_at timestamptz;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS lease_token uuid;
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS recording_id uuid REFERENCES recording(id);
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS provider_task_id varchar(256);
+CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
 
 -- 兼容旧版前端直接写入的伪成功导出：没有真实文件时必须回到可重试的 PENDING。
@@ -422,7 +425,7 @@ COMMENT ON TABLE recording IS '接诊录音文件元数据；音频本体存储�
 COMMENT ON COLUMN recording.id IS '录音 UUID 主键';
 COMMENT ON COLUMN recording.visit_id IS '所属接诊 ID';
 COMMENT ON COLUMN recording.recording_no IS '接诊内录音序号';
-COMMENT ON COLUMN recording.source_type IS '录音来源：UPLOAD 上传、SAMPLE 样例';
+COMMENT ON COLUMN recording.source_type IS '录音来源：UPLOAD 上传';
 COMMENT ON COLUMN recording.object_key IS '文件在对象存储中的键或本地存储路径';
 COMMENT ON COLUMN recording.file_name IS '原始文件名';
 COMMENT ON COLUMN recording.mime_type IS '文件 MIME 类型';
@@ -430,7 +433,7 @@ COMMENT ON COLUMN recording.size_bytes IS '文件大小，单位字节';
 COMMENT ON COLUMN recording.duration_ms IS '录音时长，单位毫秒';
 COMMENT ON COLUMN recording.sha256 IS '文件内容 SHA-256，用于完整性校验和去重';
 COMMENT ON COLUMN recording.status IS '录音状态：UPLOADED、PROCESSING、DONE、FAILED 等';
-COMMENT ON COLUMN recording.asr_route IS 'ASR 处理路由，例如 UPLOADED、MOCK';
+COMMENT ON COLUMN recording.asr_route IS 'ASR 处理路由，例如 UPLOADED、DASHSCOPE';
 COMMENT ON COLUMN recording.error_code IS '录音处理失败错误码';
 COMMENT ON COLUMN recording.error_message IS '录音处理失败详情';
 COMMENT ON COLUMN recording.created_at IS '录音记录创建时间';

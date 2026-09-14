@@ -28,6 +28,10 @@ public class VisitMapper {
                 ROW,id,doctorId).stream().findFirst();
     }
 
+    public UUID doctorId(UUID visitId) {
+        return jdbc.queryForObject("SELECT doctor_id FROM visit WHERE id=?", UUID.class, visitId);
+    }
+
     public Visit create(UUID id, Patient patient, Doctor doctor, Integer age, String chief, LocalDate date) {
         return jdbc.queryForObject("""
                 INSERT INTO visit(id,visit_no,patient_id,doctor_id,department_id,department_name,visit_date,

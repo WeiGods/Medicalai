@@ -44,12 +44,13 @@ export interface Recording {
   id: string
   visit_id: string
   recording_no: string
-  source_type: 'UPLOAD' | 'SAMPLE' | string
+  source_type: 'UPLOAD' | string
   file_name: string | null
   mime_type: string | null
   size_bytes: number | null
   duration_ms: number | null
   status: 'UPLOADED' | 'PROCESSING' | 'DONE' | 'FAILED' | string
+  error_message?: string | null
   audio_url: string | null
   created_at: string
 }
@@ -70,6 +71,15 @@ export interface Transcript {
   edited: boolean
   source_dirty: boolean
   turns: Utterance[]
+}
+
+export interface AsrJob {
+  job_id: string
+  status: string
+  total_recordings: number
+  completed_recordings: number
+  error_message: string | null
+  transcript: Transcript | null
 }
 
 export interface MedicalRecordContent {

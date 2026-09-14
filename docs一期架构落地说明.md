@@ -1,6 +1,6 @@
 # MedicalAI 一期架构落地说明
 
-当前代码已增加 `backend/`、`frontend/`、`ai_service/` 三个可独立启动的骨架。Java 服务负责登录、患者和接诊；Python 服务提供 Mock ASR/病历生成接口；Vue 前端提供演示登录和患者/接诊工作台。
+当前代码已增加 `backend/`、`frontend/`、`ai_service/` 三个可独立启动的骨架。Java 服务负责登录、患者、接诊和 DashScope ASR；Python 服务暂提供病历生成接口；Vue 前端提供登录和患者/接诊工作台。
 
 ## 本地启动
 
