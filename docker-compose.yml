@@ -9,10 +9,14 @@ services:
     build:
       context: ./backend
     environment:
-      DB_URL: jdbc:postgresql://192.168.1.30:5432/medicalai
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
-      AI_SERVICE_BASE_URL: http://ai:8000
+      DB_URL: ${DB_URL:-jdbc:postgresql://192.168.1.30:5432/medicalai}
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      AI_SERVICE_BASE_URL: ${AI_SERVICE_BASE_URL:-http://ai:8000}
+      LOCAL_ASR_BASE_URL: ${LOCAL_ASR_BASE_URL:-http://ai:8000}
+      LOCAL_ASR_CONNECT_TIMEOUT_MS: ${LOCAL_ASR_CONNECT_TIMEOUT_MS:-5000}
+      LOCAL_ASR_POLL_DELAY_MS: ${LOCAL_ASR_POLL_DELAY_MS:-3000}
+      LOCAL_ASR_READ_TIMEOUT_MS: ${LOCAL_ASR_READ_TIMEOUT_MS:-600000}
       STORAGE_ROOT: /data/recordings
       MINIO_API_ENDPOINT: ${MINIO_API_ENDPOINT:-http://106.55.225.222:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
@@ -20,22 +24,26 @@ services:
       MINIO_BUCKET_NAME: medicalai
       MINIO_FOLDER_PREFIX: medicalai
       MINIO_ANONYMOUS_READ: "true"
-      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       DASHSCOPE_ENDPOINT: https://dashscope.aliyuncs.com
+      DASHSCOPE_ROLE_MODEL: ${DASHSCOPE_ROLE_MODEL:-qwen-plus}
       DASHSCOPE_ASR_MODEL: qwen-audio-3.0-asr-flash-filetrans
     ports:
       - "8080:8189"
-    depends_on:
-      - ai
     volumes:
       - medicalai_data:/data
   ai:
+    profiles: [local-ai]
     build:
       context: .
       dockerfile: ai_service/Dockerfile
     environment:
       ASR_DEVICE: cuda:0
       ASR_HUB: ms
+      ASR_MODEL: ${ASR_MODEL:-}
+      ASR_VAD_MODEL: ${ASR_VAD_MODEL:-fsmn-vad}
+      ASR_SPK_MODEL: ${ASR_SPK_MODEL:-iic/speech_eres2netv2_sv_zh-cn_16k-common}
+      ASR_OFFLINE: ${ASR_OFFLINE:-0}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-qwen-plus}
@@ -44,6 +52,7 @@ services:
       - "8000:8000"
     volumes:
       - medicalai_models:/workspace/.cache
+      - ${ASR_MODELS_DIR:-./models}:/models:ro
     deploy:
       resources:
         reservations:
@@ -55,8 +64,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: medicalai
-      MINIO_ROOT_PASSWORD: medicalai-demo-password
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
     ports:
       - "9000:9000"
       - "9001:9001"

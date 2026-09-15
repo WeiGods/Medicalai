@@ -2,7 +2,9 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../api'
 import Icon from './Icon.vue'
-import type { Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
+import { formatDateTime } from '../dateTime'
+import { roleLabel } from '../asrRoles'
+import type { AsrProvider, Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
@@ -20,6 +22,8 @@ const view = ref<MainView>('workbench')
 const queueSearch = ref('')
 const busy = ref(false)
 const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'save' | 'confirm'>('')
+const asrProvider = ref<AsrProvider>('DASHSCOPE')
+const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
 const transcript = ref<Transcript | null>(null)
 const record = ref<MedicalRecord | null>(null)
@@ -206,11 +210,11 @@ const segments = computed(() => {
   const source = transcript.value
   if (!source) return []
   if (source.turns.length && !source.edited) {
-    return source.turns.map(item => ({ role: item.role === 'DOCTOR' ? '医生' : item.role === 'PATIENT' ? '患者' : '其他人', time: formatTime(item.start_ms), text: item.text }))
+    return source.turns.map(item => ({ role: roleLabel(item), time: formatTime(item.start_ms), text: item.text }))
   }
   return source.transcript.split(/\n+/).filter(Boolean).map((line, index) => {
-    const match = line.match(/^(医生|患者)[：:]\s*(.*)$/)
-    return { role: match ? match[1] : '其他人', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
+    const match = line.match(/^(医生|患者|其他人|未识别角色|说话人 ?[0-9]+)[：:]\s*(.*)$/)
+    return { role: match ? match[1] : '未识别角色', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
   })
 })
 const facts = computed(() => {
@@ -233,8 +237,7 @@ const formatDuration = (ms: number | null) => {
 }
 const formatRecordingDuration = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 const formatTime = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
-const formatDateTime = (value: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : ''
-const visitDate = computed(() => currentVisit.value ? currentVisit.value.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10))
+const visitDate = computed(() => currentVisit.value ? formatDateTime(currentVisit.value.created_at).slice(0, 10) : formatDateTime(new Date()).slice(0, 10))
 const isPlaying = (item: Recording) => playingId.value === item.id
 const avatarClass = (patient: Patient | null) => patient?.patient_no === '002' ? 'lilac' : patient?.patient_no === '003' ? 'blue' : ''
 const highlightText = (text: string) => [{ text, mark: false }]
@@ -249,7 +252,7 @@ function toast(text: string) {
 }
 
 function addLog(text: string) {
-  activity.value.unshift({ time: new Date().toLocaleString('zh-CN', { hour12: false }), text })
+  activity.value.unshift({ time: formatDateTime(new Date()), text })
 }
 
 async function refreshCore(keepSelection = true) {
@@ -523,17 +526,26 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
   if (view.value === 'workbench') toast('录音已上传，可开始转写。')
 }
 
+watch(() => currentVisit.value?.id, () => {
+  asrProvider.value = 'DASHSCOPE'
+  activeAsrProvider.value = null
+})
+
 async function startTranscription() {
   if (!currentVisit.value || locked.value) return
   actionBusy.value = 'transcribe'
   try {
     const visitId = currentVisit.value.id
-    const job = await api.transcribe(visitId)
+    const job = await api.transcribe(visitId, asrProvider.value)
+    if (currentVisit.value?.id !== visitId) return
+    activeAsrProvider.value = job.provider_route
     await loadAll(true)
-    addLog('已提交真实 ASR 转写任务')
+    addLog(`已提交${job.provider_route === 'LOCAL' ? '本地' : '公网'} ASR 转写任务`)
     for (let attempt = 0; attempt < 240; attempt++) {
       await new Promise(resolve => window.setTimeout(resolve, 3000))
+      if (currentVisit.value?.id !== visitId) return
       const state = await api.transcribeStatus(visitId, job.job_id)
+      if (currentVisit.value?.id !== visitId) return
       await loadAll(true)
       if (state.status === 'SUCCEEDED') {
         transcript.value = state.transcript
@@ -1095,6 +1107,15 @@ defineExpose({ selectPatient })
                   <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
+              <div v-if="recordings.length" class="asr-controls">
+                <fieldset :disabled="locked" class="asr-selector">
+                  <legend>转写模型</legend>
+                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网 ASR</label>
+                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地 ASR</label>
+                </fieldset>
+                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
+                <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
+              </div>
               <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" style="margin-top:13px">
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
@@ -1106,7 +1127,8 @@ defineExpose({ selectPatient })
               <button class="text-btn" :disabled="!transcriptDraft" aria-label="复制转写文本" @click="copyTranscript"><Icon name="copy" /></button>
             </div>
             <template v-if="transcriptDraft">
-              <div class="transcript-tabs">
+              <p v-if="transcript?.turns?.length && transcript.turns.every(item => item.role !== 'DOCTOR' && item.role !== 'PATIENT')" class="issue-hint">当前结果保留说话人信息，尚未标注医生／患者。可在编辑文本中核对角色；本地 ASR 不自动判断医疗身份。</p>
+          <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
                 <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
                 <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
@@ -1244,6 +1266,15 @@ defineExpose({ selectPatient })
                   <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
+              <div v-if="recordings.length" class="asr-controls">
+                <fieldset :disabled="locked" class="asr-selector">
+                  <legend>转写模型</legend>
+                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网 ASR</label>
+                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地 ASR</label>
+                </fieldset>
+                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
+                <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
+              </div>
               <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
@@ -1279,6 +1310,7 @@ defineExpose({ selectPatient })
       <div v-else-if="view === 'transcript'" class="full-view">
         <section class="card">
           <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div>
+          <p v-if="transcript?.turns?.length && transcript.turns.every(item => item.role !== 'DOCTOR' && item.role !== 'PATIENT')" class="issue-hint">当前结果保留说话人信息，尚未标注医生／患者。可在编辑文本中核对角色；本地 ASR 不自动判断医疗身份。</p>
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
             <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>

@@ -33,7 +33,10 @@ public class DashScopeAsrClient {
         this.apiKey = apiKey == null ? "" : apiKey.trim();
         this.model = model;
         this.diarizationEnabled = diarizationEnabled;
-        this.client = RestClient.builder().baseUrl(endpoint).build();
+        var factory = new org.springframework.http.client.JdkClientHttpRequestFactory(
+                java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build());
+        factory.setReadTimeout(java.time.Duration.ofSeconds(60));
+        this.client = RestClient.builder().baseUrl(endpoint).requestFactory(factory).build();
     }
 
     public String submit(String fileUrl) {
@@ -72,7 +75,7 @@ public class DashScopeAsrClient {
         }
     }
 
-    public List<Segment> result(Task task) {
+    public List<AsrSegment> result(Task task) {
         JsonNode result = task.output();
         String resultUrl = findUrl(result);
         if (!resultUrl.isBlank()) {
@@ -84,12 +87,12 @@ public class DashScopeAsrClient {
                 throw unavailable("DashScope ASR 结果下载失败", e);
             }
         }
-        List<Segment> segments = new ArrayList<>();
+        List<AsrSegment> segments = new ArrayList<>();
         collectSegments(result, segments);
         return segments;
     }
 
-    private void collectSegments(JsonNode node, List<Segment> segments) {
+    private void collectSegments(JsonNode node, List<AsrSegment> segments) {
         if (node == null || node.isMissingNode() || node.isNull()) return;
         if (node.isArray()) {
             node.forEach(item -> collectSegments(item, segments));
@@ -101,7 +104,7 @@ public class DashScopeAsrClient {
         Long start = firstNumber(node, "begin_time", "start_time", "start_ms", "startMs", "start");
         Long end = firstNumber(node, "end_time", "end_time_ms", "end_ms", "endMs", "end");
         if (!text.isBlank() && start != null && end != null) {
-            segments.add(new Segment(text.strip(), Math.max(0, start), Math.max(start, end), speakerId));
+            segments.add(new AsrSegment(text.strip(), Math.max(0, start), Math.max(start, end), speakerId));
             return;
         }
         node.fields().forEachRemaining(entry -> collectSegments(entry.getValue(), segments));
@@ -172,5 +175,4 @@ public class DashScopeAsrClient {
     }
 
     public record Task(String taskId, String status, JsonNode output) {}
-    public record Segment(String text, long startMs, long endMs, Integer speakerId) {}
 }

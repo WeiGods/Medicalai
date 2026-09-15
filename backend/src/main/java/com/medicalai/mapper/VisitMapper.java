@@ -24,7 +24,7 @@ public class VisitMapper {
     }
 
     public Optional<Visit> find(UUID id, UUID doctorId, boolean lock) {
-        return jdbc.query("SELECT * FROM visit WHERE id=? AND doctor_id=?",
+        return jdbc.query("SELECT * FROM visit WHERE id=? AND doctor_id=?" + (lock ? " FOR UPDATE" : ""),
                 ROW,id,doctorId).stream().findFirst();
     }
 

@@ -1,5 +1,5 @@
 import type {
-  AsrJob, Confirmation, Doctor, LoginResult, MedicalRecord, Patient, RecordExport,
+  AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, MedicalRecord, Patient, RecordExport,
   Recording, Transcript, Visit
 } from './types'
 
@@ -74,7 +74,7 @@ export const api = {
     body.append('duration_ms', String(Math.round(durationMs)))
     return request<Recording>(`/api/v1/visits/${visitId}/recordings`, { method: 'POST', body }, false)
   },
-  transcribe: (visitId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe`, { method: 'POST' }),
+  transcribe: (visitId: string, provider: AsrProvider) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe`, { method: 'POST', body: JSON.stringify({ provider }) }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
   transcript: (visitId: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`),
   saveTranscript: (visitId: string, transcript: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`, {

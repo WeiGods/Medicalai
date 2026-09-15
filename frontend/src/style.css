@@ -215,3 +215,5 @@ body.modal-open{overflow:hidden}
   .manual-patient-grid{grid-template-columns:1fr}
   .manual-patient-wide{grid-column:auto}
 }
+
+.asr-controls{margin-top:16px}.asr-selector{display:flex;flex-wrap:wrap;gap:16px;border:1px solid #dce7e1;border-radius:10px;padding:12px}.asr-selector legend{font-size:12px;padding:0 6px}.asr-selector label{display:flex;align-items:center;gap:6px;font-size:13px}.asr-selector input{accent-color:#168477}.asr-selector:disabled{opacity:.6}

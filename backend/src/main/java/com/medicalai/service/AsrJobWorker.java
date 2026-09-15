@@ -1,163 +1,128 @@
 package com.medicalai.service;
 
-import com.medicalai.domain.Recording;
-import com.medicalai.domain.Utterance;
 import com.medicalai.mapper.RecordingMapper;
-import com.medicalai.mapper.MedicalRecordMapper;
-import com.medicalai.mapper.VisitMapper;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.IntStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+/** Network/model work runs outside transactions and on separate route schedulers. */
 @Service
 public class AsrJobWorker {
     private static final Logger LOG = LoggerFactory.getLogger(AsrJobWorker.class);
-    private final RecordingMapper recordings;
+    private final AsrJobStore store;
     private final AudioStorageService storage;
-    private final DashScopeAsrClient dashscope;
-    private final AiServiceClient ai;
-    private final MedicalRecordMapper records;
-    private final VisitMapper visits;
-    private final long pollTimeoutMs;
+    private final DashScopeAsrClient cloud;
+    private final LocalAsrClient local;
+    private final DashScopeRoleClient cloudRoles;
+    private final ScheduledExecutorService heartbeat;
+    private final long publicTimeoutMs;
 
-    public AsrJobWorker(RecordingMapper recordings, AudioStorageService storage, DashScopeAsrClient dashscope,
-                        MedicalRecordMapper records, VisitMapper visits, AiServiceClient ai,
-                        @Value("${medicalai.dashscope.timeout-ms:600000}") long pollTimeoutMs) {
-        this.recordings = recordings;
-        this.storage = storage;
-        this.dashscope = dashscope;
-        this.ai = ai;
-        this.records = records;
-        this.visits = visits;
-        this.pollTimeoutMs = Math.max(30_000, pollTimeoutMs);
+    public AsrJobWorker(AsrJobStore store, AudioStorageService storage, DashScopeAsrClient cloud,
+            LocalAsrClient local, DashScopeRoleClient cloudRoles,
+            @Qualifier("asrLeaseHeartbeat") ScheduledExecutorService heartbeat,
+            @Value("${medicalai.dashscope.timeout-ms:600000}") long publicTimeoutMs) {
+        this.store=store; this.storage=storage; this.cloud=cloud; this.local=local;
+        this.cloudRoles=cloudRoles; this.heartbeat=heartbeat; this.publicTimeoutMs=publicTimeoutMs;
     }
 
-    @Scheduled(fixedDelayString = "${medicalai.dashscope.poll-delay-ms:3000}")
-    @Transactional
-    public void processOne() {
-        var job = recordings.claimNextAsrJob(UUID.randomUUID());
-        if (job.isEmpty()) return;
-        RecordingMapper.AsrJob current = job.get();
+    @Scheduled(scheduler="publicAsrScheduler", fixedDelayString="${medicalai.dashscope.poll-delay-ms:3000}")
+    public void processPublic() { process("DASHSCOPE"); }
+
+    @Scheduled(scheduler="localAsrScheduler", fixedDelayString="${medicalai.local-asr.poll-delay-ms:3000}")
+    public void processLocal() { process("LOCAL"); }
+
+    private void process(String provider) {
+        UUID token = UUID.randomUUID();
+        var claimed = store.claim(provider, token);
+        if (claimed.isEmpty()) return;
+        var job = claimed.get();
+        AtomicBoolean lost = new AtomicBoolean(false);
+        ScheduledFuture<?> renewal = heartbeat.scheduleWithFixedDelay(() -> {
+            try {
+                if (!store.renew(job.id(), token)) lost.set(true);
+            } catch (Exception e) {
+                lost.set(true);
+                LOG.warn("ASR lease renewal failed: jobId={}, provider={}", job.id(), provider);
+            }
+        }, 20, 20, TimeUnit.SECONDS);
         try {
-            if ("PENDING".equals(current.status())) {
-                submitNext(current);
-            } else {
-                if (current.startedAt() != null && System.currentTimeMillis() - current.startedAt().toEpochMilli() > pollTimeoutMs) {
-                    throw new IllegalStateException("DashScope ASR 任务等待超时");
+            if (!provider.equals(job.providerRoute())) throw new IllegalStateException("ASR 任务路由不匹配");
+            if ("PENDING".equals(job.status())) {
+                var recording = store.begin(job, token);
+                if ("LOCAL".equals(provider)) {
+                    var result = local.transcribe(storage.load(recording.objectKey()), recording.fileName(), recording.mimeType());
+                    checkLease(lost);
+                    store.complete(job, token, recording.id(), localTurns(result));
+                } else {
+                    String taskId = cloud.submit(storage.presignedUrl(recording.objectKey()));
+                    checkLease(lost);
+                    store.submitted(job, token, recording.id(), taskId);
                 }
-                poll(current);
+            } else if ("LOCAL".equals(provider)) {
+                // A synchronous local job can only be reclaimed after its worker lost
+                // the lease or stopped. Never replay potentially ongoing inference.
+                throw new IllegalStateException("本地 ASR 任务已中断，请手动重试");
+            } else {
+                pollPublic(job, token, lost);
             }
+        } catch (AsrJobStore.LeaseLostException e) {
+            LOG.warn("Discarding stale ASR execution: jobId={}, provider={}", job.id(), provider);
         } catch (Exception e) {
-            String message = safeMessage(e);
-            UUID recordingId = current.recordingId();
-            if (recordingId == null) {
-                recordingId = recordings.asrJob(current.id(), current.visitId())
-                        .map(RecordingMapper.AsrJob::recordingId).orElse(null);
+            String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            if (message.length() > 1000) message=message.substring(0,1000);
+            LOG.error("ASR failed: jobId={}, provider={}, message={}", job.id(), provider, message);
+            try {
+                checkLease(lost);
+                store.fail(job, token, message);
+            } catch (AsrJobStore.LeaseLostException ignored) {
+                LOG.warn("Stale failure ignored: jobId={}", job.id());
             }
-            LOG.error("ASR job failed: jobId={}, visitId={}, recordingId={}, message={}",
-                    current.id(), current.visitId(), recordingId, message, e);
-            if (recordingId != null) recordings.updateStatus(recordingId, "FAILED", message);
-            recordings.markAsrFailed(current.id(), message);
+        } finally {
+            renewal.cancel(false);
         }
     }
 
-    private void submitNext(RecordingMapper.AsrJob job) {
-        Recording recording = recordings.findByVisitAndStatus(job.visitId(), "UPLOADED")
-                .orElseThrow(() -> new IllegalStateException("没有待转写录音"));
-        if (recording.objectKey() == null || recording.objectKey().isBlank()) {
-            throw new IllegalStateException("录音对象不存在");
-        }
-        recordings.bindAsrRecording(job.id(), recording.id());
-        recordings.updateStatus(recording.id(), "PROCESSING", null);
-        String url = storage.presignedUrl(recording.objectKey());
-        String taskId = dashscope.submit(url);
-        recordings.updateAsrSubmission(job.id(), recording.id(), taskId);
-        LOG.info("ASR task submitted: jobId={}, visitId={}, recordingId={}, taskId={}",
-                job.id(), job.visitId(), recording.id(), taskId);
-    }
-
-    private void poll(RecordingMapper.AsrJob job) {
-        if (job.providerTaskId() == null || job.providerTaskId().isBlank() || job.recordingId() == null) {
-            throw new IllegalStateException("ASR 任务缺少 provider task id");
-        }
-        DashScopeAsrClient.Task task = dashscope.query(job.providerTaskId());
-        if ("PENDING".equals(task.status()) || "RUNNING".equals(task.status())) {
-            recordings.releaseAsrJob(job.id());
+    private void pollPublic(RecordingMapper.AsrJob job, UUID token, AtomicBoolean lost) {
+        if (job.startedAt()!=null && System.currentTimeMillis()-job.startedAt().toEpochMilli()>publicTimeoutMs)
+            throw new IllegalStateException("公网 ASR 任务等待超时");
+        if (job.providerTaskId()==null || job.providerTaskId().isBlank() || job.recordingId()==null)
+            throw new IllegalStateException("公网 ASR 提交已中断，缺少任务编号，请手动重试");
+        var task=cloud.query(job.providerTaskId());
+        checkLease(lost);
+        if (Set.of("PENDING","RUNNING").contains(task.status())) {
+            store.release(job, token);
             return;
         }
-        if (!"SUCCEEDED".equals(task.status())) {
-            throw new IllegalStateException("DashScope 任务状态：" + task.status());
-        }
-        List<DashScopeAsrClient.Segment> segments = dashscope.result(task);
-        if (segments.isEmpty()) throw new IllegalStateException("DashScope 返回空转写结果");
-
-        UUID sessionId = recordings.createSession(job.visitId(), job.recordingId());
-        List<RecordingMapper.Turn> rawTurns = segments.stream()
-                .map(segment -> new RecordingMapper.Turn("OTHER", segment.text(), segment.startMs(), segment.endMs(), segment.speakerId())).toList();
-        var roleInput = rawTurns.stream().map(t -> java.util.Map.<String,Object>of("speaker_id", t.speakerId() == null ? "unknown" : t.speakerId(), "text", t.text())).toList();
-        var roles = ai.assignRoles(roleInput);
-        List<RecordingMapper.Turn> turns = rawTurns.stream().map(t -> new RecordingMapper.Turn(
-                t.speakerId() == null ? "OTHER" : roles.getOrDefault(t.speakerId(), "OTHER"),
-                t.text(), t.startMs(), t.endMs(), t.speakerId())).toList();
-        recordings.insertUtterances(job.visitId(), job.recordingId(), sessionId, turns);
-        recordings.updateStatus(job.recordingId(), "DONE", null);
-
-        boolean pending = recordings.list(job.visitId()).stream().anyMatch(r -> "UPLOADED".equals(r.status()));
-        if (pending) {
-            recordings.prepareNextAsrRecording(job.id());
-            return;
-        }
-        finalizeVisit(job, job.recordingId(), sessionId);
-        recordings.markAsrSucceeded(job.id());
+        if (!"SUCCEEDED".equals(task.status())) throw new IllegalStateException("公网 ASR 任务状态："+task.status());
+        var turns=publicTurns(cloud.result(task));
+        checkLease(lost);
+        store.complete(job, token, job.recordingId(), turns);
     }
 
-    private void finalizeVisit(RecordingMapper.AsrJob job, UUID recordingId, UUID sessionId) {
-        List<RecordingMapper.Turn> turns = new ArrayList<>();
-        List<UUID> utteranceIds = new ArrayList<>();
-        Recording last = null;
-        for (Recording recording : recordings.list(job.visitId())) {
-            if (!"DONE".equals(recording.status())) continue;
-            last = recording;
-            for (Utterance utterance : recordings.listByRecording(recording.id())) {
-                turns.add(new RecordingMapper.Turn(utterance.role(), utterance.text(), utterance.startMs(), utterance.endMs()));
-                utteranceIds.add(utterance.id());
-            }
-        }
-        if (turns.isEmpty() || last == null) throw new IllegalStateException("没有可保存的转写句段");
-        String hash = hash(job.visitId(), turns);
-        UUID snapshotId = recordings.createSnapshot(job.visitId(), last.id(), sessionId, turns, utteranceIds, hash);
-        recordings.saveTranscript(job.visitId(), snapshotId, transcriptText(turns), false);
-        records.audit(visits.doctorId(job.visitId()), job.visitId(), "TRANSCRIPT_CREATED", snapshotId);
-        LOG.info("ASR transcription completed: jobId={}, visitId={}, snapshotId={}, utterances={}",
-                job.id(), job.visitId(), snapshotId, turns.size());
+    private List<RecordingMapper.Turn> localTurns(List<AsrSegment> result) {
+        return result.stream().map(s -> new RecordingMapper.Turn("OTHER",s.text(),s.startMs(),s.endMs(),s.speakerId())).toList();
     }
 
-    private String transcriptText(List<RecordingMapper.Turn> turns) {
-        return turns.stream().map(t -> ("DOCTOR".equals(t.role()) ? "医生" : "PATIENT".equals(t.role()) ? "患者" : "其他人") + "：" + t.text()).reduce((a, b) -> a + "\n\n" + b).orElse("");
+    private List<RecordingMapper.Turn> publicTurns(List<AsrSegment> result) {
+        if (result.isEmpty()) throw new IllegalStateException("公网 ASR 返回空句段");
+        var input=IntStream.range(0,result.size()).mapToObj(i -> Map.<String,Object>of(
+                "speaker_id",roleKey(result.get(i),i),"text",result.get(i).text())).toList();
+        var roles=cloudRoles.assignRoles(input);
+        return IntStream.range(0,result.size()).mapToObj(i -> {
+            var s=result.get(i);
+            return new RecordingMapper.Turn(roles.getOrDefault(roleKey(s,i),"OTHER"),s.text(),s.startMs(),s.endMs(),s.speakerId());
+        }).toList();
     }
 
-    private String hash(UUID visitId, List<RecordingMapper.Turn> turns) {
-        try {
-            String source = visitId + "|" + turns.stream().map(t -> t.role() + ":" + t.text())
-                    .reduce((a, b) -> a + "\n" + b).orElse("");
-            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(source.getBytes(StandardCharsets.UTF_8)));
-        } catch (Exception e) {
-            throw new IllegalStateException("转写快照哈希生成失败", e);
-        }
+    private int roleKey(AsrSegment segment,int index) {
+        return segment.speakerId()!=null && segment.speakerId()>=0 ? segment.speakerId() : -index-1;
     }
-
-    private String safeMessage(Exception e) {
-        String message = e.getMessage();
-        if (message == null || message.isBlank()) message = e.getClass().getSimpleName();
-        return message.length() > 1000 ? message.substring(0, 1000) : message;
-    }
+    private void checkLease(AtomicBoolean lost) { if (lost.get()) throw new AsrJobStore.LeaseLostException(); }
 }

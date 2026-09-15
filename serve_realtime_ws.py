@@ -535,6 +535,12 @@ _spk_model = None
 def load_models(args):
     global _vllm_engine, _asr_kwargs, _vad_model, _spk_model
     if _vllm_engine is None:
+        if getattr(args, "offline", False):
+            paths = [args.model, args.vad_model]
+            if not getattr(args, "disable_spk", False):
+                paths.append(args.spk_model)
+            if any(not os.path.isdir(path) for path in paths):
+                raise RuntimeError("离线模式要求 ASR_MODEL、ASR_VAD_MODEL、ASR_SPK_MODEL 指向已准备好的本地模型目录")
         from funasr import AutoModel
         from funasr.auto.auto_model_vllm import AutoModelVLLM
 
@@ -560,14 +566,14 @@ def load_models(args):
             logger.info(f"Language: {args.language}")
 
         logger.info("Loading VAD: fsmn-vad (streaming)")
-        _vad_model = AutoModel(model="fsmn-vad", device=args.device, disable_update=True)
+        _vad_model = AutoModel(model=getattr(args, "vad_model", "fsmn-vad"), device=args.device, disable_update=True)
 
         if getattr(args, "disable_spk", False):
             logger.info("SPK disabled by --disable-spk")
             _spk_model = None
         else:
             logger.info("Loading SPK: eres2netv2")
-            _spk_model = AutoModel(model="iic/speech_eres2netv2_sv_zh-cn_16k-common", device=args.device, disable_update=True)
+            _spk_model = AutoModel(model=getattr(args, "spk_model", "iic/speech_eres2netv2_sv_zh-cn_16k-common"), device=args.device, disable_update=True)
 
         logger.info("All models ready!")
     return _vllm_engine, _asr_kwargs, _vad_model, _spk_model

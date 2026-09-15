@@ -23,7 +23,7 @@ public class RecordingMapper {
             rs.getObject("session_id", UUID.class), rs.getString("utterance_id"), rs.getInt("revision"),
             rs.getString("result_type"), rs.getString("text"), rs.getString("role"),
             rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getBoolean("is_current"),
-            rs.getTimestamp("created_at").toInstant());
+            rs.getTimestamp("created_at").toInstant(), rs.getObject("speaker_id", Integer.class));
 
     private final JdbcTemplate jdbc;
     public RecordingMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
@@ -64,53 +64,79 @@ public class RecordingMapper {
                 RECORDING, visitId, status).stream().findFirst();
     }
 
-    public UUID createAsrJob(UUID visitId) {
+    public UUID createAsrJob(UUID visitId, String provider) {
         UUID id = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,provider_route)
-                VALUES (?,?,?,?,'PENDING','DASHSCOPE')
-                """, id, "ASR_TRANSCRIBE", visitId, "asr:" + visitId + ":" + id);
+                VALUES (?,?,?,?,'PENDING',?)
+                """, id, "ASR_TRANSCRIBE", visitId, "asr:" + visitId + ":" + id, provider);
         return id;
     }
 
-    public Optional<AsrJob> claimNextAsrJob(UUID leaseToken) {
+    public Optional<AsrJob> claimNextAsrJob(UUID leaseToken, String provider) {
         List<AsrJob> jobs = jdbc.query("""
                 WITH candidate AS (
                     SELECT j.id
                     FROM ai_job j
                     WHERE j.job_type='ASR_TRANSCRIBE'
                       AND j.status IN ('PENDING','RUNNING')
-                      AND (j.locked_at IS NULL OR j.locked_at < now() - interval '2 minutes')
+                      AND COALESCE(j.provider_route,'DASHSCOPE')=?
+                      AND (j.locked_at IS NULL OR j.locked_at < clock_timestamp() - interval '2 minutes')
                     ORDER BY j.created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE ai_job j
-                SET locked_at=now(), lease_token=?
+                SET locked_at=clock_timestamp(), lease_token=?
                 FROM candidate c
                 WHERE j.id=c.id
-                RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at
+                RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at,j.provider_route
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), leaseToken);
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), provider, leaseToken);
         return jobs.stream().findFirst();
+    }
+
+    /** Called inside a short transaction before any job or result mutation. */
+    public boolean lockAsrLease(UUID jobId, UUID token) {
+        return !jdbc.queryForList("""
+                SELECT id FROM ai_job WHERE id=? AND lease_token=?
+                  AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
+                  AND locked_at > clock_timestamp() - interval '2 minutes'
+                FOR UPDATE
+                """, jobId, token).isEmpty();
+    }
+
+    public boolean renewAsrLease(UUID jobId, UUID token) {
+        return jdbc.update("""
+                UPDATE ai_job SET locked_at=clock_timestamp()
+                WHERE id=? AND lease_token=? AND job_type='ASR_TRANSCRIBE'
+                  AND status IN ('PENDING','RUNNING')
+                  AND locked_at > clock_timestamp() - interval '2 minutes'
+                """, jobId, token) == 1;
+    }
+
+    public void lockVisit(UUID visitId) {
+        jdbc.queryForList("SELECT id FROM visit WHERE id=? FOR UPDATE", visitId);
+    }
+
+    // Mutators below require lockAsrLease in the SAME transaction. Holding that
+    // row lock prevents a newer lease owner from being installed before commit.
+    public void beginAsrRecording(UUID jobId, UUID recordingId, String provider) {
+        jdbc.update("""
+                UPDATE ai_job SET status='RUNNING',recording_id=?,started_at=now(),
+                    attempt_count=attempt_count+1,last_error=NULL WHERE id=?
+                """, recordingId, jobId);
+        jdbc.update("UPDATE recording SET asr_route=? WHERE id=?", provider, recordingId);
     }
 
     public void updateAsrSubmission(UUID jobId, UUID recordingId, String providerTaskId) {
         jdbc.update("""
-                UPDATE ai_job SET status='RUNNING',recording_id=?,provider_task_id=?,attempt_count=attempt_count+1,
-                    started_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
-                WHERE id=? AND job_type='ASR_TRANSCRIBE'
-                """, recordingId, providerTaskId, jobId);
-    }
-
-    /** Bind a pending job to its recording before any provider call can fail. */
-    public void bindAsrRecording(UUID jobId, UUID recordingId) {
-        jdbc.update("""
-                UPDATE ai_job SET recording_id=?
-                WHERE id=? AND job_type='ASR_TRANSCRIBE' AND status='PENDING'
-                """, recordingId, jobId);
+                UPDATE ai_job SET provider_task_id=?,locked_at=NULL,lease_token=NULL
+                WHERE id=? AND recording_id=? AND job_type='ASR_TRANSCRIBE'
+                """, providerTaskId, jobId, recordingId);
     }
 
     /** Makes failed jobs, and pre-fix orphaned PROCESSING rows, eligible for an explicit retry. */
@@ -154,23 +180,25 @@ public class RecordingMapper {
 
     public Optional<AsrJob> asrJob(UUID jobId, UUID visitId) {
         return jdbc.query("""
-                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
                 FROM ai_job WHERE id=? AND visit_id=? AND job_type='ASR_TRANSCRIBE'
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), jobId, visitId).stream().findFirst();
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), jobId, visitId).stream().findFirst();
     }
 
     public Optional<AsrJob> latestAsrJob(UUID visitId) {
         return jdbc.query("""
-                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
                 FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'
                 ORDER BY created_at DESC LIMIT 1
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant()), visitId).stream().findFirst();
+                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId).stream().findFirst();
     }
 
     public UUID createSession(UUID visitId, UUID recordingId) {
@@ -191,7 +219,7 @@ public class RecordingMapper {
             jdbc.update("""
                     INSERT INTO asr_utterance(id,visit_id,recording_id,session_id,utterance_id,revision,result_type,
                                               text,role,speaker_id,role_source,start_ms,end_ms,is_current)
-                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,'AUTO',?,?,true)
+                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,'AUTO',?,?,true)
                     """, id, visitId, recordingId, sessionId, "u-" + (i + 1), 0,
                     t.text(), t.role(), t.speakerId(), t.startMs(), t.endMs());
         }
@@ -291,7 +319,7 @@ public class RecordingMapper {
             Turn t = turns.get(i);
             if (i > 0) json.append(',');
             json.append("{\"role\":\"").append(escape(t.role())).append("\",\"text\":\"").append(escape(t.text()))
-                    .append("\",\"startMs\":").append(t.startMs()).append(",\"endMs\":").append(t.endMs()).append('}');
+                    .append("\",\"startMs\":").append(t.startMs()).append(",\"endMs\":").append(t.endMs()).append(",\"speaker_id\":").append(t.speakerId()).append('}');
         }
         return json.append(']').toString();
     }
@@ -305,5 +333,5 @@ public class RecordingMapper {
     }
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
     public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
-                         int attemptCount, String lastError, Instant startedAt) {}
+                         int attemptCount, String lastError, Instant startedAt, String providerRoute) {}
 }

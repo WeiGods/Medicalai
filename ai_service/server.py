@@ -24,6 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+if os.environ.get("ASR_OFFLINE") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import serve_realtime_ws as rt
 
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket
@@ -55,6 +59,9 @@ class ServiceSettings:
         model, hub = resolve_model()
         self.args = SimpleNamespace(
             model=model,
+            vad_model=_env("ASR_VAD_MODEL", "fsmn-vad"),
+            spk_model=_env("ASR_SPK_MODEL", "iic/speech_eres2netv2_sv_zh-cn_16k-common"),
+            offline=_env("ASR_OFFLINE", "0") == "1",
             hub=hub,
             device=_env("ASR_DEVICE", "cuda:0"),
             language=_env("ASR_LANGUAGE"),
@@ -156,6 +163,7 @@ def _transcribe_sync(pcm: np.ndarray) -> list[dict]:
         spk = sent.get("spk")
         utterances.append({
             "role": f"SPEAKER_{spk}" if spk is not None else "UNKNOWN",
+            "speaker_id": int(spk) if spk is not None else None,
             "text": text,
             "start_ms": int(sent.get("start") or 0),
             "end_ms": int(sent.get("end") or 0),

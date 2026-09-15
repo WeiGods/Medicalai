@@ -53,13 +53,14 @@ public class AiServiceClient {
             }
             return result;
         } catch (Exception e) {
-            LOG.warn("Speaker role assignment unavailable; using OTHER");
+            LOG.warn("Speaker role assignment failed: endpoint={}/internal/transcript/assign-roles, status={}, exception={}. Check AI deployment and LLM configuration",
+                    baseUrl, e instanceof RestClientResponseException response ? response.getStatusCode().value() : null, e.getClass().getSimpleName());
             return Map.of();
         }
     }
 
     private String normalizeRole(String role) {
-        return switch (role.toUpperCase()) { case "DOCTOR" -> "DOCTOR"; case "PATIENT" -> "PATIENT"; default -> "OTHER"; };
+        return switch (role.strip().toUpperCase(java.util.Locale.ROOT)) { case "DOCTOR" -> "DOCTOR"; case "PATIENT" -> "PATIENT"; default -> "OTHER"; };
     }
 
     private void logFailure(String endpoint, String details, Exception error) {

@@ -32,6 +32,8 @@ public class ClinicalWorkflowService {
     private final AudioStorageService storage;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
+    private String dashscopeApiKey;
 
     public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
                                    MedicalRecordMapper records, AiServiceClient ai, AudioStorageService storage,
@@ -76,13 +78,16 @@ public class ClinicalWorkflowService {
     }
 
     @Transactional(noRollbackFor = BusinessException.class)
-    public AsrJobVO transcribe(UUID visitId, UUID doctorId) {
+    public AsrJobVO transcribe(UUID visitId, UUID doctorId, String provider) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
         Optional<RecordingMapper.AsrJob> active = recordings.latestAsrJob(visit.id())
                 .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
         if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
+        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
+        }
         recordings.requeueRetryableRecordings(visit.id());
         // Recover stale PROCESSING rows before validating storage credentials
         // so failed submissions leave recordings in a retryable state.
@@ -90,7 +95,7 @@ public class ClinicalWorkflowService {
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
-        UUID jobId = recordings.createAsrJob(visit.id());
+        UUID jobId = recordings.createAsrJob(visit.id(), provider);
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -102,7 +107,7 @@ public class ClinicalWorkflowService {
         List<Recording> all = recordings.list(visit.id());
         int completed = (int) all.stream().filter(r -> "DONE".equals(r.status())).count();
         TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId) : null;
-        return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result);
+        return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result, job.providerRoute());
     }
 
     @Transactional(readOnly = true)
@@ -312,7 +317,7 @@ public class ClinicalWorkflowService {
             if (value.isEmpty()) continue;
             String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR"
                     : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "OTHER";
-            String text = value.replaceFirst("^(医生|患者|其他人)[：:]\\s*", "");
+            String text = value.replaceFirst("^(医生|患者|其他人|未识别角色|说话人 ?[0-9]+)[：:]\\s*", "");
             dialogue.add(Map.of("role", role, "text", text));
         }
         return dialogue;
@@ -325,7 +330,7 @@ public class ClinicalWorkflowService {
             String value = line.strip();
             if (value.isEmpty()) continue;
             String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR" : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "OTHER";
-            String text = value.replaceFirst("^(医生|患者|其他人)[：:]\\s*", "").strip();
+            String text = value.replaceFirst("^(医生|患者|其他人|未识别角色|说话人 ?[0-9]+)[：:]\\s*", "").strip();
             if (text.isEmpty()) continue;
             long end = cursor + Math.max(500, text.length() * 120L);
             turns.add(new RecordingMapper.Turn(role, text, cursor, end));

@@ -56,6 +56,7 @@ export interface Recording {
 }
 
 export interface Utterance {
+  speaker_id?: number | null
   role: 'DOCTOR' | 'PATIENT' | string
   text: string
   start_ms: number
@@ -73,7 +74,10 @@ export interface Transcript {
   turns: Utterance[]
 }
 
+export type AsrProvider = 'DASHSCOPE' | 'LOCAL'
+
 export interface AsrJob {
+  provider_route: AsrProvider
   job_id: string
   status: string
   total_recordings: number
