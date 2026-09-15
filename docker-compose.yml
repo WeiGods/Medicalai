@@ -14,13 +14,12 @@ services:
       DB_PASSWORD: postgres
       AI_SERVICE_BASE_URL: http://ai:8000
       STORAGE_ROOT: /data/recordings
-      MINIO_API_ENDPOINT: http://192.168.1.30:9030
+      MINIO_API_ENDPOINT: ${MINIO_API_ENDPOINT:-http://106.55.225.222:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
       MINIO_BUCKET_NAME: medicalai
       MINIO_FOLDER_PREFIX: medicalai
       MINIO_ANONYMOUS_READ: "true"
-      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
       DASHSCOPE_ENDPOINT: https://dashscope.aliyuncs.com
       DASHSCOPE_ASR_MODEL: qwen-audio-3.0-asr-flash-filetrans

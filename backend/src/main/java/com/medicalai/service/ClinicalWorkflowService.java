@@ -84,10 +84,8 @@ public class ClinicalWorkflowService {
                 .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
         if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
         recordings.requeueRetryableRecordings(visit.id());
-        // Reset stale PROCESSING rows before validating the external endpoint.
-        // This lets a user recover recordings left behind by the old worker
-        // when MINIO_PUBLIC_ENDPOINT was missing, instead of leaving the UI
-        // stuck in "转写中" forever.
+        // Recover stale PROCESSING rows before validating storage credentials
+        // so failed submissions leave recordings in a retryable state.
         storage.assertAsrSubmissionReady();
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
@@ -313,8 +311,8 @@ public class ClinicalWorkflowService {
             String value = line.strip();
             if (value.isEmpty()) continue;
             String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR"
-                    : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "UNKNOWN";
-            String text = value.replaceFirst("^(医生|患者)[：:]\\s*", "");
+                    : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "OTHER";
+            String text = value.replaceFirst("^(医生|患者|其他人)[：:]\\s*", "");
             dialogue.add(Map.of("role", role, "text", text));
         }
         return dialogue;
@@ -326,8 +324,8 @@ public class ClinicalWorkflowService {
         for (String line : transcript.split("\\R+")) {
             String value = line.strip();
             if (value.isEmpty()) continue;
-            String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR" : "PATIENT";
-            String text = value.replaceFirst("^(医生|患者)[：:]\\s*", "").strip();
+            String role = value.startsWith("医生：") || value.startsWith("医生:") ? "DOCTOR" : value.startsWith("患者：") || value.startsWith("患者:") ? "PATIENT" : "OTHER";
+            String text = value.replaceFirst("^(医生|患者|其他人)[：:]\\s*", "").strip();
             if (text.isEmpty()) continue;
             long end = cursor + Math.max(500, text.length() * 120L);
             turns.add(new RecordingMapper.Turn(role, text, cursor, end));

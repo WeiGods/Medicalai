@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS asr_utterance (
     result_type varchar(32) NOT NULL CHECK (result_type IN ('PREVIEW','CANONICAL')),
     text text NOT NULL,
     role varchar(32) NOT NULL DEFAULT 'UNKNOWN',
+    speaker_id int,
+    role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN' CHECK (role_source IN ('AUTO','MANUAL','UNKNOWN')),
     anonymous_speaker_epoch int NOT NULL DEFAULT 1,
     start_ms bigint CHECK (start_ms >= 0),
     end_ms bigint CHECK (end_ms >= start_ms),
@@ -307,6 +309,8 @@ ALTER TABLE medical_record ADD CONSTRAINT ck_confirmed_version CHECK (
 );
 
 ALTER TABLE asr_utterance DROP CONSTRAINT IF EXISTS asr_utterance_utterance_id_revision_result_type_key;
+ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS speaker_id int;
+ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN';
 ALTER TABLE dialogue_snapshot DROP CONSTRAINT IF EXISTS dialogue_snapshot_visit_id_key;
 DROP INDEX IF EXISTS uq_current_canonical_utterance;
 

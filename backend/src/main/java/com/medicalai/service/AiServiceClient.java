@@ -4,6 +4,7 @@ import com.medicalai.exception.BusinessException;
 import java.io.File;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -40,6 +41,25 @@ public class AiServiceClient {
             logFailure("/internal/medical-record/generate", "snapshotHash=" + safe(snapshotHash), e);
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "AI_UNAVAILABLE", "病历生成服务暂不可用", e);
         }
+    }
+
+    public Map<Integer, String> assignRoles(List<Map<String, Object>> turns) {
+        try {
+            Map response = client.post().uri("/internal/transcript/assign-roles")
+                    .contentType(MediaType.APPLICATION_JSON).body(Map.of("turns", turns)).retrieve().body(Map.class);
+            Map<Integer, String> result = new LinkedHashMap<>();
+            if (response != null && response.get("roles") instanceof Map roles) {
+                roles.forEach((k, v) -> { try { result.put(Integer.valueOf(String.valueOf(k)), normalizeRole(String.valueOf(v))); } catch (Exception ignored) {} });
+            }
+            return result;
+        } catch (Exception e) {
+            LOG.warn("Speaker role assignment unavailable; using OTHER");
+            return Map.of();
+        }
+    }
+
+    private String normalizeRole(String role) {
+        return switch (role.toUpperCase()) { case "DOCTOR" -> "DOCTOR"; case "PATIENT" -> "PATIENT"; default -> "OTHER"; };
     }
 
     private void logFailure(String endpoint, String details, Exception error) {

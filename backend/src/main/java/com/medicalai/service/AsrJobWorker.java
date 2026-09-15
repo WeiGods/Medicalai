@@ -23,16 +23,18 @@ public class AsrJobWorker {
     private final RecordingMapper recordings;
     private final AudioStorageService storage;
     private final DashScopeAsrClient dashscope;
+    private final AiServiceClient ai;
     private final MedicalRecordMapper records;
     private final VisitMapper visits;
     private final long pollTimeoutMs;
 
     public AsrJobWorker(RecordingMapper recordings, AudioStorageService storage, DashScopeAsrClient dashscope,
-                        MedicalRecordMapper records, VisitMapper visits,
+                        MedicalRecordMapper records, VisitMapper visits, AiServiceClient ai,
                         @Value("${medicalai.dashscope.timeout-ms:600000}") long pollTimeoutMs) {
         this.recordings = recordings;
         this.storage = storage;
         this.dashscope = dashscope;
+        this.ai = ai;
         this.records = records;
         this.visits = visits;
         this.pollTimeoutMs = Math.max(30_000, pollTimeoutMs);
@@ -98,9 +100,13 @@ public class AsrJobWorker {
         if (segments.isEmpty()) throw new IllegalStateException("DashScope 返回空转写结果");
 
         UUID sessionId = recordings.createSession(job.visitId(), job.recordingId());
-        List<RecordingMapper.Turn> turns = segments.stream()
-                .map(segment -> new RecordingMapper.Turn("UNKNOWN", segment.text(), segment.startMs(), segment.endMs()))
-                .toList();
+        List<RecordingMapper.Turn> rawTurns = segments.stream()
+                .map(segment -> new RecordingMapper.Turn("OTHER", segment.text(), segment.startMs(), segment.endMs(), segment.speakerId())).toList();
+        var roleInput = rawTurns.stream().map(t -> java.util.Map.<String,Object>of("speaker_id", t.speakerId() == null ? "unknown" : t.speakerId(), "text", t.text())).toList();
+        var roles = ai.assignRoles(roleInput);
+        List<RecordingMapper.Turn> turns = rawTurns.stream().map(t -> new RecordingMapper.Turn(
+                t.speakerId() == null ? "OTHER" : roles.getOrDefault(t.speakerId(), "OTHER"),
+                t.text(), t.startMs(), t.endMs(), t.speakerId())).toList();
         recordings.insertUtterances(job.visitId(), job.recordingId(), sessionId, turns);
         recordings.updateStatus(job.recordingId(), "DONE", null);
 
@@ -135,7 +141,7 @@ public class AsrJobWorker {
     }
 
     private String transcriptText(List<RecordingMapper.Turn> turns) {
-        return turns.stream().map(t -> "说话人：" + t.text()).reduce((a, b) -> a + "\n\n" + b).orElse("");
+        return turns.stream().map(t -> ("DOCTOR".equals(t.role()) ? "医生" : "PATIENT".equals(t.role()) ? "患者" : "其他人") + "：" + t.text()).reduce((a, b) -> a + "\n\n" + b).orElse("");
     }
 
     private String hash(UUID visitId, List<RecordingMapper.Turn> turns) {

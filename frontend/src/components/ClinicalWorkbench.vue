@@ -206,11 +206,11 @@ const segments = computed(() => {
   const source = transcript.value
   if (!source) return []
   if (source.turns.length && !source.edited) {
-    return source.turns.map(item => ({ role: item.role === 'DOCTOR' ? '医生' : item.role === 'PATIENT' ? '患者' : '说话人', time: formatTime(item.start_ms), text: item.text }))
+    return source.turns.map(item => ({ role: item.role === 'DOCTOR' ? '医生' : item.role === 'PATIENT' ? '患者' : '其他人', time: formatTime(item.start_ms), text: item.text }))
   }
   return source.transcript.split(/\n+/).filter(Boolean).map((line, index) => {
     const match = line.match(/^(医生|患者)[：:]\s*(.*)$/)
-    return { role: match ? match[1] : '说话人', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
+    return { role: match ? match[1] : '其他人', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
   })
 })
 const facts = computed(() => {
@@ -548,7 +548,7 @@ async function startTranscription() {
     throw new Error('转写等待超时，请稍后查看任务状态')
   } catch (error) {
     // The server may have recovered a stale PROCESSING row before rejecting
-    // this submission (for example, when the public MinIO endpoint is absent).
+    // this submission (for example, when storage credentials are missing).
     // Reload so the card immediately returns to a retryable state.
     await loadAll(true)
     toast(error instanceof Error ? error.message : '转写失败')
@@ -1114,7 +1114,7 @@ defineExpose({ selectPatient })
               <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
                 <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
                 <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
-                  <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '人' }}</span>
+                  <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
                   <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
                     <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
                   </div>
@@ -1287,7 +1287,7 @@ defineExpose({ selectPatient })
           <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
             <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
             <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
-              <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '人' }}</span>
+              <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
               <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
                 <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
               </div>

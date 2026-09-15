@@ -301,6 +301,27 @@ async def medical_record_generate(body: dict):
     return {"jobId": f"gen-{int(time.time() * 1000)}", "status": status,
             "sourceSnapshotHash": snapshot_hash, "record": record}
 
+@app.post("/internal/transcript/assign-roles")
+async def assign_roles(body: dict):
+    turns = body.get("turns") or []
+    speakers = sorted({str(t.get("speaker_id")) for t in turns if t.get("speaker_id") is not None})
+    roles = {speaker: "OTHER" for speaker in speakers}
+    if settings.llm_api_base and speakers:
+        prompt = "将以下说话人按上下文映射为 DOCTOR、PATIENT、OTHER，只返回 JSON 对象，例如 {\"0\":\"DOCTOR\"}。\n" + json.dumps(turns, ensure_ascii=False)
+        try:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
+                resp = await client.post(settings.llm_api_base.rstrip("/") + "/chat/completions",
+                    json={"model": settings.llm_model, "messages":[{"role":"system","content":"你是医疗对话角色分类器。不要根据编号或发言顺序猜测；不确定返回 OTHER。"},{"role":"user","content":prompt}],"temperature":0},
+                    headers={"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {})
+                content = resp.json()["choices"][0]["message"]["content"].strip().strip('`')
+                if content.startswith("json"): content = content[4:]
+                parsed = json.loads(content)
+                for key, value in parsed.items():
+                    if str(key) in roles and str(value).upper() in {"DOCTOR", "PATIENT", "OTHER"}: roles[str(key)] = str(value).upper()
+        except Exception:
+            pass
+    return {"roles": roles}
+
 
 @app.websocket("/ws/asr")
 async def ws_asr(websocket: WebSocket):

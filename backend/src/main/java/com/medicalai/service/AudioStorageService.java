@@ -14,6 +14,9 @@ import io.minio.http.Method;
 import io.minio.messages.Item;
 import io.minio.errors.ErrorResponseException;
 import java.io.IOException;
+import java.io.EOFException;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
@@ -28,7 +31,7 @@ import org.springframework.web.multipart.MultipartFile;
 @Service
 public class AudioStorageService {
     private final MinioClient client;
-    private final MinioClient publicClient;
+    private final String apiEndpoint;
     private final String bucket;
     private final String folderPrefix;
     private final int presignExpirySeconds;
@@ -37,18 +40,15 @@ public class AudioStorageService {
     private final AtomicBoolean bucketInitialized = new AtomicBoolean(false);
 
     public AudioStorageService(
-            @Value("${medicalai.minio.api-endpoint:http://192.168.1.30:9030}") String apiEndpoint,
+            @Value("${medicalai.minio.api-endpoint:http://106.55.225.222:9000}") String apiEndpoint,
             @Value("${medicalai.minio.access-key:}") String accessKey,
             @Value("${medicalai.minio.secret-key:}") String secretKey,
-            @Value("${medicalai.minio.public-endpoint:}") String publicEndpoint,
             @Value("${medicalai.minio.bucket-name:medicalai}") String bucket,
             @Value("${medicalai.minio.folder-prefix:medicalai}") String folderPrefix,
             @Value("${medicalai.minio.presign-expiry-seconds:900}") int presignExpirySeconds,
             @Value("${medicalai.storage.root:./data/recordings}") String localRoot) {
+        this.apiEndpoint = apiEndpoint;
         this.client = buildClient(apiEndpoint, accessKey, secretKey);
-        this.publicClient = publicEndpoint == null || publicEndpoint.isBlank()
-                ? null
-                : buildClient(publicEndpoint, accessKey, secretKey);
         this.bucket = bucket;
         this.folderPrefix = trimSlashes(folderPrefix);
         this.presignExpirySeconds = Math.max(60, Math.min(7 * 24 * 3600, presignExpirySeconds));
@@ -101,7 +101,7 @@ public class AudioStorageService {
     public String presignedUrl(String objectKey) {
         assertAsrSubmissionReady();
         try {
-            return publicClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
+            return client.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
                     .method(Method.GET).bucket(bucket).object(objectKey)
                     .expiry(presignExpirySeconds).build());
         } catch (Exception e) {
@@ -111,10 +111,6 @@ public class AudioStorageService {
 
     /** Validates the configuration required before an ASR job is created. */
     public void assertAsrSubmissionReady() {
-        if (publicClient == null) {
-            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "ASR_STORAGE_NOT_PUBLIC",
-                    "未配置 MINIO_PUBLIC_ENDPOINT。DashScope 无法访问内网 MinIO，请配置公网 HTTPS 地址后重试");
-        }
         if (!credentialsConfigured) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "STORAGE_CREDENTIALS_MISSING",
                     "未配置 MinIO 访问凭据，无法生成录音访问地址");
@@ -169,7 +165,21 @@ public class AudioStorageService {
                         "MinIO 认证失败，请检查 MINIO_ACCESS_KEY 和 MINIO_SECRET_KEY", cause);
             }
         }
+        if (transportFailure(cause)) {
+            return new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "STORAGE_UNAVAILABLE",
+                    "无法连接 MinIO S3 API（" + apiEndpoint + "）。请确认该地址是 S3 API 端口（通常为 9000），"
+                            + "并检查服务器端口映射、安全组和防火墙配置", cause);
+        }
         return new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "STORAGE_FAILED", message, cause);
+    }
+
+    private boolean transportFailure(Throwable error) {
+        Throwable current = error;
+        for (int i = 0; current != null && i < 8; i++, current = current.getCause()) {
+            if (current instanceof ConnectException || current instanceof SocketTimeoutException
+                    || current instanceof EOFException) return true;
+        }
+        return false;
     }
 
     /**

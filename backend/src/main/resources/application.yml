@@ -31,17 +31,17 @@ medicalai:
   ai:
     base-url: ${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}
   minio:
-    api-endpoint: ${MINIO_API_ENDPOINT:http://192.168.1.30:9030}
-    access-key: ${MINIO_ACCESS_KEY:admin}
-    secret-key: ${MINIO_SECRET_KEY:Admin@123456}
+    api-endpoint: ${MINIO_API_ENDPOINT:http://106.55.225.222:9000}
+    access-key: ${MINIO_ACCESS_KEY:Zerojy}
+    secret-key: ${MINIO_SECRET_KEY:minio_zerojy}
     bucket-name: ${MINIO_BUCKET_NAME:medicalai}
     folder-prefix: ${MINIO_FOLDER_PREFIX:medicalai}
     anonymous-read: ${MINIO_ANONYMOUS_READ:true}
-    public-endpoint: ${MINIO_PUBLIC_ENDPOINT:}
     presign-expiry-seconds: ${MINIO_PRESIGN_EXPIRY_SECONDS:900}
   dashscope:
-    api-key: ${DASHSCOPE_API_KEY:}
+    api-key: ${DASHSCOPE_API_KEY:sk-ws-H.PDYIRDH.WTGk.MEQCIA1Cg2vaLpNLwHfiXquEK6FGX_pbkwclvF_JaaO2t7GkAiBEL0fBqwtkdCArw3wPbnt4JIVOOrVOKTWRwi1n4QSnMg}
     endpoint: ${DASHSCOPE_ENDPOINT:https://dashscope.aliyuncs.com}
     asr-model: ${DASHSCOPE_ASR_MODEL:qwen-audio-3.0-asr-flash-filetrans}
+    diarization-enabled: ${DASHSCOPE_DIARIZATION_ENABLED:true}
     poll-delay-ms: ${DASHSCOPE_POLL_DELAY_MS:3000}
     timeout-ms: ${DASHSCOPE_TIMEOUT_MS:600000}

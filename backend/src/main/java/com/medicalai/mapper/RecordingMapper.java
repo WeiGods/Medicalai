@@ -190,10 +190,10 @@ public class RecordingMapper {
             ids.add(id);
             jdbc.update("""
                     INSERT INTO asr_utterance(id,visit_id,recording_id,session_id,utterance_id,revision,result_type,
-                                              text,role,start_ms,end_ms,is_current)
-                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,?,true)
+                                              text,role,speaker_id,role_source,start_ms,end_ms,is_current)
+                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,'AUTO',?,?,true)
                     """, id, visitId, recordingId, sessionId, "u-" + (i + 1), 0,
-                    t.text(), t.role(), t.startMs(), t.endMs());
+                    t.text(), t.role(), t.speakerId(), t.startMs(), t.endMs());
         }
         return ids;
     }
@@ -256,6 +256,10 @@ public class RecordingMapper {
         return jdbc.query("SELECT * FROM asr_utterance WHERE recording_id=? ORDER BY start_ms,id", UTTERANCE, recordingId);
     }
 
+    public void updateRole(UUID visitId, UUID utteranceId, String role) {
+        jdbc.update("UPDATE asr_utterance SET role=?, role_source='MANUAL' WHERE id=? AND visit_id=?", role, utteranceId, visitId);
+    }
+
     public Optional<TurnState> transcript(UUID visitId) {
                 return jdbc.query("SELECT * FROM visit_transcript WHERE visit_id=?", (rs, n) -> new TurnState(
                 rs.getObject("snapshot_id", UUID.class), rs.getString("transcript_text"), rs.getBoolean("edited"),
@@ -296,7 +300,9 @@ public class RecordingMapper {
         return String.valueOf(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "");
     }
 
-    public record Turn(String role, String text, long startMs, long endMs) {}
+    public record Turn(String role, String text, long startMs, long endMs, Integer speakerId) {
+        public Turn(String role, String text, long startMs, long endMs) { this(role, text, startMs, endMs, null); }
+    }
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
     public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
                          int attemptCount, String lastError, Instant startedAt) {}

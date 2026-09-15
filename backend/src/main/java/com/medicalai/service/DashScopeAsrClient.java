@@ -21,15 +21,18 @@ public class DashScopeAsrClient {
     private final ObjectMapper objectMapper;
     private final String apiKey;
     private final String model;
+    private final boolean diarizationEnabled;
 
     public DashScopeAsrClient(
             ObjectMapper objectMapper,
             @Value("${medicalai.dashscope.endpoint:https://dashscope.aliyuncs.com}") String endpoint,
             @Value("${medicalai.dashscope.api-key:}") String apiKey,
-            @Value("${medicalai.dashscope.asr-model:qwen-audio-3.0-asr-flash-filetrans}") String model) {
+            @Value("${medicalai.dashscope.asr-model:qwen-audio-3.0-asr-flash-filetrans}") String model,
+            @Value("${medicalai.dashscope.diarization-enabled:true}") boolean diarizationEnabled) {
         this.objectMapper = objectMapper;
         this.apiKey = apiKey == null ? "" : apiKey.trim();
         this.model = model;
+        this.diarizationEnabled = diarizationEnabled;
         this.client = RestClient.builder().baseUrl(endpoint).build();
     }
 
@@ -45,7 +48,7 @@ public class DashScopeAsrClient {
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(Map.of("model", model,
                             "input", Map.of("file_urls", List.of(fileUrl)),
-                            "parameters", Map.of("channel_id", List.of(0))))
+                            "parameters", Map.of("channel_id", List.of(0), "diarization_enabled", diarizationEnabled)))
                     .retrieve().body(JsonNode.class);
             String taskId = text(response == null ? null : response.at("/output/task_id"));
             if (taskId.isBlank()) throw new IllegalStateException("DashScope response did not contain output.task_id");
@@ -94,10 +97,11 @@ public class DashScopeAsrClient {
         }
         if (!node.isObject()) return;
         String text = firstText(node, "text", "sentence", "transcript");
+        Integer speakerId = firstInteger(node, "speaker_id", "speakerId");
         Long start = firstNumber(node, "begin_time", "start_time", "start_ms", "startMs", "start");
         Long end = firstNumber(node, "end_time", "end_time_ms", "end_ms", "endMs", "end");
         if (!text.isBlank() && start != null && end != null) {
-            segments.add(new Segment(text.strip(), Math.max(0, start), Math.max(start, end)));
+            segments.add(new Segment(text.strip(), Math.max(0, start), Math.max(start, end), speakerId));
             return;
         }
         node.fields().forEachRemaining(entry -> collectSegments(entry.getValue(), segments));
@@ -142,6 +146,16 @@ public class DashScopeAsrClient {
         return null;
     }
 
+    private Integer firstInteger(JsonNode node, String... names) {
+        for (String name : names) {
+            JsonNode value = node.get(name);
+            if (value == null || value.isNull()) continue;
+            try { return value.isNumber() ? value.intValue() : Integer.valueOf(value.asText()); }
+            catch (NumberFormatException ignored) { }
+        }
+        return null;
+    }
+
     private String text(JsonNode node) {
         return node == null || node.isNull() || node.isMissingNode() ? "" : node.asText("");
     }
@@ -158,5 +172,5 @@ public class DashScopeAsrClient {
     }
 
     public record Task(String taskId, String status, JsonNode output) {}
-    public record Segment(String text, long startMs, long endMs) {}
+    public record Segment(String text, long startMs, long endMs, Integer speakerId) {}
 }
