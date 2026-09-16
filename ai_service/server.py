@@ -7,6 +7,7 @@ and a shared Fun-ASR-Nano vLLM engine with streaming VAD and diarization.
 """
 
 import asyncio
+import math
 from pathlib import Path
 import json
 import logging
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 import httpx
 import numpy as np
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -69,9 +71,26 @@ class ServiceSettings:
             tensor_parallel_size=int(_env("ASR_TENSOR_PARALLEL", "1")),
             gpu_memory_utilization=float(_env("ASR_GPU_MEM_UTIL", "0.8")),
             max_model_len=int(_env("ASR_MAX_MODEL_LEN", "2048")),
+            enforce_eager=_env("ASR_ENFORCE_EAGER", "0") == "1",
+            cudagraph_capture_sizes=_env("ASR_CUDAGRAPH_CAPTURE_SIZES"),
             partial_window_sec=float(_env("ASR_PARTIAL_WINDOW_SEC", "15.0")),
             disable_spk=_env("ASR_DISABLE_SPK", "0") == "1",
             hotword_file=_env("HOTWORD_FILE", "热词列表"),
+            use_context=_env("ASR_USE_CONTEXT", "0") == "1",
+            vad_max_end_silence_ms=int(_env("ASR_VAD_MAX_END_SILENCE_MS", "0")),
+            vad_silence_schedule=_env("ASR_VAD_SILENCE_SCHEDULE") or None,
+            vad_speech_noise_thres=float(_env("ASR_VAD_SPEECH_NOISE_THRES", "0.6")),
+            merge_gap_ms=int(_env("ASR_MERGE_GAP_MS", "500")),
+            no_merge_turns=_env("ASR_DISABLE_MERGE", "0") == "1",
+            spk_threshold=float(_env("ASR_SPK_THRESHOLD", "0.6")),
+            spk_merge_thr=float(_env("ASR_SPK_MERGE_THR", "0.78")),
+            spk_min_seg_ms=int(_env("ASR_SPK_MIN_SEG_MS", "1000")),
+            decode_interval=float(_env("ASR_DECODE_INTERVAL", "0.48")),
+            min_rms=float(_env("ASR_MIN_RMS", "0.004")),
+            drop_filler_ms=int(_env("ASR_DROP_FILLER_MS", "1500")),
+            vad_max_single_segment_ms=int(_env("ASR_VAD_MAX_SINGLE_SEGMENT_MS", "30000")),
+            preset_spk_num=int(_env("ASR_PRESET_SPK_NUM", "2")),
+            mode=_env("ASR_MODE", "realtime"),
         )
         self.llm_api_base = _env("LLM_API_BASE")
         self.llm_api_key = _env("LLM_API_KEY")
@@ -88,6 +107,7 @@ class ServiceSettings:
         def load():
             try:
                 rt.load_models(self.args)
+                _warmup_asr_engine()
                 logger.info("Models ready")
             except Exception:
                 self._models_started = False
@@ -112,6 +132,25 @@ async def startup():
 def require_models():
     if not settings.models_ready:
         raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
+
+
+def _warmup_asr_engine():
+    """Prime vLLM audio/CUDA paths before serving the first real request."""
+    if rt._vllm_engine is None:
+        return
+    seconds = torch.arange(SAMPLE_RATE // 2, dtype=torch.float32) / SAMPLE_RATE
+    tone = 0.05 * torch.sin(2 * math.pi * 440.0 * seconds)
+    try:
+        with settings.lock:
+            rt._vllm_engine.generate(
+                inputs=[tone],
+                hotwords=rt._asr_kwargs.get("hotwords"),
+                language=rt._asr_kwargs.get("language"),
+                max_new_tokens=16,
+            )
+        logger.info("ASR engine warmup complete")
+    except Exception:
+        logger.exception("ASR engine warmup failed")
 
 
 def decode_audio_to_pcm(data: bytes, suffix: str) -> np.ndarray:
@@ -140,13 +179,7 @@ def decode_audio_to_pcm(data: bytes, suffix: str) -> np.ndarray:
 def _transcribe_sync(pcm: np.ndarray) -> list[dict]:
     """Run the streaming pipeline (VAD + vLLM decode + diarization) on a file."""
     require_models()
-    vad = rt.DynamicStreamingVAD(rt._vad_model)
-    spk_tracker = None if settings.args.disable_spk else rt.HybridSpeakerTracker(
-        rt._spk_model, settings.args.device)
-    session = rt.RealtimeASRSession(
-        rt._vllm_engine, dict(rt._asr_kwargs), vad, spk_tracker=spk_tracker,
-        partial_window_sec=settings.args.partial_window_sec,
-    )
+    session = _build_session()
     byte_chunk = session.chunk_samples * 2
     buffer = pcm.astype(np.int16).tobytes()
     with settings.lock:
@@ -155,8 +188,18 @@ def _transcribe_sync(pcm: np.ndarray) -> list[dict]:
             session.decode(False)
         result = session.decode(True)
 
+    utterances = _sentences_to_utterances(result.get("sentences", []))
+    if not utterances and result.get("partial"):
+        utterances.append({"role": "UNKNOWN", "text": result["partial"],
+                           "start_ms": 0, "end_ms": result.get("duration_ms", 0)})
+    logger.info("Transcribed audio: utterances=%d, duration_ms=%s",
+                len(utterances), result.get("duration_ms"))
+    return utterances
+
+
+def _sentences_to_utterances(result_sentences):
     utterances = []
-    for sent in result.get("sentences", []):
+    for sent in result_sentences or []:
         text = (sent.get("text") or "").strip()
         if not text:
             continue
@@ -168,16 +211,144 @@ def _transcribe_sync(pcm: np.ndarray) -> list[dict]:
             "start_ms": int(sent.get("start") or 0),
             "end_ms": int(sent.get("end") or 0),
         })
-    if not utterances and result.get("partial"):
-        utterances.append({"role": "UNKNOWN", "text": result["partial"],
-                           "start_ms": 0, "end_ms": result.get("duration_ms", 0)})
-    logger.info("Transcribed audio: utterances=%d, duration_ms=%s",
-                len(utterances), result.get("duration_ms"))
     return utterances
+
+
+def _build_session():
+    vad = rt.build_streaming_vad(rt._vad_model, settings.args)
+    spk_tracker = None if settings.args.disable_spk else rt.HybridSpeakerTracker(
+        rt._spk_model, settings.args.device,
+        threshold=settings.args.spk_threshold,
+        merge_thr=settings.args.spk_merge_thr,
+        min_segment_ms=settings.args.spk_min_seg_ms,
+    )
+    return rt.RealtimeASRSession(
+        rt._vllm_engine, dict(rt._asr_kwargs), vad, spk_tracker=spk_tracker,
+        partial_window_sec=settings.args.partial_window_sec,
+        merge_gap_ms=settings.args.merge_gap_ms,
+        merge_enabled=not settings.args.no_merge_turns,
+        use_context=settings.args.use_context,
+        min_rms=settings.args.min_rms,
+        drop_filler_ms=settings.args.drop_filler_ms,
+    )
+
+
+def _transcribe_sync_offline(pcm: np.ndarray) -> list[dict]:
+    """Batch pipeline: full-file VAD, one batched vLLM call, then diarization.
+
+    Batched decoding fills the GPU instead of decoding realtime-sized chunks,
+    and the model sees each complete utterance in a single pass.
+    """
+    require_models()
+    audio_float = pcm.astype(np.float32) / 32768.0
+    vad = rt.build_streaming_vad(rt._vad_model, settings.args)
+
+    with settings.lock:
+        speaking = []
+        for start_ms, end_ms in vad.process(torch.from_numpy(audio_float)):
+            seg_audio = audio_float[int(start_ms * SAMPLE_RATE / 1000):int(end_ms * SAMPLE_RATE / 1000)]
+            if len(seg_audio) >= 1600 and (
+                settings.args.min_rms <= 0 or rt._audio_rms(seg_audio) >= settings.args.min_rms
+            ):
+                speaking.append((int(start_ms), int(end_ms), seg_audio))
+        if not speaking:
+            return []
+
+        results = rt._vllm_engine.generate(
+            inputs=[torch.from_numpy(seg_audio) for _, _, seg_audio in speaking],
+            hotwords=rt._asr_kwargs.get("hotwords"),
+            language=rt._asr_kwargs.get("language"),
+            max_new_tokens=512,
+        )
+
+        sentences = []
+        for (start_ms, end_ms, _), result in zip(speaking, results):
+            text = rt._clean_asr_text((result or {}).get("text", ""))
+            text, _ = rt.detect_and_fix_hallucination(text)
+            short_filler = (
+                settings.args.drop_filler_ms > 0
+                and (end_ms - start_ms) < settings.args.drop_filler_ms
+                and rt._is_filler_only(text)
+            )
+            if text.strip() and not short_filler:
+                sentences.append({"text": text.strip(), "start": start_ms, "end": end_ms})
+
+        if settings.args.disable_spk or not sentences:
+            return _sentences_to_utterances(sentences)
+
+        tracker = rt.HybridSpeakerTracker(
+            rt._spk_model, settings.args.device,
+            threshold=settings.args.spk_threshold,
+            merge_thr=settings.args.spk_merge_thr,
+            min_segment_ms=settings.args.spk_min_seg_ms,
+        )
+
+        # Official FunASR diarization recipe: slide a fixed window over the
+        # VAD segments for embeddings, then cluster once, globally. The stock
+        # ClusterBackend returns a single cluster when fed fewer than 20
+        # embeddings, so shrink the window until we have enough to cluster.
+        chunks = _sliding_chunks(speaking, seg_dur=1.5, seg_shift=0.75)
+        for seg_dur, seg_shift in ((1.0, 0.25), (0.75, 0.25)):
+            if len(chunks) >= 20:
+                break
+            chunks = _sliding_chunks(speaking, seg_dur=seg_dur, seg_shift=seg_shift)
+        chunks = [ch for ch in chunks if (ch[1] - ch[0]) * 1000 >= 300]
+        if not chunks:
+            return _sentences_to_utterances(sentences)
+
+        speech_list = [ch[2] for ch in chunks]
+        spk_res = tracker.spk_model.generate(input=speech_list, cache={}, is_final=True)
+        embeddings = torch.cat([r["spk_embedding"] for r in spk_res], dim=0).detach().cpu()
+        preset_spk_num = settings.args.preset_spk_num or None
+        labels = tracker.cluster_backend(embeddings, oracle_num=preset_spk_num)
+        logger.info(
+            "Offline diarization: %d chunks (preset_spk_num=%s), cluster labels=%s",
+            len(chunks), preset_spk_num, np.asarray(labels).tolist(),
+        )
+        sv_output = tracker.postprocess(
+            [[ch[0], ch[1], None] for ch in chunks], None,
+            np.asarray(labels), embeddings.numpy(),
+        )
+        assigned = []
+        for sentence in sentences:
+            current = dict(sentence)
+            tracker.distribute_spk([current], sv_output)
+            assigned.extend(tracker._try_split(current, sv_output, {}, min_split_s=3.0))
+        sentences = [
+            s for s in assigned
+            if not rt._is_sparse_text(s["text"], s["end"] - s["start"])
+        ]
+        return _sentences_to_utterances(sentences)
+
+
+def _sliding_chunks(speaking, seg_dur, seg_shift):
+    """Slide a fixed window across VAD segments (official sv_chunk recipe)."""
+    chunk_len = int(seg_dur * SAMPLE_RATE)
+    chunk_shift = int(seg_shift * SAMPLE_RATE)
+    chunks = []
+    for start_ms, _end_ms, audio in speaking:
+        start_s = start_ms / 1000.0
+        last_end = 0
+        for offset in range(0, len(audio), chunk_shift):
+            end = min(offset + chunk_len, len(audio))
+            if end <= last_end:
+                break
+            last_end = end
+            begin = max(0, end - chunk_len)
+            chunks.append([
+                start_s + begin / SAMPLE_RATE,
+                start_s + end / SAMPLE_RATE,
+                audio[begin:end],
+            ])
+    return chunks
 
 
 async def transcribe_pcm(pcm: np.ndarray) -> list[dict]:
     return await run_in_threadpool(_transcribe_sync, pcm)
+
+
+async def transcribe_pcm_offline(pcm: np.ndarray) -> list[dict]:
+    return await run_in_threadpool(_transcribe_sync_offline, pcm)
 
 
 SAMPLE_DIALOGUE = [
@@ -206,7 +377,10 @@ async def asr_sample(patient_name: str = ""):
 
 
 @app.post("/internal/asr/transcribe")
-async def asr_transcribe(file: UploadFile):
+async def asr_transcribe(file: UploadFile, mode: str = None):
+    requested = (mode or settings.args.mode or "realtime").strip().lower()
+    if requested not in {"realtime", "offline"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 realtime / offline")
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="音频内容为空")
@@ -218,9 +392,10 @@ async def asr_transcribe(file: UploadFile):
         raise HTTPException(status_code=400, detail="音频解码失败，请确认文件格式") from e
     if pcm.size < SAMPLE_RATE // 2:
         raise HTTPException(status_code=400, detail="音频过短")
-    utterances = await transcribe_pcm(pcm)
+    transcribe = transcribe_pcm_offline if requested == "offline" else transcribe_pcm
+    utterances = await transcribe(pcm)
     return {"jobId": f"asr-{int(time.time() * 1000)}", "status": "SUCCEEDED",
-            "utterances": utterances}
+            "mode": requested, "utterances": utterances}
 
 
 RECORD_PROMPT = """你是经验丰富的内科医生助理。根据对话和患者信息生成门诊病历，只输出 JSON，字段：
@@ -340,14 +515,8 @@ async def ws_asr(websocket: WebSocket):
         await websocket.close()
         return
 
-    vad = rt.DynamicStreamingVAD(rt._vad_model)
-    spk_tracker = None if settings.args.disable_spk else rt.HybridSpeakerTracker(
-        rt._spk_model, settings.args.device)
-    session = rt.RealtimeASRSession(
-        rt._vllm_engine, dict(rt._asr_kwargs), vad, spk_tracker=spk_tracker,
-        partial_window_sec=settings.args.partial_window_sec,
-    )
-    decode_interval = 0.48
+    session = _build_session()
+    decode_interval = settings.args.decode_interval
     last_decode_time = 0.0
     logger.info("Realtime client connected: %s", websocket.client)
 

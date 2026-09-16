@@ -34,6 +34,7 @@ services:
       - medicalai_data:/data
   ai:
     profiles: [local-ai]
+    image: mouyu/medicalai:local_ai-latest
     build:
       context: .
       dockerfile: ai_service/Dockerfile
@@ -44,10 +45,31 @@ services:
       ASR_VAD_MODEL: ${ASR_VAD_MODEL:-fsmn-vad}
       ASR_SPK_MODEL: ${ASR_SPK_MODEL:-iic/speech_eres2netv2_sv_zh-cn_16k-common}
       ASR_OFFLINE: ${ASR_OFFLINE:-0}
+      ASR_MODE: ${ASR_MODE:-realtime}
+      ASR_ENFORCE_EAGER: ${ASR_ENFORCE_EAGER:-0}
+      ASR_CUDAGRAPH_CAPTURE_SIZES: ${ASR_CUDAGRAPH_CAPTURE_SIZES:-1,2,4,8,16,32,64,128}
+      ASR_MODEL_PT_MMAP: ${ASR_MODEL_PT_MMAP:-1}
+      ASR_USE_CONTEXT: ${ASR_USE_CONTEXT:-0}
+      ASR_VAD_MAX_END_SILENCE_MS: ${ASR_VAD_MAX_END_SILENCE_MS:-0}
+      ASR_VAD_SILENCE_SCHEDULE: ${ASR_VAD_SILENCE_SCHEDULE:-}
+      ASR_VAD_SPEECH_NOISE_THRES: ${ASR_VAD_SPEECH_NOISE_THRES:-0.6}
+      ASR_VAD_MAX_SINGLE_SEGMENT_MS: ${ASR_VAD_MAX_SINGLE_SEGMENT_MS:-30000}
+      ASR_PRESET_SPK_NUM: ${ASR_PRESET_SPK_NUM:-2}
+      ASR_MERGE_GAP_MS: ${ASR_MERGE_GAP_MS:-500}
+      ASR_DISABLE_MERGE: ${ASR_DISABLE_MERGE:-0}
+      ASR_SPK_THRESHOLD: ${ASR_SPK_THRESHOLD:-0.6}
+      ASR_SPK_MERGE_THR: ${ASR_SPK_MERGE_THR:-0.78}
+      ASR_SPK_MIN_SEG_MS: ${ASR_SPK_MIN_SEG_MS:-1000}
+      ASR_DECODE_INTERVAL: ${ASR_DECODE_INTERVAL:-0.48}
+      ASR_MIN_RMS: ${ASR_MIN_RMS:-0.004}
+      ASR_DROP_FILLER_MS: ${ASR_DROP_FILLER_MS:-1500}
+      HOTWORD_FILE: ${HOTWORD_FILE:-热词列表}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-qwen-plus}
       LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-30}
+      VLLM_CACHE_ROOT: /workspace/.cache/vllm
+      VLLM_ENABLE_STARTUP_PLAN: "1"
     ports:
       - "8000:8000"
     volumes:

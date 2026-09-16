@@ -4,5 +4,7 @@
 !requirements.txt
 !model.py
 !serve_realtime_ws.py
+!热词列表
 !ai_service
+!docker-models
 ai_service/__pycache__

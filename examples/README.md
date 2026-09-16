@@ -59,3 +59,19 @@ pip install "funasr>=1.3.26" "vllm>=0.12.0"
 python examples/streaming_sdk.py --hub hf --chunk-ms 720
 python examples/streaming_sdk.py path/to/audio.wav
 ```
+
+## Browser upload
+
+Run a local upload page, then choose an audio file in the browser. The model is
+loaded once and each upload is transcribed with the language, hotwords, and ITN
+controls from the page:
+
+```bash
+python examples/upload.py --open-browser
+```
+
+To skip the page and transcribe one local file directly:
+
+```bash
+python examples/upload.py --file path/to/audio.wav
+```
