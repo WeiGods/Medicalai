@@ -2,6 +2,7 @@ package com.medicalai.service;
 
 import com.medicalai.domain.Recording;
 import com.medicalai.domain.Utterance;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.medicalai.mapper.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -64,11 +65,30 @@ public class AsrJobStore {
 
     @Transactional
     public void complete(RecordingMapper.AsrJob job, UUID token, UUID recordingId, List<RecordingMapper.Turn> turns) {
+        complete(job, token, recordingId, turns, null);
+    }
+
+    @Transactional
+    public void complete(RecordingMapper.AsrJob job, UUID token, UUID recordingId, List<RecordingMapper.Turn> turns,
+                         JsonNode rawResponse) {
+        /*
+         * 此事务只负责持久化，不执行 ASR 或 LLM 网络调用：
+         * 1. 校验租约仍归当前 worker；2. 拒绝未完成角色判断的 AUTO/UNKNOWN；
+         * 3. 保存脱敏后的 ASR 原始 JSON；4. 保存标准化句段；5. 生成当前对话快照与展示文本。
+         */
         fence(job, token);
         var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
         if (!Objects.equals(current.recordingId(), recordingId)) throw new LeaseLostException();
         if (turns.isEmpty() || turns.stream().anyMatch(t -> t.text() == null || t.text().isBlank()
                 || t.startMs() < 0 || t.endMs() < t.startMs())) throw new IllegalStateException("ASR 返回无效句段");
+        if (turns.stream().anyMatch(turn -> !Set.of("LLM", "FALLBACK", "MANUAL").contains(turn.roleSource()))) {
+            throw new IllegalStateException("ASR 角色判断未完成，拒绝以 AUTO 或 UNKNOWN 结果入库");
+        }
+        String rawJson = AsrRawResponse.sanitizedJson(rawResponse);
+        if (rawJson != null) {
+            // 原始响应仅用于后台审计；前端始终读取后面的标准化句段和展示文本。
+            recordings.saveAsrRawResponse(recordingId, rawJson, AsrRawResponse.sha256(rawJson), turns.size());
+        }
         UUID sessionId = recordings.createSession(job.visitId(), recordingId);
         recordings.insertUtterances(job.visitId(), recordingId, sessionId, turns);
         recordings.updateStatus(recordingId, "DONE", null);
@@ -95,7 +115,8 @@ public class AsrJobStore {
             if (!"DONE".equals(recording.status())) continue;
             last = recording;
             for (Utterance utterance : recordings.listByRecording(recording.id())) {
-                turns.add(new RecordingMapper.Turn(utterance.role(), utterance.text(), utterance.startMs(), utterance.endMs(), utterance.speakerId()));
+                turns.add(new RecordingMapper.Turn(utterance.role(), utterance.text(), utterance.startMs(), utterance.endMs(),
+                        utterance.speakerId(), utterance.roleSource(), utterance.roleConfidence()));
                 utteranceIds.add(utterance.id());
             }
         }
@@ -104,7 +125,7 @@ public class AsrJobStore {
         UUID snapshotId = recordings.createSnapshot(job.visitId(), recordingId, sessionId, turns, utteranceIds, hash);
         recordings.saveTranscript(job.visitId(), snapshotId, transcriptText(turns), false);
         records.audit(visits.doctorId(job.visitId()), job.visitId(), "TRANSCRIPT_CREATED", snapshotId);
-        LOG.info("ASR transcription completed: jobId={}, visitId={}, snapshotId={}, utterances={}",
+        LOG.info("ASR转写结果已入库：任务ID={}，接诊ID={}，快照ID={}，句段数={}",
                 job.id(), job.visitId(), snapshotId, turns.size());
     }
 

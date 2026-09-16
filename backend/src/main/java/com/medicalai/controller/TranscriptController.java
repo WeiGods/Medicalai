@@ -2,6 +2,7 @@ package com.medicalai.controller;
 
 import com.medicalai.domain.AuthenticatedDoctor;
 import com.medicalai.dto.SaveTranscriptRequest;
+import com.medicalai.dto.UpdateUtteranceRoleRequest;
 import com.medicalai.service.ClinicalWorkflowService;
 import com.medicalai.vo.TranscriptVO;
 import jakarta.validation.Valid;
@@ -24,5 +25,18 @@ public class TranscriptController {
     public TranscriptVO save(@PathVariable UUID visitId, @Valid @RequestBody SaveTranscriptRequest request,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.saveTranscript(visitId, current.doctor().id(), request);
+    }
+
+    @PatchMapping("/utterances/{utteranceId}/role")
+    public TranscriptVO updateRole(@PathVariable UUID visitId, @PathVariable UUID utteranceId,
+                                   @Valid @RequestBody UpdateUtteranceRoleRequest request,
+                                   @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return service.updateUtteranceRole(visitId, current.doctor().id(), utteranceId, request);
+    }
+
+    @PostMapping("/roles/reclassify")
+    public TranscriptVO reclassifyRoles(@PathVariable UUID visitId,
+                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return service.reclassifyTranscriptRoles(visitId, current.doctor().id());
     }
 }

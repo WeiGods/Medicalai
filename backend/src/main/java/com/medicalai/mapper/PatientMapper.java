@@ -48,7 +48,7 @@ public class PatientMapper {
         return jdbc.queryForObject("""
                 INSERT INTO patient(id,source_system,source_patient_id,patient_no,name,gender,birth_date,
                                     phone_masked,id_no_masked,department_name,source_updated_at,raw_snapshot,status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,'{"manual":true}','ACTIVE') RETURNING *
+                VALUES (?,?,?,?,?,?,?,?,?,?,medicalai_local_now(),'{"manual":true}','ACTIVE') RETURNING *
                 """, ROW, id, "MANUAL", sourcePatientId, patientNo, name, gender,
                 birthDate == null ? null : Date.valueOf(birthDate),
                 phoneMasked, idNoMasked, departmentName);
@@ -58,11 +58,11 @@ public class PatientMapper {
         jdbc.update("""
                 INSERT INTO patient(source_system,source_patient_id,patient_no,name,gender,
                                     birth_date,phone_masked,id_no_masked,department_name,source_updated_at,raw_snapshot)
-                VALUES (?,?,?,?,?,?,?,?,'神经内科',CURRENT_TIMESTAMP,'{"synthetic":true}')
+                VALUES (?,?,?,?,?,?,?,?,'神经内科',medicalai_local_now(),'{"synthetic":true}')
                 ON CONFLICT (source_system,source_patient_id) DO UPDATE SET
                     patient_no=EXCLUDED.patient_no,name=EXCLUDED.name,gender=EXCLUDED.gender,
                     birth_date=EXCLUDED.birth_date,phone_masked=EXCLUDED.phone_masked,id_no_masked=EXCLUDED.id_no_masked,
-                    source_updated_at=EXCLUDED.source_updated_at,updated_at=CURRENT_TIMESTAMP
+                    source_updated_at=EXCLUDED.source_updated_at,updated_at=medicalai_local_now()
                 """, p.sourceSystem(), p.sourcePatientId(), p.patientNo(), p.name(), p.gender(),
                 p.birthDate() == null ? null : Date.valueOf(p.birthDate()), p.phoneMasked(), p.idNoMasked());
     }

@@ -56,11 +56,15 @@ export interface Recording {
 }
 
 export interface Utterance {
+  id?: string
   speaker_id?: number | null
-  role: 'DOCTOR' | 'PATIENT' | string
+  role: 'DOCTOR' | 'PATIENT' | 'OTHER' | string
   text: string
   start_ms: number
   end_ms: number
+  role_source?: 'AUTO' | 'LLM' | 'FALLBACK' | 'MANUAL' | 'UNKNOWN' | string
+  role_confidence?: number | null
+  role_review_required?: boolean
 }
 
 export interface Transcript {

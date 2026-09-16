@@ -32,12 +32,17 @@ public class ClinicalWorkflowService {
     private final AudioStorageService storage;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final DashScopeRoleClient roleClient;
+    private final TranscriptRoleReclassificationStore roleReclassificationStore;
+    @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
+    private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
     private String dashscopeApiKey;
 
     public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
                                    MedicalRecordMapper records, AiServiceClient ai, AudioStorageService storage,
-                                   ObjectMapper objectMapper, Clock clock) {
+                                   ObjectMapper objectMapper, Clock clock, DashScopeRoleClient roleClient,
+                                   TranscriptRoleReclassificationStore roleReclassificationStore) {
         this.visits = visits;
         this.patients = patients;
         this.doctors = doctors;
@@ -47,6 +52,8 @@ public class ClinicalWorkflowService {
         this.storage = storage;
         this.objectMapper = objectMapper;
         this.clock = clock;
+        this.roleClient = roleClient;
+        this.roleReclassificationStore = roleReclassificationStore;
     }
 
     @Transactional
@@ -95,7 +102,7 @@ public class ClinicalWorkflowService {
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
-        UUID jobId = recordings.createAsrJob(visit.id(), provider);
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider));
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -107,7 +114,8 @@ public class ClinicalWorkflowService {
         List<Recording> all = recordings.list(visit.id());
         int completed = (int) all.stream().filter(r -> "DONE".equals(r.status())).count();
         TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId) : null;
-        return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result, job.providerRoute());
+        return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result,
+                displayProvider(job.providerRoute()));
     }
 
     @Transactional(readOnly = true)
@@ -120,7 +128,7 @@ public class ClinicalWorkflowService {
         List<UtteranceVO> turns = recordings.list(visit.id()).stream()
                 .filter(r -> "DONE".equals(r.status()))
                 .flatMap(r -> recordings.listByRecording(r.id()).stream())
-                .map(UtteranceVO::from).toList();
+                .map(u -> UtteranceVO.from(u, roleReviewThreshold)).toList();
         Optional<RecordingMapper.TurnState> state = recordings.transcript(visit.id());
         String text = state.map(RecordingMapper.TurnState::transcript).orElse("");
         boolean edited = state.map(RecordingMapper.TurnState::edited).orElse(false);
@@ -151,6 +159,77 @@ public class ClinicalWorkflowService {
                 snapshotHash(visit.id(), editedTurns), doctorId);
         recordings.saveTranscript(visit.id(), editedSnapshotId, editedText, true);
         records.audit(doctorId, visit.id(), "TRANSCRIPT_EDITED", editedSnapshotId);
+        return transcript(visitId, doctorId);
+    }
+
+    @Transactional
+    public TranscriptVO updateUtteranceRole(UUID visitId, UUID doctorId, UUID utteranceId,
+                                            UpdateUtteranceRoleRequest request) {
+        Visit visit = owned(visitId, doctorId, true);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
+                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
+        if (isConfirmed(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
+        }
+        recordings.utterance(visit.id(), utteranceId).orElseThrow(BusinessException::notFound);
+        List<RecordingMapper.Turn> turnsBeforeUpdate = currentTurns(visit.id());
+        RecordingMapper.TurnState current = recordings.transcript(visit.id()).orElse(null);
+        if (current != null && current.edited() && !transcriptText(turnsBeforeUpdate).equals(current.transcript())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "TRANSCRIPT_TEXT_EDITED",
+                    "全文转写已手工编辑，请在全文编辑中核对角色，避免覆盖已修改的文本");
+        }
+        if (!recordings.updateRole(visit.id(), utteranceId, request.role())) throw BusinessException.notFound();
+        List<RecordingMapper.Turn> turns = currentTurns(visit.id());
+        UUID snapshotId = recordings.createEditedSnapshot(visit.id(), snapshot, turns,
+                snapshotHash(visit.id(), turns), doctorId);
+        recordings.saveTranscript(visit.id(), snapshotId, transcriptText(turns), true);
+        records.audit(doctorId, visit.id(), "TRANSCRIPT_ROLE_UPDATED", utteranceId);
+        return transcript(visitId, doctorId);
+    }
+
+    /**
+     * Applies the current per-turn role model to a completed, older transcript.
+     * The DashScope call deliberately happens outside a database transaction;
+     * the transactional store rechecks all mutable state before it writes.
+     */
+    public TranscriptVO reclassifyTranscriptRoles(UUID visitId, UUID doctorId) {
+        Visit visit = owned(visitId, doctorId, false);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        if (isConfirmed(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
+        }
+        recordings.latestSnapshot(visit.id())
+                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
+
+        List<Utterance> candidates = currentUtterances(visit.id()).stream()
+                .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
+                .toList();
+        if (candidates.isEmpty()) return transcript(visitId, doctorId);
+
+        List<Map<String, Object>> inputs = new ArrayList<>();
+        for (int index = 0; index < candidates.size(); index++) {
+            Utterance utterance = candidates.get(index);
+            Map<String, Object> input = new LinkedHashMap<>();
+            input.put("index", index);
+            input.put("speaker_id", utterance.speakerId());
+            input.put("start_ms", utterance.startMs());
+            input.put("end_ms", utterance.endMs());
+            input.put("text", utterance.text());
+            inputs.add(input);
+        }
+
+        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleClient.assignRoles(inputs);
+        List<RecordingMapper.RoleUpdate> updates = new ArrayList<>();
+        for (int index = 0; index < candidates.size(); index++) {
+            DashScopeRoleClient.RoleAssignment assignment = assignments.get(index);
+            if (assignment == null) assignment = new DashScopeRoleClient.RoleAssignment("OTHER", null, "FALLBACK");
+            updates.add(new RecordingMapper.RoleUpdate(candidates.get(index).id(), assignment.role(),
+                    assignment.source(), assignment.confidence()));
+        }
+        roleReclassificationStore.apply(visit.id(), doctorId, updates);
         return transcript(visitId, doctorId);
     }
 
@@ -323,6 +402,25 @@ public class ClinicalWorkflowService {
         return dialogue;
     }
 
+    private List<RecordingMapper.Turn> currentTurns(UUID visitId) {
+        return currentUtterances(visitId).stream()
+                .map(utterance -> new RecordingMapper.Turn(utterance.role(), utterance.text(),
+                        utterance.startMs(), utterance.endMs(), utterance.speakerId(),
+                        utterance.roleSource(), utterance.roleConfidence()))
+                .toList();
+    }
+
+    private List<Utterance> currentUtterances(UUID visitId) {
+        return recordings.list(visitId).stream().filter(recording -> "DONE".equals(recording.status()))
+                .flatMap(recording -> recordings.listByRecording(recording.id()).stream())
+                .toList();
+    }
+
+    private String transcriptText(List<RecordingMapper.Turn> turns) {
+        return turns.stream().map(turn -> AsrJobStore.roleLabel(turn) + "：" + turn.text())
+                .reduce((left, right) -> left + "\n\n" + right).orElse("");
+    }
+
     private List<RecordingMapper.Turn> editedTurns(String transcript) {
         List<RecordingMapper.Turn> turns = new ArrayList<>();
         long cursor = 0;
@@ -456,6 +554,14 @@ public class ClinicalWorkflowService {
     private String nextRecordingNo(UUID visitId) {
         int no = recordings.count(visitId) + 1;
         return String.format("REC-%03d", no);
+    }
+
+    private String queueProvider(String provider) {
+        return "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;
+    }
+
+    private String displayProvider(String providerRoute) {
+        return AsrJobWorker.PUBLIC_ROLE_ROUTE.equals(providerRoute) ? "DASHSCOPE" : providerRoute;
     }
 
     private String snapshotHash(UUID visitId, List<RecordingMapper.Turn> turns) {

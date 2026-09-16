@@ -3,7 +3,6 @@ package com.medicalai.mapper;
 import com.medicalai.domain.DialogueSnapshot;
 import com.medicalai.domain.Recording;
 import com.medicalai.domain.Utterance;
-import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
 import org.springframework.jdbc.core.RowMapper;
@@ -17,13 +16,14 @@ public class RecordingMapper {
             rs.getString("recording_no"), rs.getString("source_type"), rs.getString("object_key"),
             rs.getString("file_name"), rs.getString("mime_type"), rs.getObject("size_bytes", Long.class),
             rs.getObject("duration_ms", Long.class), rs.getString("status"), rs.getString("error_message"),
-            rs.getTimestamp("created_at").toInstant());
+            DatabaseDateTime.getInstant(rs, "created_at"));
     private static final RowMapper<Utterance> UTTERANCE = (rs, n) -> new Utterance(
             rs.getObject("id", UUID.class), rs.getObject("recording_id", UUID.class),
             rs.getObject("session_id", UUID.class), rs.getString("utterance_id"), rs.getInt("revision"),
             rs.getString("result_type"), rs.getString("text"), rs.getString("role"),
             rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getBoolean("is_current"),
-            rs.getTimestamp("created_at").toInstant(), rs.getObject("speaker_id", Integer.class));
+            DatabaseDateTime.getInstant(rs, "created_at"), rs.getObject("speaker_id", Integer.class),
+            rs.getString("role_source"), rs.getObject("role_confidence", Integer.class));
 
     private final JdbcTemplate jdbc;
     public RecordingMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
@@ -55,8 +55,15 @@ public class RecordingMapper {
     public Recording updateStatus(UUID id, String status, String error) {
         return jdbc.queryForObject("""
                 UPDATE recording SET status=?,error_code=CASE WHEN ?::text IS NULL THEN NULL ELSE 'ASR_FAILED' END,
-                  error_message=?,updated_at=now() WHERE id=? RETURNING *
+                  error_message=?,updated_at=medicalai_local_now() WHERE id=? RETURNING *
                 """, RECORDING, status, error, error, id);
+    }
+
+    public void saveAsrRawResponse(UUID recordingId, String rawJson, String rawHash, int segmentCount) {
+        jdbc.update("""
+                UPDATE recording SET asr_raw_response=?::jsonb,asr_raw_response_hash=?,asr_segment_count=?,
+                    updated_at=medicalai_local_now() WHERE id=?
+                """, rawJson, rawHash, segmentCount, recordingId);
     }
 
     public Optional<Recording> findByVisitAndStatus(UUID visitId, String status) {
@@ -81,20 +88,20 @@ public class RecordingMapper {
                     WHERE j.job_type='ASR_TRANSCRIBE'
                       AND j.status IN ('PENDING','RUNNING')
                       AND COALESCE(j.provider_route,'DASHSCOPE')=?
-                      AND (j.locked_at IS NULL OR j.locked_at < clock_timestamp() - interval '2 minutes')
+                      AND (j.locked_at IS NULL OR j.locked_at < medicalai_local_clock() - interval '2 minutes')
                     ORDER BY j.created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE ai_job j
-                SET locked_at=clock_timestamp(), lease_token=?
+                SET locked_at=medicalai_local_clock(), lease_token=?
                 FROM candidate c
                 WHERE j.id=c.id
                 RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at,j.provider_route
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        DatabaseDateTime.getInstant(rs, "started_at"),
                         rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), provider, leaseToken);
         return jobs.stream().findFirst();
     }
@@ -104,17 +111,17 @@ public class RecordingMapper {
         return !jdbc.queryForList("""
                 SELECT id FROM ai_job WHERE id=? AND lease_token=?
                   AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
-                  AND locked_at > clock_timestamp() - interval '2 minutes'
+                  AND locked_at > medicalai_local_clock() - interval '2 minutes'
                 FOR UPDATE
                 """, jobId, token).isEmpty();
     }
 
     public boolean renewAsrLease(UUID jobId, UUID token) {
         return jdbc.update("""
-                UPDATE ai_job SET locked_at=clock_timestamp()
+                UPDATE ai_job SET locked_at=medicalai_local_clock()
                 WHERE id=? AND lease_token=? AND job_type='ASR_TRANSCRIBE'
                   AND status IN ('PENDING','RUNNING')
-                  AND locked_at > clock_timestamp() - interval '2 minutes'
+                  AND locked_at > medicalai_local_clock() - interval '2 minutes'
                 """, jobId, token) == 1;
     }
 
@@ -126,7 +133,7 @@ public class RecordingMapper {
     // row lock prevents a newer lease owner from being installed before commit.
     public void beginAsrRecording(UUID jobId, UUID recordingId, String provider) {
         jdbc.update("""
-                UPDATE ai_job SET status='RUNNING',recording_id=?,started_at=now(),
+                UPDATE ai_job SET status='RUNNING',recording_id=?,started_at=medicalai_local_now(),
                     attempt_count=attempt_count+1,last_error=NULL WHERE id=?
                 """, recordingId, jobId);
         jdbc.update("UPDATE recording SET asr_route=? WHERE id=?", provider, recordingId);
@@ -142,7 +149,7 @@ public class RecordingMapper {
     /** Makes failed jobs, and pre-fix orphaned PROCESSING rows, eligible for an explicit retry. */
     public void requeueRetryableRecordings(UUID visitId) {
         jdbc.update("""
-                UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,updated_at=now()
+                UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,updated_at=medicalai_local_now()
                 WHERE visit_id=?
                   AND (status='FAILED' OR (
                     status='PROCESSING' AND NOT EXISTS (
@@ -166,14 +173,14 @@ public class RecordingMapper {
 
     public void markAsrSucceeded(UUID jobId) {
         jdbc.update("""
-                UPDATE ai_job SET status='SUCCEEDED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                UPDATE ai_job SET status='SUCCEEDED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=NULL
                 WHERE id=? AND job_type='ASR_TRANSCRIBE'
                 """, jobId);
     }
 
     public void markAsrFailed(UUID jobId, String error) {
         jdbc.update("""
-                UPDATE ai_job SET status='FAILED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=?
+                UPDATE ai_job SET status='FAILED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=?
                 WHERE id=? AND job_type='ASR_TRANSCRIBE'
                 """, error, jobId);
     }
@@ -185,7 +192,7 @@ public class RecordingMapper {
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        DatabaseDateTime.getInstant(rs, "started_at"),
                         rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), jobId, visitId).stream().findFirst();
     }
 
@@ -197,7 +204,7 @@ public class RecordingMapper {
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
-                        rs.getTimestamp("started_at") == null ? null : rs.getTimestamp("started_at").toInstant(),
+                        DatabaseDateTime.getInstant(rs, "started_at"),
                         rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId).stream().findFirst();
     }
 
@@ -218,10 +225,10 @@ public class RecordingMapper {
             ids.add(id);
             jdbc.update("""
                     INSERT INTO asr_utterance(id,visit_id,recording_id,session_id,utterance_id,revision,result_type,
-                                              text,role,speaker_id,role_source,start_ms,end_ms,is_current)
-                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,'AUTO',?,?,true)
+                                              text,role,speaker_id,role_source,role_confidence,start_ms,end_ms,is_current)
+                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,?,?,?,?,true)
                     """, id, visitId, recordingId, sessionId, "u-" + (i + 1), 0,
-                    t.text(), t.role(), t.speakerId(), t.startMs(), t.endMs());
+                    t.text(), t.role(), t.speakerId(), t.roleSource(), t.roleConfidence(), t.startMs(), t.endMs());
         }
         return ids;
     }
@@ -245,6 +252,19 @@ public class RecordingMapper {
     /** Create a new adopted snapshot from doctor-edited transcript text. */
     public UUID createEditedSnapshot(UUID visitId, DialogueSnapshot base, List<Turn> turns,
                                      String snapshotHash, UUID doctorId) {
+        Optional<UUID> existing = snapshotIdByHash(visitId, snapshotHash);
+        if (existing.isPresent()) {
+            UUID snapshotId = existing.get();
+            // A role-source-only change (for example OTHER -> MANUAL) leaves the
+            // immutable dialogue content unchanged. Re-adopt its content snapshot
+            // instead of attempting to insert the same globally unique hash.
+            jdbc.update("""
+                    UPDATE dialogue_snapshot
+                    SET authority_status=CASE WHEN id=? THEN 'ADOPTED' ELSE 'SUPERSEDED' END
+                    WHERE visit_id=? AND (id=? OR authority_status='ADOPTED')
+                    """, snapshotId, visitId, snapshotId);
+            return snapshotId;
+        }
         supersedeAdopted(visitId);
         UUID snapshotId = UUID.randomUUID();
         jdbc.update("""
@@ -260,6 +280,11 @@ public class RecordingMapper {
         return snapshotId;
     }
 
+    private Optional<UUID> snapshotIdByHash(UUID visitId, String snapshotHash) {
+        return jdbc.query("SELECT id FROM dialogue_snapshot WHERE visit_id=? AND snapshot_hash=?",
+                (rs, n) -> rs.getObject("id", UUID.class), visitId, snapshotHash).stream().findFirst();
+    }
+
     public Optional<DialogueSnapshot> latestSnapshot(UUID visitId) {
         return jdbc.query("""
                 SELECT * FROM dialogue_snapshot
@@ -268,7 +293,7 @@ public class RecordingMapper {
                 """, (rs, n) -> new DialogueSnapshot(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getObject("session_id", UUID.class),
                         rs.getInt("snapshot_version"), rs.getString("snapshot_hash"), rs.getString("authority_status"),
-                        rs.getTimestamp("created_at").toInstant()), visitId).stream().findFirst();
+                        DatabaseDateTime.getInstant(rs, "created_at")), visitId).stream().findFirst();
     }
 
     public Optional<DialogueSnapshot> latestAdoptedSnapshot(UUID visitId) {
@@ -284,14 +309,36 @@ public class RecordingMapper {
         return jdbc.query("SELECT * FROM asr_utterance WHERE recording_id=? ORDER BY start_ms,id", UTTERANCE, recordingId);
     }
 
-    public void updateRole(UUID visitId, UUID utteranceId, String role) {
-        jdbc.update("UPDATE asr_utterance SET role=?, role_source='MANUAL' WHERE id=? AND visit_id=?", role, utteranceId, visitId);
+    public Optional<Utterance> utterance(UUID visitId, UUID utteranceId) {
+        return jdbc.query("SELECT * FROM asr_utterance WHERE id=? AND visit_id=?", UTTERANCE, utteranceId, visitId)
+                .stream().findFirst();
+    }
+
+    public boolean updateRole(UUID visitId, UUID utteranceId, String role) {
+        return jdbc.update("""
+                UPDATE asr_utterance
+                SET role=?, role_source='MANUAL', role_confidence=NULL
+                WHERE id=? AND visit_id=?
+                """, role, utteranceId, visitId) == 1;
+    }
+
+    /** Applies a complete LLM reclassification without ever overwriting a clinician decision. */
+    public int updateRoleAssignments(UUID visitId, List<RoleUpdate> updates) {
+        int updated = 0;
+        for (RoleUpdate update : updates) {
+            updated += jdbc.update("""
+                    UPDATE asr_utterance
+                    SET role=?, role_source=?, role_confidence=?
+                    WHERE id=? AND visit_id=? AND role_source <> 'MANUAL'
+                    """, update.role(), update.source(), update.confidence(), update.utteranceId(), visitId);
+        }
+        return updated;
     }
 
     public Optional<TurnState> transcript(UUID visitId) {
                 return jdbc.query("SELECT * FROM visit_transcript WHERE visit_id=?", (rs, n) -> new TurnState(
                 rs.getObject("snapshot_id", UUID.class), rs.getString("transcript_text"), rs.getBoolean("edited"),
-                rs.getTimestamp("updated_at").toInstant()), visitId).stream().findFirst();
+                DatabaseDateTime.getInstant(rs, "updated_at")), visitId).stream().findFirst();
     }
 
     public void saveTranscript(UUID visitId, UUID snapshotId, String transcript, boolean edited) {
@@ -300,7 +347,7 @@ public class RecordingMapper {
                 VALUES (?,?,?,?)
                 ON CONFLICT (visit_id) DO UPDATE SET
                   snapshot_id=EXCLUDED.snapshot_id,transcript_text=EXCLUDED.transcript_text,
-                  edited=EXCLUDED.edited,updated_at=now()
+                  edited=EXCLUDED.edited,updated_at=medicalai_local_now()
                 """, visitId, snapshotId, transcript, edited);
     }
 
@@ -328,9 +375,16 @@ public class RecordingMapper {
         return String.valueOf(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "");
     }
 
-    public record Turn(String role, String text, long startMs, long endMs, Integer speakerId) {
-        public Turn(String role, String text, long startMs, long endMs) { this(role, text, startMs, endMs, null); }
+    public record Turn(String role, String text, long startMs, long endMs, Integer speakerId,
+                       String roleSource, Integer roleConfidence) {
+        public Turn(String role, String text, long startMs, long endMs, Integer speakerId) {
+            this(role, text, startMs, endMs, speakerId, "AUTO", null);
+        }
+        public Turn(String role, String text, long startMs, long endMs) {
+            this(role, text, startMs, endMs, null, "AUTO", null);
+        }
     }
+    public record RoleUpdate(UUID utteranceId, String role, String source, Integer confidence) {}
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
     public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
                          int attemptCount, String lastError, Instant startedAt, String providerRoute) {}

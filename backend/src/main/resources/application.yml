@@ -45,6 +45,8 @@ medicalai:
     read-timeout-ms: ${LOCAL_ASR_READ_TIMEOUT_MS:600000}
   dashscope:
     role-model: ${DASHSCOPE_ROLE_MODEL:qwen-plus}
+    role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:70}
+    role-batch-size: ${DASHSCOPE_ROLE_BATCH_SIZE:40}
     api-key: ${DASHSCOPE_API_KEY:sk-ws-H.PDYIRDH.WTGk.MEQCIA1Cg2vaLpNLwHfiXquEK6FGX_pbkwclvF_JaaO2t7GkAiBEL0fBqwtkdCArw3wPbnt4JIVOOrVOKTWRwi1n4QSnMg}
     endpoint: ${DASHSCOPE_ENDPOINT:https://dashscope.aliyuncs.com}
     asr-model: ${DASHSCOPE_ASR_MODEL:qwen-audio-3.0-asr-flash-filetrans}

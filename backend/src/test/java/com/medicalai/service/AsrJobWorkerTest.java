@@ -28,27 +28,33 @@ class AsrJobWorkerTest {
         when(store.begin(eq(job),any())).thenReturn(recording);
         return job;
     }
-    @Test void localRequiresNoPublicOrLlmCall(){
+    @Test void localCompletionAssignsRolesAfterAsrWithoutCallingPublicAsr(){
         var job=pending("LOCAL");
         var audio=new ByteArrayResource(new byte[]{1});
         when(storage.load("key")).thenReturn(audio);
-        when(local.transcribe(audio,"a.wav","audio/wav")).thenReturn(List.of(new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null)));
+        when(local.transcribeDetailed(audio,"a.wav","audio/wav")).thenReturn(new AsrResult(
+                List.of(new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null)), null));
+        when(roles.assignRoles(any())).thenReturn(Map.of(
+                0,new DashScopeRoleClient.RoleAssignment("PATIENT",88,"LLM"),
+                1,new DashScopeRoleClient.RoleAssignment("OTHER",null,"FALLBACK")));
         worker.processLocal();
-        verifyNoInteractions(cloud,roles);
+        verifyNoInteractions(cloud);
         verify(storage,never()).presignedUrl(any());
         verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
-                new RecordingMapper.Turn("OTHER","头疼",0,100,2),new RecordingMapper.Turn("OTHER","嗯",110,200,null))));
+                new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88),
+                new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null))), isNull());
     }
     @Test void publicCompletionNeverCallsLocalService(){
-        var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),"DASHSCOPE");
-        when(store.claim(eq("DASHSCOPE"),any())).thenReturn(Optional.of(job));
+        var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);
+        when(store.claim(eq(AsrJobWorker.PUBLIC_ROLE_ROUTE),any())).thenReturn(Optional.of(job));
         var task=new DashScopeAsrClient.Task("task","SUCCEEDED",null);
         when(cloud.query("task")).thenReturn(task);
-        when(cloud.result(task)).thenReturn(List.of(new AsrSegment("哪里疼",0,100,null)));
-        when(roles.assignRoles(List.of(Map.<String,Object>of("speaker_id",-1,"text","哪里疼")))).thenReturn(Map.of(-1,"DOCTOR"));
+        when(cloud.resultDetailed(task)).thenReturn(new AsrResult(List.of(new AsrSegment("哪里疼",0,100,null)), null));
+        when(roles.assignRoles(any())).thenReturn(Map.of(0,new DashScopeRoleClient.RoleAssignment("DOCTOR",91,"LLM")));
         worker.processPublic();
         verifyNoInteractions(local,storage);
-        verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(new RecordingMapper.Turn("DOCTOR","哪里疼",0,100,null))));
+        verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
+                new RecordingMapper.Turn("DOCTOR","哪里疼",0,100,null,"LLM",91))), isNull());
     }
     @Test void interruptedLocalJobFailsWithoutReplayingModel(){
         var job=new RecordingMapper.AsrJob(id,visit,recordingId,null,"RUNNING",1,null,Instant.now(),"LOCAL");
@@ -71,7 +77,7 @@ class AsrJobWorkerTest {
         var renewal=org.mockito.ArgumentCaptor.forClass(Runnable.class);
         doReturn(future).when(timer).scheduleWithFixedDelay(renewal.capture(),eq(20L),eq(20L),eq(TimeUnit.SECONDS));
         when(store.renew(eq(job.id()),any())).thenReturn(false);
-        when(local.transcribe(any(),any(),any())).thenAnswer(inv->{renewal.getValue().run();return List.of(new AsrSegment("过期结果",0,1,0));});
+        when(local.transcribeDetailed(any(),any(),any())).thenAnswer(inv->{renewal.getValue().run();return new AsrResult(List.of(new AsrSegment("过期结果",0,1,0)), null);});
         new AsrJobWorker(store,storage,cloud,local,roles,timer,600000).processLocal();
         verify(store).renew(eq(job.id()),any());
         verify(store,never()).complete(any(),any(),any(),any());
@@ -80,15 +86,15 @@ class AsrJobWorkerTest {
     }
     @Test void blockedLocalInferenceDoesNotBlockPublicScheduler() throws Exception {
         var localJob=pending("LOCAL");
-        var publicJob=new RecordingMapper.AsrJob(UUID.randomUUID(),UUID.randomUUID(),recordingId,"task","RUNNING",1,null,Instant.now(),"DASHSCOPE");
-        when(store.claim(eq("DASHSCOPE"),any())).thenReturn(Optional.of(publicJob));
+        var publicJob=new RecordingMapper.AsrJob(UUID.randomUUID(),UUID.randomUUID(),recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);
+        when(store.claim(eq(AsrJobWorker.PUBLIC_ROLE_ROUTE),any())).thenReturn(Optional.of(publicJob));
         var task=new DashScopeAsrClient.Task("task","SUCCEEDED",null);
         when(cloud.query("task")).thenReturn(task);
-        when(cloud.result(task)).thenReturn(List.of(new AsrSegment("医生您好",0,100,1)));
-        when(roles.assignRoles(any())).thenReturn(Map.of(1,"PATIENT"));
+        when(cloud.resultDetailed(task)).thenReturn(new AsrResult(List.of(new AsrSegment("医生您好",0,100,1)), null));
+        when(roles.assignRoles(any())).thenReturn(Map.of(1,new DashScopeRoleClient.RoleAssignment("PATIENT",90,"LLM")));
         CountDownLatch entered=new CountDownLatch(1),unblock=new CountDownLatch(1),completed=new CountDownLatch(1);
-        when(local.transcribe(any(),any(),any())).thenAnswer(inv->{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return List.of(new AsrSegment("本地",0,100,0));});
-        doAnswer(inv->{completed.countDown();return null;}).when(store).complete(eq(publicJob),any(),any(),any());
+        when(local.transcribeDetailed(any(),any(),any())).thenAnswer(inv->{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return new AsrResult(List.of(new AsrSegment("本地",0,100,0)), null);});
+        doAnswer(inv->{completed.countDown();return null;}).when(store).complete(eq(publicJob),any(),any(),any(),any());
         var config=new AsrSchedulingConfig();var localScheduler=config.localAsrScheduler();var publicScheduler=config.publicAsrScheduler();
         localScheduler.initialize();publicScheduler.initialize();
         try {

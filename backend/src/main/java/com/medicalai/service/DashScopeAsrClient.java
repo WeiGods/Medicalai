@@ -8,6 +8,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -17,6 +19,7 @@ import org.springframework.web.client.RestClientResponseException;
 
 @Service
 public class DashScopeAsrClient {
+    private static final Logger LOG = LoggerFactory.getLogger(DashScopeAsrClient.class);
     private final RestClient client;
     private final ObjectMapper objectMapper;
     private final String apiKey;
@@ -45,6 +48,8 @@ public class DashScopeAsrClient {
                     "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY");
         }
         try {
+            long startedAt = System.nanoTime();
+            LOG.info("公网ASR调用开始：模型={}，是否启用说话人分离={}", model, diarizationEnabled);
             JsonNode response = client.post().uri("/api/v1/services/audio/asr/transcription")
                     .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
                     .header("X-DashScope-Async", "enable")
@@ -55,6 +60,7 @@ public class DashScopeAsrClient {
                     .retrieve().body(JsonNode.class);
             String taskId = text(response == null ? null : response.at("/output/task_id"));
             if (taskId.isBlank()) throw new IllegalStateException("DashScope response did not contain output.task_id");
+            LOG.info("公网ASR调用提交成功：模型={}，耗时毫秒={}", model, elapsedMs(startedAt));
             return taskId;
         } catch (Exception e) {
             throw unavailable("DashScope ASR 提交失败", e);
@@ -69,14 +75,20 @@ public class DashScopeAsrClient {
             JsonNode output = response == null ? null : response.path("output");
             String status = text(output == null ? null : output.path("task_status"));
             if (status.isBlank()) status = text(output == null ? null : output.path("status"));
-            return new Task(taskId, status.toUpperCase(Locale.ROOT), output == null ? objectMapper.createObjectNode() : output);
+            return new Task(taskId, status.toUpperCase(Locale.ROOT), output == null ? objectMapper.createObjectNode() : output,
+                    response == null ? objectMapper.createObjectNode() : response);
         } catch (Exception e) {
             throw unavailable("DashScope ASR 查询失败", e);
         }
     }
 
     public List<AsrSegment> result(Task task) {
-        JsonNode result = task.output();
+        return resultDetailed(task).segments();
+    }
+
+    public AsrResult resultDetailed(Task task) {
+        long startedAt = System.nanoTime();
+        JsonNode result = task.rawResponse() == null ? task.output() : task.rawResponse();
         String resultUrl = findUrl(result);
         if (!resultUrl.isBlank()) {
             try {
@@ -89,8 +101,12 @@ public class DashScopeAsrClient {
         }
         List<AsrSegment> segments = new ArrayList<>();
         collectSegments(result, segments);
-        return segments;
+        LOG.info("公网ASR结果解析成功：模型={}，是否下载结果文件={}，句段数={}，耗时毫秒={}",
+                model, !resultUrl.isBlank(), segments.size(), elapsedMs(startedAt));
+        return new AsrResult(segments, result);
     }
+
+    private long elapsedMs(long startedAt) { return (System.nanoTime() - startedAt) / 1_000_000; }
 
     private void collectSegments(JsonNode node, List<AsrSegment> segments) {
         if (node == null || node.isMissingNode() || node.isNull()) return;
@@ -174,5 +190,9 @@ public class DashScopeAsrClient {
         return new BusinessException(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_UNAVAILABLE", message, cause);
     }
 
-    public record Task(String taskId, String status, JsonNode output) {}
+    public record Task(String taskId, String status, JsonNode output, JsonNode rawResponse) {
+        public Task(String taskId, String status, JsonNode output) {
+            this(taskId, status, output, output);
+        }
+    }
 }

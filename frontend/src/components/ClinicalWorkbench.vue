@@ -4,7 +4,7 @@ import { api } from '../api'
 import Icon from './Icon.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
-import type { AsrProvider, Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
+import type { AsrProvider, Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
@@ -21,7 +21,7 @@ const selectedPatientId = ref('')
 const view = ref<MainView>('workbench')
 const queueSearch = ref('')
 const busy = ref(false)
-const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'save' | 'confirm'>('')
+const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
@@ -46,6 +46,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const modalDialog = ref<HTMLElement | null>(null)
 const activity = ref<{ time: string; text: string }[]>([])
 const recordingElapsedMs = ref(0)
+const roleReviewElements = new Map<string, HTMLElement>()
 let toastTimer: number | undefined
 let recordingTimer: number | undefined
 let recordingStartedAt = 0
@@ -206,17 +207,26 @@ const missingFields = computed(() => {
   if (!content.date.trim()) missing.push('接诊日期')
   return missing
 })
+const turnsMatchTranscript = computed(() => {
+  const source = transcript.value
+  if (!source?.turns.length) return false
+  return source.transcript === source.turns.map(turn => `${roleLabel(turn)}：${turn.text}`).join('\n\n')
+})
 const segments = computed(() => {
   const source = transcript.value
   if (!source) return []
-  if (source.turns.length && !source.edited) {
-    return source.turns.map(item => ({ role: roleLabel(item), time: formatTime(item.start_ms), text: item.text }))
+  if (source.turns.length && (!source.edited || turnsMatchTranscript.value)) {
+    return source.turns.map(item => ({ role: roleLabel(item), roleCode: item.role, time: formatTime(item.start_ms), text: item.text, turn: item }))
   }
   return source.transcript.split(/\n+/).filter(Boolean).map((line, index) => {
     const match = line.match(/^(医生|患者|其他人|未识别角色|说话人 ?[0-9]+)[：:]\s*(.*)$/)
-    return { role: match ? match[1] : '未识别角色', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line }
+    const role = match ? match[1] : '未识别角色'
+    return { role, roleCode: role === '医生' ? 'DOCTOR' : role === '患者' ? 'PATIENT' : 'OTHER', time: source.turns[index] ? formatTime(source.turns[index].start_ms) : '00:00', text: match ? match[2] : line, turn: undefined }
   })
 })
+const roleReviewCount = computed(() => transcript.value?.turns.filter(turn => turn.role_review_required).length || 0)
+const unclassifiedRoleCount = computed(() => transcript.value?.turns.filter(turn =>
+  turn.role_source === 'AUTO' || turn.role_source === 'UNKNOWN').length || 0)
 const facts = computed(() => {
   const lines = segments.value.filter(item => item.role === '患者').map(item => item.text)
   return [
@@ -587,6 +597,70 @@ async function saveTranscript() {
   } finally {
     actionBusy.value = ''
   }
+}
+
+function roleStatus(turn: Utterance | undefined) {
+  if (!turn) return ''
+  if (turn.role_source === 'MANUAL') return '人工确认'
+  if (turn.role_source === 'FALLBACK') return 'AI 未完成'
+  if (turn.role_source === 'AUTO' || turn.role_source === 'UNKNOWN') return 'AI 未分析'
+  if (turn.role_review_required) return '待人工核对'
+  if (turn.role_source === 'LLM' && turn.role_confidence != null) return `AI ${turn.role_confidence}%`
+  return '待人工核对'
+}
+
+async function updateUtteranceRole(turn: Utterance | undefined, event: Event) {
+  const role = (event.target as HTMLSelectElement).value as 'DOCTOR' | 'PATIENT' | 'OTHER'
+  if (!currentVisit.value || !turn?.id || locked.value || actionBusy.value) return
+  actionBusy.value = 'role'
+  try {
+    const updated = await api.updateUtteranceRole(currentVisit.value.id, turn.id, role)
+    transcript.value = updated
+    transcriptDraft.value = updated.transcript
+    addLog('人工修订句段说话角色')
+    toast('角色已人工确认，请重新生成并确认病历。')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '角色更新失败')
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
+async function confirmCurrentUtteranceRole(turn: Utterance | undefined) {
+  if (!turn) return
+  await updateUtteranceRole(turn, { target: { value: turn.role } } as Event)
+}
+
+async function reclassifyTranscriptRoles() {
+  if (!currentVisit.value || !roleReviewCount.value || !turnsMatchTranscript.value || locked.value) return
+  actionBusy.value = 'reclassify-roles'
+  try {
+    const updated = await api.reclassifyTranscriptRoles(currentVisit.value.id)
+    transcript.value = updated
+    transcriptDraft.value = updated.transcript
+    addLog('使用 AI 重新判断未人工确认的句段角色')
+    toast('AI 角色判断已更新，请继续核对待人工确认的句段。')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : 'AI 角色判断失败')
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
+function setRoleReviewElement(utteranceId: string | undefined, element: unknown) {
+  if (!utteranceId) return
+  if (element && typeof (element as HTMLElement).scrollIntoView === 'function') {
+    roleReviewElements.set(utteranceId, element as HTMLElement)
+  } else {
+    roleReviewElements.delete(utteranceId)
+  }
+}
+
+async function openRoleReview() {
+  transcriptTab.value = 'dialogue'
+  await nextTick()
+  const firstReviewId = transcript.value?.turns.find(turn => turn.role_review_required)?.id
+  if (firstReviewId) roleReviewElements.get(firstReviewId)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 async function copyTranscript() {
@@ -1124,21 +1198,28 @@ defineExpose({ selectPatient })
 
           <section class="card">
             <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2>
-              <button class="text-btn" :disabled="!transcriptDraft" aria-label="复制转写文本" @click="copyTranscript"><Icon name="copy" /></button>
+              <div class="record-header-actions"><button class="text-btn" :disabled="!transcriptDraft" aria-label="复制转写文本" @click="copyTranscript"><Icon name="copy" /></button></div>
             </div>
             <template v-if="transcriptDraft">
-              <p v-if="transcript?.turns?.length && transcript.turns.every(item => item.role !== 'DOCTOR' && item.role !== 'PATIENT')" class="issue-hint">当前结果保留说话人信息，尚未标注医生／患者。可在编辑文本中核对角色；本地 ASR 不自动判断医疗身份。</p>
-          <div class="transcript-tabs">
+              <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
+                <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
+                <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
+                  <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
+                </div>
+                <div class="role-attention-actions"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+              </aside>
+           <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
                 <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
                 <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
               </div>
               <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
                 <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
-                <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
+                <div v-for="(item, index) in segments" :key="item.turn?.id || index" :ref="element => setRoleReviewElement(item.turn?.id, element)" class="dialogue" :class="{ patient: item.roleCode === 'PATIENT', 'needs-review': item.turn?.role_review_required }">
                   <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
-                  <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
+                  <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
                     <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
+                    <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
                   </div>
                 </div>
               </div>
@@ -1309,8 +1390,14 @@ defineExpose({ selectPatient })
 
       <div v-else-if="view === 'transcript'" class="full-view">
         <section class="card">
-          <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div>
-          <p v-if="transcript?.turns?.length && transcript.turns.every(item => item.role !== 'DOCTOR' && item.role !== 'PATIENT')" class="issue-hint">当前结果保留说话人信息，尚未标注医生／患者。可在编辑文本中核对角色；本地 ASR 不自动判断医疗身份。</p>
+          <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
+          <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
+            <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
+            <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
+              <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
+            </div>
+            <div class="role-attention-actions"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+          </aside>
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
             <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
@@ -1318,10 +1405,11 @@ defineExpose({ selectPatient })
           </div>
           <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
             <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
-            <div v-for="(item, index) in segments" :key="index" class="dialogue" :class="{ patient: item.role === '患者' }">
+            <div v-for="(item, index) in segments" :key="item.turn?.id || index" :ref="element => setRoleReviewElement(item.turn?.id, element)" class="dialogue" :class="{ patient: item.roleCode === 'PATIENT', 'needs-review': item.turn?.role_review_required }">
               <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
-              <div><div class="dialogue-meta">{{ item.role }}<time>{{ item.time }}</time></div>
+              <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
                 <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
+                <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
               </div>
             </div>
           </div>

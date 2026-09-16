@@ -23,13 +23,13 @@ public class DoctorMapper {
                 INSERT INTO doctor(id, external_system, external_user_id, display_name, department_name)
                 VALUES (?, 'LOCAL_DEMO', ?, ?, '神经内科')
                 ON CONFLICT (external_system, external_user_id)
-                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=CURRENT_TIMESTAMP
+                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=medicalai_local_now()
                 RETURNING *
                 """, ROW, id, externalId, name);
     }
 
     public void markLogin(UUID id) {
-        jdbc.update("UPDATE doctor SET last_login_at=CURRENT_TIMESTAMP WHERE id=?", id);
+        jdbc.update("UPDATE doctor SET last_login_at=medicalai_local_now() WHERE id=?", id);
     }
 
     public void lock(UUID id) {

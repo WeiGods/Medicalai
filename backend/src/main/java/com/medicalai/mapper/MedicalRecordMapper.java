@@ -15,7 +15,7 @@ public class MedicalRecordMapper {
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
             rs.getString("content_json"), rs.getString("edited_content_json"), rs.getString("generation_status"),
-            rs.getString("generated_by"), rs.getTimestamp("created_at").toInstant());
+            rs.getString("generated_by"), DatabaseDateTime.getInstant(rs, "created_at"));
 
     private final JdbcTemplate jdbc;
     public MedicalRecordMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
@@ -26,7 +26,11 @@ public class MedicalRecordMapper {
     }
 
     public String status(UUID visitId) {
-        return jdbc.queryForObject("SELECT r.status FROM medical_record r WHERE r.visit_id=?", String.class, visitId);
+        // A transcript can be edited before a medical record is generated.  In
+        // that state no medical_record row exists yet, which means "not
+        // confirmed" rather than a database failure.
+        return jdbc.query("SELECT r.status FROM medical_record r WHERE r.visit_id=?", (rs, n) -> rs.getString("status"), visitId)
+                .stream().findFirst().orElse("DRAFT");
     }
 
     public UUID createRecord(UUID id, UUID visitId) {
@@ -50,7 +54,7 @@ public class MedicalRecordMapper {
                 """, id, recordId, versionNo, snapshotId, snapshotHash, contentJson, generatedBy, doctorId);
         jdbc.update("""
                 UPDATE medical_record SET current_version=?,status='DRAFT',confirmed_version=NULL,
-                  confirmed_at=NULL,confirmed_by=NULL,updated_at=now() WHERE id=?
+                  confirmed_at=NULL,confirmed_by=NULL,updated_at=medicalai_local_now() WHERE id=?
                 """, versionNo, recordId);
         return findVersion(recordId, versionNo).orElseThrow();
     }
@@ -77,7 +81,7 @@ public class MedicalRecordMapper {
 
     public void confirm(UUID recordId, int versionNo, UUID doctorId, UUID confirmationId) {
         jdbc.update("""
-                UPDATE medical_record SET status='CONFIRMED',confirmed_version=?,confirmed_at=now(),confirmed_by=?,updated_at=now()
+                UPDATE medical_record SET status='CONFIRMED',confirmed_version=?,confirmed_at=medicalai_local_now(),confirmed_by=?,updated_at=medicalai_local_now()
                 WHERE id=?
                 """, versionNo, doctorId, recordId);
     }
@@ -105,7 +109,7 @@ public class MedicalRecordMapper {
                 JOIN doctor d ON d.id=c.doctor_id
                 WHERE r.visit_id=? ORDER BY c.confirmed_at DESC
                 """, (rs,n) -> new ConfirmationRow(rs.getObject("id", UUID.class), rs.getInt("version_no"),
-                        rs.getString("display_name"), rs.getTimestamp("confirmed_at").toInstant()), visitId);
+                        rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "confirmed_at")), visitId);
     }
 
     public Optional<ConfirmedVersion> currentConfirmedVersion(UUID visitId) {
@@ -132,7 +136,7 @@ public class MedicalRecordMapper {
                 ORDER BY e.created_at DESC LIMIT 1
                 """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
                         rs.getInt("version_no"), rs.getString("format"), rs.getString("status"),
-                        rs.getString("display_name"), rs.getTimestamp("created_at").toInstant()),
+                        rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at")),
                 recordId, versionId, confirmationId, format).stream().findFirst();
     }
 
@@ -170,7 +174,7 @@ public class MedicalRecordMapper {
                 )
                 UPDATE ai_job j
                 SET status='RUNNING', attempt_count=j.attempt_count+1,
-                    started_at=COALESCE(j.started_at,now()), locked_at=now(), lease_token=?
+                    started_at=COALESCE(j.started_at,medicalai_local_now()), locked_at=medicalai_local_clock(), lease_token=?
                 FROM candidate c
                 WHERE j.id=c.id
                 RETURNING j.id,j.result_ref,j.attempt_count
@@ -188,7 +192,7 @@ public class MedicalRecordMapper {
                 WHERE id=? AND status='RUNNING'
                 """, objectKey, exportId);
         jdbc.update("""
-                UPDATE ai_job SET status='SUCCEEDED',finished_at=now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                UPDATE ai_job SET status='SUCCEEDED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=NULL
                 WHERE id=? AND result_ref=?
                 """, jobId, exportId);
     }
@@ -203,7 +207,7 @@ public class MedicalRecordMapper {
         } else {
             jdbc.update("UPDATE record_export SET status='FAILED',error_message=? WHERE id=?", error, exportId);
             jdbc.update("""
-                    UPDATE ai_job SET status='FAILED',finished_at=now(),last_error=?,locked_at=NULL,lease_token=NULL
+                    UPDATE ai_job SET status='FAILED',finished_at=medicalai_local_now(),last_error=?,locked_at=NULL,lease_token=NULL
                     WHERE id=? AND result_ref=?
                     """, error, jobId, exportId);
         }
@@ -231,7 +235,7 @@ public class MedicalRecordMapper {
                         rs.getObject("visit_id", UUID.class), rs.getString("visit_no"),
                         rs.getString("patient_name"), rs.getInt("version_no"), rs.getString("format"),
                         rs.getString("content_json"), rs.getString("edited_content_json"),
-                        rs.getString("doctor_name"), rs.getTimestamp("confirmed_at").toInstant()), exportId)
+                        rs.getString("doctor_name"), DatabaseDateTime.getInstant(rs, "confirmed_at")), exportId)
                 .stream().findFirst();
     }
 
@@ -259,7 +263,7 @@ public class MedicalRecordMapper {
                 """, (rs,n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
                         rs.getInt("version_no"),
                         rs.getString("format"), rs.getString("status"), rs.getString("display_name"),
-                        rs.getTimestamp("created_at").toInstant()), visitId);
+                        DatabaseDateTime.getInstant(rs, "created_at")), visitId);
     }
 
     public void audit(UUID doctorId, UUID visitId, String action, UUID resourceId) {

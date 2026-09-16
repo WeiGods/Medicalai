@@ -22,13 +22,13 @@ class RecordingUtterancePersistenceTest {
                         id UUID PRIMARY KEY, visit_id UUID, recording_id UUID, session_id UUID,
                         utterance_id VARCHAR(64), revision INTEGER, result_type VARCHAR(32),
                         text VARCHAR(1000), role VARCHAR(32), speaker_id INTEGER,
-                        role_source VARCHAR(32), start_ms BIGINT, end_ms BIGINT, is_current BOOLEAN
+                        role_source VARCHAR(32), role_confidence INTEGER, start_ms BIGINT, end_ms BIGINT, is_current BOOLEAN
                     )
                     """);
             UUID visit = UUID.randomUUID(), recording = UUID.randomUUID(), session = UUID.randomUUID();
             var turns = List.of(
-                    new RecordingMapper.Turn("DOCTOR", "哪里不舒服？", 120L, 2560L, 3),
-                    new RecordingMapper.Turn("OTHER", "头痛。", 3010L, 4900L, null));
+                    new RecordingMapper.Turn("DOCTOR", "哪里不舒服？", 120L, 2560L, 3, "LLM", 92),
+                    new RecordingMapper.Turn("OTHER", "头痛。", 3010L, 4900L, null, "FALLBACK", null));
             var ids = new RecordingMapper(jdbc).insertUtterances(visit, recording, session, turns);
             assertEquals(2, ids.size());
             for (int i = 0; i < turns.size(); i++) {
@@ -43,7 +43,8 @@ class RecordingUtterancePersistenceTest {
                 assertEquals(turn.text(), row.get("text"));
                 assertEquals(turn.role(), row.get("role"));
                 assertEquals(turn.speakerId(), row.get("speaker_id"));
-                assertEquals("AUTO", row.get("role_source"));
+                assertEquals(turn.roleSource(), row.get("role_source"));
+                assertEquals(turn.roleConfidence(), row.get("role_confidence"));
                 assertEquals(turn.startMs(), row.get("start_ms"));
                 assertEquals(turn.endMs(), row.get("end_ms"));
                 assertEquals(true, row.get("is_current"));
