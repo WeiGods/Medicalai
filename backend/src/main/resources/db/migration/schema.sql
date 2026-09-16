@@ -3,6 +3,25 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+-- Business timestamps are stored as Beijing local time without a timezone or
+-- fractional seconds.  Keep transaction-time and wall-clock variants separate
+-- because lease expiry must observe elapsed time during a long transaction.
+CREATE OR REPLACE FUNCTION medicalai_local_now()
+RETURNS timestamp without time zone
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT date_trunc('second', timezone('Asia/Shanghai', now()))
+$$;
+
+CREATE OR REPLACE FUNCTION medicalai_local_clock()
+RETURNS timestamp without time zone
+LANGUAGE sql
+VOLATILE
+AS $$
+    SELECT date_trunc('second', timezone('Asia/Shanghai', clock_timestamp()))
+$$;
+
 CREATE TABLE IF NOT EXISTS doctor (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     external_system varchar(32) NOT NULL,
@@ -13,10 +32,10 @@ CREATE TABLE IF NOT EXISTS doctor (
     department_name varchar(128),
     role varchar(32) NOT NULL DEFAULT 'DOCTOR' CHECK (role IN ('DOCTOR','ADMIN')),
     status varchar(32) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','DISABLED')),
-    last_login_at timestamptz,
+    last_login_at timestamp(0) without time zone,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_doctor_external_identity UNIQUE (external_system, external_user_id)
 );
 
@@ -25,11 +44,11 @@ CREATE TABLE IF NOT EXISTS login_session (
     doctor_id uuid NOT NULL REFERENCES doctor(id),
     login_type varchar(32) NOT NULL,
     access_token_hash varchar(256) NOT NULL,
-    expires_at timestamptz NOT NULL,
-    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamp(0) without time zone NOT NULL,
+    last_seen_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     client_info jsonb NOT NULL DEFAULT '{}'::jsonb,
-    revoked_at timestamptz,
-    created_at timestamptz NOT NULL DEFAULT now(),
+    revoked_at timestamp(0) without time zone,
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_session_token UNIQUE (access_token_hash)
 );
 
@@ -47,11 +66,11 @@ CREATE TABLE IF NOT EXISTS patient (
     id_no_masked varchar(64),
     department_id varchar(128),
     department_name varchar(128),
-    source_updated_at timestamptz,
+    source_updated_at timestamp(0) without time zone,
     status varchar(32) NOT NULL DEFAULT 'ACTIVE',
     raw_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_patient_source_identity UNIQUE (source_system, source_patient_id)
 );
 
@@ -70,15 +89,15 @@ CREATE TABLE IF NOT EXISTS visit (
     patient_age_snapshot int CHECK (patient_age_snapshot BETWEEN 0 AND 150),
     patient_phone_snapshot varchar(64),
     doctor_name_snapshot varchar(128),
-    started_at timestamptz,
-    completed_at timestamptz,
-    cancelled_at timestamptz,
+    started_at timestamp(0) without time zone,
+    completed_at timestamp(0) without time zone,
+    cancelled_at timestamp(0) without time zone,
     archive_reason varchar(256),
     version int NOT NULL DEFAULT 0,
     created_by uuid REFERENCES doctor(id),
     updated_by uuid REFERENCES doctor(id),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
 CREATE TABLE IF NOT EXISTS recording (
@@ -94,10 +113,13 @@ CREATE TABLE IF NOT EXISTS recording (
     sha256 varchar(128),
     status varchar(32) NOT NULL DEFAULT 'UPLOADED',
     asr_route varchar(32),
+    asr_raw_response jsonb,
+    asr_raw_response_hash varchar(128),
+    asr_segment_count int,
     error_code varchar(64),
     error_message varchar(512),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_recording_no UNIQUE (visit_id, recording_no),
     CONSTRAINT uq_recording_visit_scope UNIQUE (id, visit_id)
 );
@@ -111,8 +133,8 @@ CREATE TABLE IF NOT EXISTS recording_session (
     status varchar(32) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','STOPPING','STOPPED','FAILED')),
     last_sequence bigint NOT NULL DEFAULT -1,
     last_event_id varchar(128),
-    started_at timestamptz NOT NULL DEFAULT now(),
-    stopped_at timestamptz,
+    started_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    stopped_at timestamp(0) without time zone,
     stop_operation_id varchar(128) UNIQUE,
     reconnect_count int NOT NULL DEFAULT 0,
     CONSTRAINT uq_recording_session_scope UNIQUE (id, recording_id, visit_id),
@@ -130,14 +152,15 @@ CREATE TABLE IF NOT EXISTS asr_utterance (
     text text NOT NULL,
     role varchar(32) NOT NULL DEFAULT 'UNKNOWN',
     speaker_id int,
-    role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN' CHECK (role_source IN ('AUTO','MANUAL','UNKNOWN')),
+    role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN' CHECK (role_source IN ('AUTO','LLM','FALLBACK','MANUAL','UNKNOWN')),
+    role_confidence smallint CHECK (role_confidence IS NULL OR role_confidence BETWEEN 0 AND 100),
     anonymous_speaker_epoch int NOT NULL DEFAULT 1,
     start_ms bigint CHECK (start_ms >= 0),
     end_ms bigint CHECK (end_ms >= start_ms),
     is_current boolean NOT NULL DEFAULT false CHECK (NOT is_current OR result_type = 'CANONICAL'),
     source_event_id varchar(128),
     ignored_reason varchar(128),
-    created_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_utterance_revision UNIQUE (recording_id, utterance_id, revision, result_type),
     CONSTRAINT uq_utterance_recording_scope UNIQUE (id, recording_id, visit_id),
     CONSTRAINT fk_utterance_scope FOREIGN KEY (session_id, recording_id, visit_id)
@@ -154,7 +177,7 @@ CREATE TABLE IF NOT EXISTS dialogue_snapshot (
     authority_status varchar(64) NOT NULL,
     turns_json jsonb NOT NULL,
     created_by uuid REFERENCES doctor(id),
-    created_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_dialogue_version UNIQUE (visit_id, snapshot_version),
     CONSTRAINT fk_dialogue_scope FOREIGN KEY (session_id, recording_id, visit_id)
         REFERENCES recording_session(id, recording_id, visit_id)
@@ -172,10 +195,10 @@ CREATE TABLE IF NOT EXISTS medical_record (
     current_version int,
     status varchar(32) NOT NULL DEFAULT 'DRAFT',
     confirmed_version int,
-    confirmed_at timestamptz,
+    confirmed_at timestamp(0) without time zone,
     confirmed_by uuid REFERENCES doctor(id),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_record_visit_scope UNIQUE (id, visit_id),
     CONSTRAINT ck_confirmed_version CHECK (
         status <> 'CONFIRMED' OR (confirmed_version = current_version
@@ -196,7 +219,7 @@ CREATE TABLE IF NOT EXISTS medical_record_version (
     generation_status varchar(32) NOT NULL DEFAULT 'PENDING',
     generated_by varchar(128),
     created_by uuid REFERENCES doctor(id),
-    created_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT uq_record_version UNIQUE (record_id, version_no),
     CONSTRAINT uq_record_version_scope UNIQUE (id, record_id)
 );
@@ -207,7 +230,7 @@ CREATE TABLE IF NOT EXISTS medical_record_confirmation (
     version_id uuid NOT NULL REFERENCES medical_record_version(id),
     doctor_id uuid NOT NULL REFERENCES doctor(id),
     declaration boolean NOT NULL CHECK (declaration = true),
-    confirmed_at timestamptz NOT NULL DEFAULT now(),
+    confirmed_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     client_ip varchar(64),
     CONSTRAINT fk_confirmation_version FOREIGN KEY (version_id, record_id)
         REFERENCES medical_record_version(id, record_id),
@@ -225,10 +248,10 @@ CREATE TABLE IF NOT EXISTS ai_job (
     provider_route varchar(32),
     result_ref uuid,
     last_error varchar(1024),
-    started_at timestamptz,
-    finished_at timestamptz,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    locked_at timestamptz,
+    started_at timestamp(0) without time zone,
+    finished_at timestamp(0) without time zone,
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    locked_at timestamp(0) without time zone,
     lease_token uuid
 );
 
@@ -242,7 +265,7 @@ CREATE TABLE IF NOT EXISTS record_export (
     object_key varchar(512),
     error_message varchar(1024),
     created_by uuid NOT NULL REFERENCES doctor(id),
-    created_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     CONSTRAINT fk_export_version FOREIGN KEY (version_id, record_id)
         REFERENCES medical_record_version(id, record_id)
 );
@@ -253,7 +276,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     visit_id uuid REFERENCES visit(id),
     action varchar(128) NOT NULL,
     resource_id uuid,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
 CREATE TABLE IF NOT EXISTS visit_transcript (
@@ -261,8 +284,8 @@ CREATE TABLE IF NOT EXISTS visit_transcript (
     snapshot_id uuid NOT NULL REFERENCES dialogue_snapshot(id),
     transcript_text text NOT NULL DEFAULT '',
     edited boolean NOT NULL DEFAULT false,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
 -- 兼容已由旧版迁移创建的数据库：补列、移除旧唯一约束并补齐复合关系。
@@ -273,10 +296,13 @@ ALTER TABLE visit ADD COLUMN IF NOT EXISTS updated_by uuid REFERENCES doctor(id)
 ALTER TABLE visit DROP CONSTRAINT IF EXISTS fk_current_record;
 ALTER TABLE visit DROP COLUMN IF EXISTS current_record_id;
 ALTER TABLE patient ADD COLUMN IF NOT EXISTS id_no_masked varchar(64);
-ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS locked_at timestamptz;
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS locked_at timestamp(0) without time zone;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS lease_token uuid;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS recording_id uuid REFERENCES recording(id);
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS provider_task_id varchar(256);
+ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response jsonb;
+ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response_hash varchar(128);
+ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_segment_count int;
 CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
 
@@ -311,7 +337,66 @@ ALTER TABLE medical_record ADD CONSTRAINT ck_confirmed_version CHECK (
 ALTER TABLE asr_utterance DROP CONSTRAINT IF EXISTS asr_utterance_utterance_id_revision_result_type_key;
 ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS speaker_id int;
 ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN';
+ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS role_confidence smallint;
+ALTER TABLE asr_utterance DROP CONSTRAINT IF EXISTS asr_utterance_role_source_check;
+ALTER TABLE asr_utterance ADD CONSTRAINT asr_utterance_role_source_check
+    CHECK (role_source IN ('AUTO','LLM','FALLBACK','MANUAL','UNKNOWN'));
+ALTER TABLE asr_utterance DROP CONSTRAINT IF EXISTS asr_utterance_role_confidence_check;
+ALTER TABLE asr_utterance ADD CONSTRAINT asr_utterance_role_confidence_check
+    CHECK (role_confidence IS NULL OR role_confidence BETWEEN 0 AND 100);
 ALTER TABLE dialogue_snapshot DROP CONSTRAINT IF EXISTS dialogue_snapshot_visit_id_key;
+
+-- Convert existing PostgreSQL databases once.  CREATE TABLE IF NOT EXISTS does
+-- not change old column types, so each listed timestamptz column is explicitly
+-- converted from its instant to Beijing local time and truncated to seconds.
+CREATE OR REPLACE FUNCTION medicalai_migrate_timestamp_storage()
+RETURNS void
+LANGUAGE plpgsql
+AS '
+DECLARE
+    target record;
+BEGIN
+    FOR target IN
+        SELECT * FROM (VALUES
+            (''doctor'', ''last_login_at'', false), (''doctor'', ''created_at'', true), (''doctor'', ''updated_at'', true),
+            (''login_session'', ''expires_at'', false), (''login_session'', ''last_seen_at'', true),
+            (''login_session'', ''revoked_at'', false), (''login_session'', ''created_at'', true),
+            (''patient'', ''source_updated_at'', false), (''patient'', ''created_at'', true), (''patient'', ''updated_at'', true),
+            (''visit'', ''started_at'', false), (''visit'', ''completed_at'', false), (''visit'', ''cancelled_at'', false),
+            (''visit'', ''created_at'', true), (''visit'', ''updated_at'', true),
+            (''recording'', ''created_at'', true), (''recording'', ''updated_at'', true),
+            (''recording_session'', ''started_at'', true), (''recording_session'', ''stopped_at'', false),
+            (''asr_utterance'', ''created_at'', true), (''dialogue_snapshot'', ''created_at'', true),
+            (''medical_record'', ''confirmed_at'', false), (''medical_record'', ''created_at'', true), (''medical_record'', ''updated_at'', true),
+            (''medical_record_version'', ''created_at'', true),
+            (''medical_record_confirmation'', ''confirmed_at'', true),
+            (''ai_job'', ''started_at'', false), (''ai_job'', ''finished_at'', false), (''ai_job'', ''created_at'', true), (''ai_job'', ''locked_at'', false),
+            (''record_export'', ''created_at'', true), (''audit_log'', ''created_at'', true),
+            (''visit_transcript'', ''created_at'', true), (''visit_transcript'', ''updated_at'', true)
+        ) AS time_column(table_name, column_name, has_default)
+    LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns column_info
+            WHERE column_info.table_schema = current_schema()
+              AND column_info.table_name = target.table_name
+              AND column_info.column_name = target.column_name
+              AND column_info.data_type = ''timestamp with time zone''
+        ) THEN
+            EXECUTE format(''ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT'', target.table_name, target.column_name);
+            EXECUTE format(
+                ''ALTER TABLE %I ALTER COLUMN %I TYPE timestamp(0) without time zone ''
+                    || ''USING date_trunc(''''second'''', %I AT TIME ZONE ''''Asia/Shanghai'''')'',
+                target.table_name, target.column_name, target.column_name);
+            IF target.has_default THEN
+                EXECUTE format(''ALTER TABLE %I ALTER COLUMN %I SET DEFAULT medicalai_local_now()'',
+                    target.table_name, target.column_name);
+            END IF;
+        END IF;
+    END LOOP;
+END;
+';
+SELECT medicalai_migrate_timestamp_storage();
+DROP FUNCTION medicalai_migrate_timestamp_storage();
 DROP INDEX IF EXISTS uq_current_canonical_utterance;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_doctor_active_visit ON visit(doctor_id) WHERE status = 'ACTIVE';
@@ -467,6 +552,8 @@ COMMENT ON COLUMN asr_utterance.revision IS '同一句段的修订序号，从 0
 COMMENT ON COLUMN asr_utterance.result_type IS '结果类型：PREVIEW 预览、CANONICAL 正式';
 COMMENT ON COLUMN asr_utterance.text IS '句段转写文本';
 COMMENT ON COLUMN asr_utterance.role IS '说话角色：DOCTOR、PATIENT、UNKNOWN';
+COMMENT ON COLUMN asr_utterance.role_source IS '角色来源：LLM、FALLBACK、MANUAL，兼容历史 AUTO';
+COMMENT ON COLUMN asr_utterance.role_confidence IS 'LLM 对角色判断的 0-100 自评，仅用于人工复核优先级';
 COMMENT ON COLUMN asr_utterance.anonymous_speaker_epoch IS '匿名说话人分段世代号';
 COMMENT ON COLUMN asr_utterance.start_ms IS '句段开始时间，单位毫秒';
 COMMENT ON COLUMN asr_utterance.end_ms IS '句段结束时间，单位毫秒';

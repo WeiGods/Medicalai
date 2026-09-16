@@ -19,7 +19,8 @@ class AsrRoutingTest {
     RecordingMapper recordings = mock(RecordingMapper.class);
     AudioStorageService storage = mock(AudioStorageService.class);
     ClinicalWorkflowService workflow = new ClinicalWorkflowService(visits,mock(PatientMapper.class),mock(DoctorMapper.class),
-        recordings,mock(MedicalRecordMapper.class),mock(AiServiceClient.class),storage,new ObjectMapper(),Clock.systemUTC());
+        recordings,mock(MedicalRecordMapper.class),mock(AiServiceClient.class),storage,new ObjectMapper(),Clock.systemUTC(),
+        mock(DashScopeRoleClient.class),mock(TranscriptRoleReclassificationStore.class));
     UUID visitId=UUID.randomUUID(), doctorId=UUID.randomUUID(), jobId=UUID.randomUUID();
     AsrRoutingTest() {
         org.springframework.test.util.ReflectionTestUtils.setField(workflow,"dashscopeApiKey","test-key");
@@ -40,14 +41,15 @@ class AsrRoutingTest {
     }
     @ParameterizedTest @ValueSource(strings={"DASHSCOPE","LOCAL"})
     void retryCreatesTaskWithSelectedProvider(String provider) {
+        String queueProvider = "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;
         if ("LOCAL".equals(provider)) org.springframework.test.util.ReflectionTestUtils.setField(workflow,"dashscopeApiKey","");
         when(recordings.latestAsrJob(visitId)).thenReturn(Optional.of(job("FAILED",provider.equals("LOCAL") ? "DASHSCOPE" : "LOCAL")));
         when(recordings.list(visitId)).thenReturn(List.of(new Recording(UUID.randomUUID(),visitId,"R1","UPLOAD","key","a.wav","audio/wav",1L,1L,"UPLOADED",null,Instant.now())));
-        when(recordings.createAsrJob(visitId,provider)).thenReturn(jobId);
-        when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("PENDING",provider)));
+        when(recordings.createAsrJob(visitId,queueProvider)).thenReturn(jobId);
+        when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("PENDING",queueProvider)));
         assertEquals(provider,workflow.transcribe(visitId,doctorId,provider).providerRoute());
         verify(recordings).requeueRetryableRecordings(visitId);
-        verify(recordings).createAsrJob(visitId,provider);
+        verify(recordings).createAsrJob(visitId,queueProvider);
     }
     @Test void missingPublicCredentialsRejectedBeforeCreatingTask() {
         org.springframework.test.util.ReflectionTestUtils.setField(workflow,"dashscopeApiKey","");

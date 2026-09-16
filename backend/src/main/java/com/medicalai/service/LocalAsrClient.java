@@ -6,6 +6,8 @@ import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.Resource;
@@ -17,6 +19,7 @@ import org.springframework.web.client.RestClient;
 
 @Service
 public class LocalAsrClient {
+    private static final Logger LOG = LoggerFactory.getLogger(LocalAsrClient.class);
     private final RestClient client;
 
     public LocalAsrClient(@Value("${medicalai.local-asr.base-url:${medicalai.ai.base-url:http://127.0.0.1:8000}}") String baseUrl,
@@ -30,7 +33,12 @@ public class LocalAsrClient {
     }
 
     public List<AsrSegment> transcribe(Resource audio, String filename, String mimeType) {
+        return transcribeDetailed(audio, filename, mimeType).segments();
+    }
+
+    public AsrResult transcribeDetailed(Resource audio, String filename, String mimeType) {
         try {
+            long startedAt = System.nanoTime();
             var resource = new ByteArrayResource(audio.getContentAsByteArray()) {
                 @Override public String getFilename() {
                     return filename == null || filename.isBlank() ? "recording.webm" : filename;
@@ -62,10 +70,14 @@ public class LocalAsrClient {
                 segments.add(new AsrSegment(text, start, end, speaker));
             }
             if (segments.isEmpty()) throw new IllegalStateException("本地 ASR 返回空转写结果");
-            return segments;
+            LOG.info("本地ASR调用成功：音频字节数={}，句段数={}，耗时毫秒={}",
+                    resource.contentLength(), segments.size(), elapsedMs(startedAt));
+            return new AsrResult(segments, response);
         } catch (Exception e) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "LOCAL_ASR_UNAVAILABLE",
                     "本地 ASR 转写失败，请确认容器可访问、模型已加载，或切换模型重试", e);
         }
     }
+
+    private long elapsedMs(long startedAt) { return (System.nanoTime() - startedAt) / 1_000_000; }
 }

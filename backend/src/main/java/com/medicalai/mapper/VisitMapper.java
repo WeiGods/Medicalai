@@ -14,7 +14,7 @@ public class VisitMapper {
             rs.getString("status"),rs.getString("department_name"),
             rs.getString("patient_name_snapshot"),rs.getString("patient_gender_snapshot"),
             rs.getObject("patient_age_snapshot",Integer.class),rs.getString("doctor_name_snapshot"),
-            rs.getString("chief_complaint"),rs.getInt("version"),rs.getTimestamp("created_at").toInstant());
+            rs.getString("chief_complaint"),rs.getInt("version"),DatabaseDateTime.getInstant(rs,"created_at"));
     private final JdbcTemplate jdbc;
 
     public VisitMapper(JdbcTemplate jdbc) { this.jdbc=jdbc; }
@@ -96,10 +96,10 @@ public class VisitMapper {
     public Visit updateStatus(UUID id, UUID doctorId, String status) {
         return jdbc.queryForObject("""
                 UPDATE visit SET status=?,
-                  started_at=CASE WHEN ?='ACTIVE' THEN COALESCE(started_at,now()) ELSE started_at END,
-                  completed_at=CASE WHEN ?='COMPLETED' THEN now() ELSE completed_at END,
-                  cancelled_at=CASE WHEN ?='CANCELLED' THEN now() ELSE cancelled_at END,
-                  updated_at=now(),updated_by=?,version=version+1
+                  started_at=CASE WHEN ?='ACTIVE' THEN COALESCE(started_at,medicalai_local_now()) ELSE started_at END,
+                  completed_at=CASE WHEN ?='COMPLETED' THEN medicalai_local_now() ELSE completed_at END,
+                  cancelled_at=CASE WHEN ?='CANCELLED' THEN medicalai_local_now() ELSE cancelled_at END,
+                  updated_at=medicalai_local_now(),updated_by=?,version=version+1
                 WHERE id=? AND doctor_id=? RETURNING *
                 """,ROW,status,status,status,status,doctorId,id,doctorId);
     }

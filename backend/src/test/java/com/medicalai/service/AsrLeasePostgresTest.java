@@ -65,10 +65,10 @@ class AsrLeasePostgresTest {
         assertEquals(publicJob,store.claim("DASHSCOPE",UUID.randomUUID()).orElseThrow().id());
         assertTrue(store.claim("LOCAL",second).isEmpty());
         store.begin(local,first);
-        jdbc.update("UPDATE ai_job SET locked_at=clock_timestamp()-interval '1 minute' WHERE id=?",job);
+        jdbc.update("UPDATE ai_job SET locked_at=medicalai_local_clock()-interval '1 minute' WHERE id=?",job);
         assertTrue(store.renew(job,first));
         assertFalse(store.renew(job,second));
-        jdbc.update("UPDATE ai_job SET locked_at=clock_timestamp()-interval '3 minutes' WHERE id=?",job);
+        jdbc.update("UPDATE ai_job SET locked_at=medicalai_local_clock()-interval '3 minutes' WHERE id=?",job);
         assertFalse(store.renew(job,first),"expired lease cannot be resurrected");
         var reclaimed=store.claim("LOCAL",second).orElseThrow();
         assertEquals("RUNNING",reclaimed.status());
@@ -105,7 +105,7 @@ class AsrLeasePostgresTest {
 
     @Test void retryOfEarlierRecordingKeepsCompletedLaterRecordingAndValidSessionScope() {
         UUID later=createRecording(visit);
-        jdbc.update("UPDATE recording SET created_at=clock_timestamp()+interval '1 second',status='DONE' WHERE id=?",later);
+        jdbc.update("UPDATE recording SET created_at=medicalai_local_clock()+interval '1 second',status='DONE' WHERE id=?",later);
         UUID laterSession=mapper.createSession(visit,later);
         mapper.insertUtterances(visit,later,laterSession,List.of(new RecordingMapper.Turn("DOCTOR","已完成",0,100,0)));
         UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();

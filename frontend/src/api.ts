@@ -81,6 +81,13 @@ export const api = {
     method: 'PUT',
     body: JSON.stringify({ transcript })
   }),
+  updateUtteranceRole: (visitId: string, utteranceId: string, role: 'DOCTOR' | 'PATIENT' | 'OTHER') => request<Transcript>(
+    `/api/v1/visits/${visitId}/transcript/utterances/${utteranceId}/role`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role })
+    }),
+  reclassifyTranscriptRoles: (visitId: string) => request<Transcript>(
+    `/api/v1/visits/${visitId}/transcript/roles/reclassify`, { method: 'POST' }),
 
   medicalRecord: (visitId: string) => request<MedicalRecord>(`/api/v1/visits/${visitId}/medical-record`),
   generateMedicalRecord: (visitId: string) => request<MedicalRecord>(`/api/v1/visits/${visitId}/medical-record/generate`, { method: 'POST' }),
