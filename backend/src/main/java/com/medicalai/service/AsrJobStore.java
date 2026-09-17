@@ -4,23 +4,29 @@ import com.medicalai.domain.Recording;
 import com.medicalai.domain.Utterance;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.medicalai.mapper.*;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-/** All writes are fenced by the current lease in a short database transaction. */
+/** 所有写入均在短数据库事务中由当前租约隔离。 */
 @Service
 public class AsrJobStore {
     private static final Logger LOG = LoggerFactory.getLogger(AsrJobStore.class);
     private final RecordingMapper recordings;
     private final MedicalRecordMapper records;
     private final VisitMapper visits;
+    private final ClinicalExtractionMapper extractions;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public AsrJobStore(RecordingMapper recordings, MedicalRecordMapper records, VisitMapper visits,
+                       ClinicalExtractionMapper extractions) {
+        this.recordings=recordings; this.records=records; this.visits=visits; this.extractions=extractions;
+    }
+
     public AsrJobStore(RecordingMapper recordings, MedicalRecordMapper records, VisitMapper visits) {
-        this.recordings=recordings; this.records=records; this.visits=visits;
+        this(recordings, records, visits, null);
     }
 
     public Optional<RecordingMapper.AsrJob> claim(String provider, UUID token) {
@@ -70,11 +76,12 @@ public class AsrJobStore {
 
     @Transactional
     public void complete(RecordingMapper.AsrJob job, UUID token, UUID recordingId, List<RecordingMapper.Turn> turns,
-                         JsonNode rawResponse) {
+                          JsonNode rawResponse) {
         /*
-         * 此事务只负责持久化，不执行 ASR 或 LLM 网络调用：
-         * 1. 校验租约仍归当前 worker；2. 拒绝未完成角色判断的 AUTO/UNKNOWN；
-         * 3. 保存脱敏后的 ASR 原始 JSON；4. 保存标准化句段；5. 生成当前对话快照与展示文本。
+         * 步骤 9：此事务只负责持久化，不执行 ASR 或 LLM 网络调用：
+         * 9.1 校验租约仍归当前 worker，并拒绝未完成角色判断的 AUTO 或 UNKNOWN；
+         * 9.2 保存脱敏后的 ASR 原始 JSON 和标准化句段；
+         * 9.3 当本接诊的全部录音完成时，生成当前对话快照与展示文本并标记任务成功。
          */
         fence(job, token);
         var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
@@ -92,6 +99,8 @@ public class AsrJobStore {
         UUID sessionId = recordings.createSession(job.visitId(), recordingId);
         recordings.insertUtterances(job.visitId(), recordingId, sessionId, turns);
         recordings.updateStatus(recordingId, "DONE", null);
+        // 新录音会改变后续快照，旧提取的证据不能再被病历生成复用。
+        if (extractions != null) extractions.markCurrentStale(job.visitId());
         if (recordings.list(job.visitId()).stream().anyMatch(r -> "UPLOADED".equals(r.status()))) {
             recordings.prepareNextAsrRecording(job.id());
             return;
@@ -116,12 +125,12 @@ public class AsrJobStore {
             last = recording;
             for (Utterance utterance : recordings.listByRecording(recording.id())) {
                 turns.add(new RecordingMapper.Turn(utterance.role(), utterance.text(), utterance.startMs(), utterance.endMs(),
-                        utterance.speakerId(), utterance.roleSource(), utterance.roleConfidence()));
+                        utterance.speakerId(), utterance.roleSource(), utterance.roleConfidence(), utterance.roleProviderRoute()));
                 utteranceIds.add(utterance.id());
             }
         }
         if (turns.isEmpty() || last == null) throw new IllegalStateException("没有可保存的转写句段");
-        String hash = hash(job.visitId(), turns);
+        String hash = DialogueSnapshotHasher.hash(job.visitId(), turns);
         UUID snapshotId = recordings.createSnapshot(job.visitId(), recordingId, sessionId, turns, utteranceIds, hash);
         recordings.saveTranscript(job.visitId(), snapshotId, transcriptText(turns), false);
         records.audit(visits.doctorId(job.visitId()), job.visitId(), "TRANSCRIPT_CREATED", snapshotId);
@@ -131,17 +140,6 @@ public class AsrJobStore {
 
     private String transcriptText(List<RecordingMapper.Turn> turns) {
         return turns.stream().map(t -> roleLabel(t) + "：" + t.text()).reduce((a, b) -> a + "\n\n" + b).orElse("");
-    }
-
-    private String hash(UUID visitId, List<RecordingMapper.Turn> turns) {
-        try {
-            String source = visitId + "|" + turns.stream().map(t -> t.role() + ":" + t.speakerId() + ":" + t.text())
-                    .reduce((a, b) -> a + "\n" + b).orElse("");
-            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(source.getBytes(StandardCharsets.UTF_8)));
-        } catch (Exception e) {
-            throw new IllegalStateException("转写快照哈希生成失败", e);
-        }
     }
 
 }

@@ -85,7 +85,7 @@ class FunASRNano(nn.Module):
     ):
         super().__init__()
 
-        # audio encoder
+        # 音频编码器
         hub = audio_encoder_conf.get("hub", None)
         self.audio_encoder_activation_checkpoint = audio_encoder_conf.get(
             "activation_checkpoint", False
@@ -114,7 +114,7 @@ class FunASRNano(nn.Module):
             audio_encoder.eval()
         self.audio_encoder = audio_encoder
 
-        # llm
+        # 大语言模型
         self.llm = None
         init_param_path = llm_conf.get("init_param_path", None)
         llm_dim = None
@@ -135,7 +135,7 @@ class FunASRNano(nn.Module):
         self.llm = model.to(dtype_map[self.llm_dtype])
         llm_dim = model.get_input_embeddings().weight.shape[-1]
 
-        # adaptor
+        # 适配层
         adaptor_class = tables.adaptor_classes.get(audio_adaptor)
         if audio_encoder_output_size > 0:
             audio_adaptor_conf["encoder_dim"] = audio_encoder_output_size
@@ -151,10 +151,10 @@ class FunASRNano(nn.Module):
         self.audio_adaptor = audio_adaptor
         self.use_low_frame_rate = audio_adaptor_conf.get("use_low_frame_rate", False)
 
-        # ctc decoder
+        # CTC 解码器
         self.ctc_decoder = None
         self._externally_loaded_ctc_keys = set()
-        # TODO: fix table name
+        # 待办：修正表名。
         ctc_decoder_class = tables.adaptor_classes.get(kwargs.get("ctc_decoder", None))
         if ctc_decoder_class is not None:
             ctc_tokenizer = (
@@ -237,7 +237,7 @@ class FunASRNano(nn.Module):
                 speech_lengths = speech_lengths[:, 0]
             batch_size_speech, frames, _ = speech.shape
 
-            # audio encoder
+            # 音频编码器
             if self.audio_encoder_activation_checkpoint:
                 from torch.utils.checkpoint import checkpoint
 
@@ -247,7 +247,7 @@ class FunASRNano(nn.Module):
             else:
                 encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
-            # audio_adaptor
+            # 音频适配层
             encoder_out, encoder_out_lens = self.audio_adaptor(encoder_out, encoder_out_lens)
 
             batch_size, token_num, dims = inputs_embeds.shape
@@ -322,7 +322,7 @@ class FunASRNano(nn.Module):
         stats["dialog_turns_max"] = dialog_turns_max
         stats["dialog_turns_avg"] = dialog_turns_avg
 
-        # force_gatherable: to-device and to-tensor if scalar for DataParallel
+        # force_gatherable：对标量执行设备迁移和张量转换，以支持 DataParallel。
         if self.length_normalized_loss:
             batch_size = int((labels_ids > 0 + 1).sum())
         loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
@@ -334,7 +334,7 @@ class FunASRNano(nn.Module):
         return encoder_out, encoder_out_lens
 
     def encode(self, speech, speech_lengths):
-        # audio encoder
+        # 音频编码器
         encoder_out, encoder_out_lens = self.audio_encoder(speech, speech_lengths)
 
         return encoder_out, encoder_out_lens
@@ -535,7 +535,7 @@ class FunASRNano(nn.Module):
         output = self.data_load_speech(contents, tokenizer, frontend, meta_data=meta_data, **kwargs)
         batch = to_device(output, kwargs["device"])
 
-        # audio encoder
+        # 音频编码器
         speech = batch["speech"]
 
         if len(speech) > 0:
@@ -549,10 +549,10 @@ class FunASRNano(nn.Module):
                     speech = speech.to(torch.float16)
                 elif kwargs.get("bf16", False):
                     speech = speech.to(torch.bfloat16)
-                # audio encoder
+                # 音频编码器
                 encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
-                # audio_adaptor
+                # 音频适配层
                 adaptor_out, adaptor_out_lens = self.audio_adaptor(encoder_out, encoder_out_lens)
                 meta_data["encoder_out"] = encoder_out
                 meta_data["encoder_out_lens"] = encoder_out_lens
@@ -699,7 +699,7 @@ class FunASRNano(nn.Module):
                 yseq = torch.unique_consecutive(yseq, dim=-1)
                 mask = yseq != self.blank_id
                 token_int = yseq[mask].tolist()
-                # Change integer-ids to tokens
+                # 将整数 ID 转换为词元。
                 text = self.ctc_tokenizer.decode(token_int)
                 ctc_results.append({"key": key[i], "text": text, "ctc_logits": x})
 

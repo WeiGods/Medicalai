@@ -25,7 +25,7 @@ public class LocalDemoIdentityProvider implements IdentityProvider {
                     "OA 身份服务尚未配置，演示登录已关闭");
         }
         String name = credential.strip();
-        // Demo-only alias. Future OA accounts map by provider subject, never by display name.
+        // 仅供演示的别名。后续 OA 账号必须按身份提供方主体标识映射，不能按展示名称映射。
         return mapper.upsertDemo("demo:" + TokenService.hash(name), name);
     }
 }

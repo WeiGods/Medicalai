@@ -3,18 +3,18 @@
 
 workspace=`pwd`
 
-# which gpu to train or finetune
+# 指定用于训练或微调的 GPU。
 export CUDA_VISIBLE_DEVICES="0"
 gpu_num=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
 
-# model_name from model_hub, or model_dir in local path
+# 指定 model_hub 中的模型名称，或本地路径中的 model_dir。
 model_name_or_model_dir="FunAudioLLM/Fun-ASR-Nano-2512"
 
-# data dir, which contains: train.json, val.json
+# 数据目录，包含 train.json、val.json。
 train_data=${workspace}/data/train_example.jsonl
 val_data=${workspace}/data/val_example.jsonl
 
-# exp output dir
+# 实验输出目录。
 output_dir="./outputs"
 log_file="${output_dir}/log.txt"
 
@@ -32,7 +32,7 @@ DISTRIBUTED_ARGS="
 "
 echo $DISTRIBUTED_ARGS
 
-# funasr trainer path
+# FunASR 训练器路径。
 train_tool=`which funasr-train-ds`
 echo "Using funasr trainer: ${train_tool}"
 

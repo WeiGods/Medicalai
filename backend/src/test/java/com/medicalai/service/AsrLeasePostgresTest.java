@@ -16,7 +16,7 @@ import org.springframework.transaction.annotation.AnnotationTransactionAttribute
 import org.springframework.transaction.interceptor.TransactionInterceptor;
 import org.springframework.transaction.support.TransactionTemplate;
 
-/** Dedicated disposable localhost PostgreSQL only, never application credentials. */
+/** 仅使用独立且可销毁的本机 PostgreSQL，绝不使用应用凭据。 */
 @EnabledIfEnvironmentVariable(named="RUN_ASR_POSTGRES_TEST",matches="true")
 class AsrLeasePostgresTest {
     String schema;
@@ -135,7 +135,7 @@ class AsrLeasePostgresTest {
     }
 
     @Test void visitLockSerializesTaskCreation() throws Exception {
-        // The actual workflow's owned(..., true) must lock; this used to ignore its flag.
+        // 实际工作流中的 owned(..., true) 必须加锁；此前曾忽略该标志位。
         UUID doctor=jdbc.queryForObject("SELECT doctor_id FROM visit WHERE id=?",UUID.class,visit);
         var pool=Executors.newSingleThreadExecutor();var started=new CountDownLatch(1);
         try {

@@ -34,7 +34,7 @@ class ApiDateTimeConfigTest {
                 new MedicalRecordVO(id, id, 1, "CONFIRMED", "SUCCEEDED", null, true,
                         TIMESTAMP, "医生", false),
                 new ConfirmationVO(id, 1, "医生", TIMESTAMP),
-                new RecordExportVO(id, 1, "PDF", "SUCCEEDED", "医生", TIMESTAMP)
+                new RecordExportVO(id, 1, 2, "PDF", "SUCCEEDED", "医生", TIMESTAMP)
         });
 
         assertThat(json).contains("\"created_at\":\"2026-09-15 15:55:32\"");

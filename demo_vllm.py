@@ -2,16 +2,16 @@
 """Demo: Fun-ASR-Nano with vLLM inference backend.
 
 Usage:
-    # Single GPU (greedy decoding)
+    # 单 GPU（贪心解码）
     python demo_vllm.py
 
-    # Multi-GPU tensor parallel
+    # 多 GPU 张量并行
     python demo_vllm.py --tensor-parallel-size 2
 
-    # Batch inference from wav.scp
+    # 从 wav.scp 批量推理
     python demo_vllm.py --input wav.scp --tensor-parallel-size 4 --batch-size 32
 
-    # With hotwords and language
+    # 指定热词和语言
     python demo_vllm.py --input audio.wav --language 中文 --hotwords 开放时间 周一
 """
 
@@ -130,9 +130,9 @@ def main():
     )
     print(f"Model loaded in {time.perf_counter() - t_load:.1f}s\n")
 
-    # Determine input files
+    # 确定输入文件
     if args.input is None:
-        # Use default example audio
+        # 使用默认示例音频
         example_dir = os.path.join(engine.model_dir, "example")
         if os.path.isdir(example_dir):
             wav_files = [
@@ -171,7 +171,7 @@ def main():
     else:
         audio_files = [args.input]
 
-    # Run inference in batches
+    # 分批执行推理
     all_results = []
     total_audio_time = 0
     total_infer_time = 0
@@ -196,7 +196,7 @@ def main():
         total_batches = (len(audio_files) + args.batch_size - 1) // args.batch_size
         print(f"  Batch {batch_num}/{total_batches}: {len(batch)} files in {batch_time:.2f}s")
 
-    # Print results
+    # 输出结果
     print(f"\n{'=' * 60}")
     print(f"Results: {len(all_results)} samples, total inference time: {total_infer_time:.2f}s")
     print(f"{'=' * 60}")
@@ -212,13 +212,13 @@ def main():
                 ts_str += f" ... ({len(r['timestamps'])} total)"
             print(f"  Timestamps: {ts_str}")
 
-    # Save results to file
+    # 将结果保存到文件
     if args.output:
         import json
 
         with open(args.output, "w", encoding="utf-8") as f:
             for r in all_results:
-                # Remove non-serializable fields
+                # 移除不可序列化字段
                 out = {k: v for k, v in r.items() if k != "timestamps"}
                 if "timestamps" in r:
                     out["timestamps"] = r["timestamps"]

@@ -4,33 +4,48 @@ import com.medicalai.domain.DialogueSnapshot;
 import com.medicalai.domain.Utterance;
 import com.medicalai.domain.Visit;
 import com.medicalai.exception.BusinessException;
+import com.medicalai.mapper.ClinicalExtractionMapper;
 import com.medicalai.mapper.MedicalRecordMapper;
 import com.medicalai.mapper.RecordingMapper;
 import com.medicalai.mapper.VisitMapper;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-/** Writes LLM role results atomically after the network call has already completed. */
+/** 在网络调用完成后，以原子方式写入 LLM 角色判断结果。 */
 @Service
 public class TranscriptRoleReclassificationStore {
     private final VisitMapper visits;
     private final RecordingMapper recordings;
     private final MedicalRecordMapper records;
+    private final ClinicalExtractionMapper extractions;
 
-    public TranscriptRoleReclassificationStore(VisitMapper visits, RecordingMapper recordings, MedicalRecordMapper records) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public TranscriptRoleReclassificationStore(VisitMapper visits, RecordingMapper recordings, MedicalRecordMapper records,
+                                               ClinicalExtractionMapper extractions) {
         this.visits = visits;
         this.recordings = recordings;
         this.records = records;
+        this.extractions = extractions;
+    }
+
+    public TranscriptRoleReclassificationStore(VisitMapper visits, RecordingMapper recordings, MedicalRecordMapper records) {
+        this(visits, recordings, records, null);
     }
 
     @Transactional
     public void apply(UUID visitId, UUID doctorId, List<RecordingMapper.RoleUpdate> updates) {
+        apply(visitId, doctorId, updates, LlmRoute.UNKNOWN);
+    }
+
+    /**
+     * 将一次角色重判及其实际模型路由原子写入。
+     * 路由与快照哈希一起冻结，后续提取才能追溯本段角色是由公网、内网还是医生确认得到。
+     */
+    @Transactional
+    public void apply(UUID visitId, UUID doctorId, List<RecordingMapper.RoleUpdate> updates, LlmRoute route) {
         Visit visit = visits.find(visitId, doctorId, true).orElseThrow(BusinessException::notFound);
         if (!"ACTIVE".equals(visit.status())) {
             throw new BusinessException(HttpStatus.CONFLICT, "VISIT_NOT_ACTIVE", "请先开始本次接诊");
@@ -50,9 +65,11 @@ public class TranscriptRoleReclassificationStore {
             throw new BusinessException(HttpStatus.CONFLICT, "TRANSCRIPT_CHANGED", "转写已被修改，请刷新后重试");
         }
         List<RecordingMapper.Turn> turns = currentTurns(visitId);
-        UUID snapshotId = recordings.createEditedSnapshot(visitId, snapshot, turns, hash(visitId, turns), doctorId);
+        UUID snapshotId = recordings.createEditedSnapshot(visitId, snapshot, turns,
+                DialogueSnapshotHasher.hash(visitId, turns), doctorId);
         recordings.saveTranscript(visitId, snapshotId, transcriptText(turns), state != null && state.edited());
-        records.audit(doctorId, visitId, "TRANSCRIPT_ROLES_RECLASSIFIED", snapshotId);
+        if (extractions != null) extractions.markCurrentStale(visitId);
+        records.audit(doctorId, visitId, "TRANSCRIPT_ROLES_RECLASSIFIED_" + route.name(), snapshotId);
     }
 
     private List<RecordingMapper.Turn> currentTurns(UUID visitId) {
@@ -63,7 +80,7 @@ public class TranscriptRoleReclassificationStore {
 
     private RecordingMapper.Turn turn(Utterance utterance) {
         return new RecordingMapper.Turn(utterance.role(), utterance.text(), utterance.startMs(), utterance.endMs(),
-                utterance.speakerId(), utterance.roleSource(), utterance.roleConfidence());
+                utterance.speakerId(), utterance.roleSource(), utterance.roleConfidence(), utterance.roleProviderRoute());
     }
 
     private String transcriptText(List<RecordingMapper.Turn> turns) {
@@ -71,14 +88,4 @@ public class TranscriptRoleReclassificationStore {
                 .reduce((left, right) -> left + "\n\n" + right).orElse("");
     }
 
-    private String hash(UUID visitId, List<RecordingMapper.Turn> turns) {
-        try {
-            String content = visitId + "|" + turns.stream().map(turn -> turn.role() + ":" + turn.text())
-                    .reduce((left, right) -> left + "\n" + right).orElse("");
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(content.getBytes(StandardCharsets.UTF_8)));
-        } catch (Exception e) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "HASH_FAILED", "快照生成失败");
-        }
-    }
 }

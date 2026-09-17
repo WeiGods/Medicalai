@@ -31,13 +31,13 @@ public class RecordingController {
     }
 
     @GetMapping("/visits/{visitId}/recordings")
-    public List<RecordingVO> list(@PathVariable UUID visitId,
+    public List<RecordingVO> list(@PathVariable("visitId") UUID visitId,
                                   @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return workflow.recordings(visitId, current.doctor().id());
     }
 
     @PostMapping(value = "/visits/{visitId}/recordings", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public RecordingVO upload(@PathVariable UUID visitId,
+    public RecordingVO upload(@PathVariable("visitId") UUID visitId,
                               @RequestPart("file") MultipartFile file,
                               @RequestParam(value = "duration_ms", required = false) Long durationMs,
                               @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
@@ -45,7 +45,7 @@ public class RecordingController {
     }
 
     @PostMapping("/visits/{visitId}/recordings/transcribe")
-    public AsrJobVO transcribe(@PathVariable UUID visitId,
+    public AsrJobVO transcribe(@PathVariable("visitId") UUID visitId,
                              @RequestBody(required = false) TranscribeRequest request,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         String provider = request == null ? "DASHSCOPE" : request.provider();
@@ -58,13 +58,13 @@ public class RecordingController {
     public record TranscribeRequest(String provider) {}
 
     @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")
-    public AsrJobVO transcriptionStatus(@PathVariable UUID visitId, @PathVariable UUID jobId,
+    public AsrJobVO transcriptionStatus(@PathVariable("visitId") UUID visitId, @PathVariable("jobId") UUID jobId,
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return workflow.asrJob(visitId, current.doctor().id(), jobId);
     }
 
     @GetMapping("/recordings/{recordingId}/audio")
-    public ResponseEntity<ByteArrayResource> audio(@PathVariable UUID recordingId,
+    public ResponseEntity<ByteArrayResource> audio(@PathVariable("recordingId") UUID recordingId,
                                                    @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         Recording recording = recordings.find(recordingId, current.doctor().id()).orElseThrow(BusinessException::notFound);
         if (recording.objectKey() == null || recording.objectKey().isBlank()) {
@@ -91,21 +91,19 @@ public class RecordingController {
         if (mime != null && !mime.isBlank()) {
             try {
                 MediaType parsed = MediaType.parseMediaType(mime);
-                // Some browsers label MediaRecorder WebM as video/webm; it is
-                // still an audio stream and audio/webm is the most compatible
-                // response type for HTMLAudioElement.
+                // 部分浏览器将 MediaRecorder 的 WebM 标记为 video/webm，但它仍是音频流；
+                // audio/webm 是与 HTMLAudioElement 兼容性最好的响应类型。
                 if (fileName.endsWith(".webm") && "video".equalsIgnoreCase(parsed.getType())) {
                     return MediaType.parseMediaType("audio/webm");
                 }
-                // Do not let a generic upload header (for example
-                // application/octet-stream) hide the extension based audio
-                // type.  HTMLAudioElement needs an audio-compatible response.
+                // 不能让通用上传请求头（如 application/octet-stream）覆盖基于扩展名判断的音频类型，
+                // HTMLAudioElement 需要音频兼容的响应类型。
                 if ("audio".equalsIgnoreCase(parsed.getType())) return parsed;
                 if (!MediaType.APPLICATION_OCTET_STREAM.equals(parsed)) {
                     return parsed;
                 }
             } catch (IllegalArgumentException ignored) {
-                // Fall through to the extension based fallback below.
+                // 继续使用下方基于扩展名的兜底判断。
             }
         }
         if (fileName.endsWith(".webm")) return MediaType.parseMediaType("audio/webm");

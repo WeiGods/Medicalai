@@ -1,5 +1,5 @@
-# Use together with docker-compose.yml and --profile local-ai.
-# All model files must already exist beneath ASR_MODELS_DIR on the host.
+# 与 docker-compose.yml 及 --profile local-ai 配合使用。
+# 所有模型文件必须已存在于宿主机的 ASR_MODELS_DIR 目录下。
 services:
   api:
     environment:

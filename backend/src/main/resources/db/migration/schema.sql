@@ -3,9 +3,8 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Business timestamps are stored as Beijing local time without a timezone or
--- fractional seconds.  Keep transaction-time and wall-clock variants separate
--- because lease expiry must observe elapsed time during a long transaction.
+-- 业务时间戳以不带时区和小数秒的北京时间本地时间存储。事务时间与墙上时钟时间必须分开，
+-- 因为租约过期判断在长事务中必须感知真实经过时间。
 CREATE OR REPLACE FUNCTION medicalai_local_now()
 RETURNS timestamp without time zone
 LANGUAGE sql
@@ -154,6 +153,7 @@ CREATE TABLE IF NOT EXISTS asr_utterance (
     speaker_id int,
     role_source varchar(16) NOT NULL DEFAULT 'UNKNOWN' CHECK (role_source IN ('AUTO','LLM','FALLBACK','MANUAL','UNKNOWN')),
     role_confidence smallint CHECK (role_confidence IS NULL OR role_confidence BETWEEN 0 AND 100),
+    role_provider_route varchar(32),
     anonymous_speaker_epoch int NOT NULL DEFAULT 1,
     start_ms bigint CHECK (start_ms >= 0),
     end_ms bigint CHECK (end_ms >= start_ms),
@@ -261,6 +261,7 @@ CREATE TABLE IF NOT EXISTS record_export (
     version_id uuid NOT NULL,
     confirmation_id uuid NOT NULL REFERENCES medical_record_confirmation(id),
     format varchar(8) NOT NULL CHECK (format IN ('DOCX','PDF')),
+    template_version smallint NOT NULL DEFAULT 1 CHECK (template_version > 0),
     status varchar(16) NOT NULL CHECK (status IN ('PENDING','RUNNING','SUCCEEDED','FAILED')),
     object_key varchar(512),
     error_message varchar(1024),
@@ -288,6 +289,35 @@ CREATE TABLE IF NOT EXISTS visit_transcript (
     updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
+-- 结构化提取独立于病历版本保存；一份提取只能服务于生成时的单个对话快照。
+CREATE TABLE IF NOT EXISTS clinical_extraction (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    visit_id uuid NOT NULL UNIQUE REFERENCES visit(id),
+    current_version int,
+    status varchar(16) NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING','GENERATED','CONFIRMED','FAILED','STALE')),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
+);
+
+CREATE TABLE IF NOT EXISTS clinical_extraction_version (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    extraction_id uuid NOT NULL REFERENCES clinical_extraction(id),
+    version_no int NOT NULL,
+    source_snapshot_id uuid NOT NULL REFERENCES dialogue_snapshot(id),
+    source_snapshot_hash varchar(128) NOT NULL,
+    status varchar(16) NOT NULL CHECK (status IN ('GENERATED','CONFIRMED','FAILED','STALE')),
+    content_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    quality_issues_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+    generated_by varchar(128),
+    provider_route varchar(32),
+    created_by uuid REFERENCES doctor(id),
+    confirmed_by uuid REFERENCES doctor(id),
+    confirmed_at timestamp(0) without time zone,
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    CONSTRAINT uq_clinical_extraction_version UNIQUE (extraction_id, version_no)
+);
+
 -- 兼容已由旧版迁移创建的数据库：补列、移除旧唯一约束并补齐复合关系。
 ALTER TABLE visit ADD COLUMN IF NOT EXISTS patient_phone_snapshot varchar(64);
 ALTER TABLE visit ADD COLUMN IF NOT EXISTS doctor_name_snapshot varchar(128);
@@ -303,8 +333,11 @@ ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS provider_task_id varchar(256);
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response jsonb;
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response_hash varchar(128);
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_segment_count int;
+ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS role_provider_route varchar(32);
+ALTER TABLE clinical_extraction_version ADD COLUMN IF NOT EXISTS provider_route varchar(32);
 CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
+ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_version smallint NOT NULL DEFAULT 1;
 
 -- 兼容旧版前端直接写入的伪成功导出：没有真实文件时必须回到可重试的 PENDING。
 UPDATE record_export
@@ -346,9 +379,8 @@ ALTER TABLE asr_utterance ADD CONSTRAINT asr_utterance_role_confidence_check
     CHECK (role_confidence IS NULL OR role_confidence BETWEEN 0 AND 100);
 ALTER TABLE dialogue_snapshot DROP CONSTRAINT IF EXISTS dialogue_snapshot_visit_id_key;
 
--- Convert existing PostgreSQL databases once.  CREATE TABLE IF NOT EXISTS does
--- not change old column types, so each listed timestamptz column is explicitly
--- converted from its instant to Beijing local time and truncated to seconds.
+-- 一次性转换已有 PostgreSQL 数据库。CREATE TABLE IF NOT EXISTS 不会变更旧列类型，
+-- 因此将列出的每个 timestamptz 列从瞬时时间显式转换为北京时间本地时间并截断到秒。
 CREATE OR REPLACE FUNCTION medicalai_migrate_timestamp_storage()
 RETURNS void
 LANGUAGE plpgsql
@@ -426,7 +458,11 @@ CREATE INDEX IF NOT EXISTS ix_recording_visit ON recording(visit_id);
 CREATE INDEX IF NOT EXISTS ix_recording_status ON recording(visit_id, status);
 CREATE INDEX IF NOT EXISTS ix_ai_job_pending ON ai_job(status, created_at);
 CREATE INDEX IF NOT EXISTS ix_record_version_record ON medical_record_version(record_id, version_no DESC);
+CREATE INDEX IF NOT EXISTS ix_clinical_extraction_version_source
+    ON clinical_extraction_version(extraction_id, source_snapshot_id, version_no DESC);
 CREATE INDEX IF NOT EXISTS ix_record_export_record ON record_export(record_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template
+    ON record_export(version_id, format, template_version) WHERE template_version = 2;
 CREATE INDEX IF NOT EXISTS ix_audit_visit_time ON audit_log(visit_id, created_at);
 
 -- 当前病历通过 medical_record.visit_id（唯一）和 medical_record.current_version 定位。
@@ -554,6 +590,7 @@ COMMENT ON COLUMN asr_utterance.text IS '句段转写文本';
 COMMENT ON COLUMN asr_utterance.role IS '说话角色：DOCTOR、PATIENT、UNKNOWN';
 COMMENT ON COLUMN asr_utterance.role_source IS '角色来源：LLM、FALLBACK、MANUAL，兼容历史 AUTO';
 COMMENT ON COLUMN asr_utterance.role_confidence IS 'LLM 对角色判断的 0-100 自评，仅用于人工复核优先级';
+COMMENT ON COLUMN asr_utterance.role_provider_route IS '角色判断实际路由：DASHSCOPE、LOCAL、MANUAL 或 UNKNOWN';
 COMMENT ON COLUMN asr_utterance.anonymous_speaker_epoch IS '匿名说话人分段世代号';
 COMMENT ON COLUMN asr_utterance.start_ms IS '句段开始时间，单位毫秒';
 COMMENT ON COLUMN asr_utterance.end_ms IS '句段结束时间，单位毫秒';
@@ -568,11 +605,23 @@ COMMENT ON COLUMN dialogue_snapshot.visit_id IS '所属接诊 ID';
 COMMENT ON COLUMN dialogue_snapshot.recording_id IS '生成快照时对应的最后一段录音 ID';
 COMMENT ON COLUMN dialogue_snapshot.session_id IS '生成快照时对应的录音会话 ID';
 COMMENT ON COLUMN dialogue_snapshot.snapshot_version IS '接诊内对话快照版本号';
-COMMENT ON COLUMN dialogue_snapshot.snapshot_hash IS '快照内容哈希，用于幂等和完整性校验';
+COMMENT ON COLUMN dialogue_snapshot.snapshot_hash IS '完整冻结句段（文本、角色、时间、角色来源及置信度）哈希，用于证据版本一致性校验';
 COMMENT ON COLUMN dialogue_snapshot.authority_status IS '快照权威状态，例如 ADOPTED';
 COMMENT ON COLUMN dialogue_snapshot.turns_json IS '不可变医患对话句段 JSON';
 COMMENT ON COLUMN dialogue_snapshot.created_by IS '创建/采用该快照的医生 ID';
 COMMENT ON COLUMN dialogue_snapshot.created_at IS '快照创建时间';
+
+COMMENT ON TABLE clinical_extraction IS '接诊当前结构化提取版本指针；状态随当前对话快照变化而失效';
+COMMENT ON COLUMN clinical_extraction.visit_id IS '所属接诊 ID，一次接诊唯一';
+COMMENT ON COLUMN clinical_extraction.current_version IS '当前提取版本号';
+COMMENT ON COLUMN clinical_extraction.status IS '当前状态：PENDING、GENERATED、CONFIRMED、FAILED、STALE';
+COMMENT ON TABLE clinical_extraction_version IS '可追溯信息提取版本，所有非空字段应包含当前快照精确原文证据';
+COMMENT ON COLUMN clinical_extraction_version.source_snapshot_id IS '证据所依据的不可变对话快照 ID';
+COMMENT ON COLUMN clinical_extraction_version.source_snapshot_hash IS '完整快照哈希，避免旧证据串联至新转写';
+COMMENT ON COLUMN clinical_extraction_version.status IS '提取状态：GENERATED、CONFIRMED、FAILED、STALE';
+COMMENT ON COLUMN clinical_extraction_version.content_json IS '标准字段事实、置信度及精确原文证据 JSON';
+COMMENT ON COLUMN clinical_extraction_version.quality_issues_json IS '质量门禁或模型校验失败的明确问题列表';
+COMMENT ON COLUMN clinical_extraction_version.provider_route IS '结构化提取实际使用的公网或内网 LLM 路由';
 
 COMMENT ON TABLE dialogue_snapshot_source IS '对话快照与其来源 ASR 句段的多对多映射表';
 COMMENT ON COLUMN dialogue_snapshot_source.snapshot_id IS '对话快照 ID';

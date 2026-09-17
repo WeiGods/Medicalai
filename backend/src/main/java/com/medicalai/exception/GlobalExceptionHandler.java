@@ -19,10 +19,8 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ErrorVO> business(BusinessException e, HttpServletRequest request) {
-        // Business errors are normally safe to show to the caller, but still
-        // need a server-side trace.  In particular this preserves the real
-        // ASR client exception that would otherwise be hidden behind the
-        // generic “转写服务暂不可用” message.
+        // 业务错误通常可安全返回调用方，但仍需保留服务端调用链；特别是要保留真实 ASR 客户端异常，
+        // 避免其被通用的“转写服务暂不可用”消息掩盖。
         LOG.warn("API business error: method={}, uri={}, status={}, code={}, message={}",
                 request.getMethod(), request.getRequestURI(), e.status().value(), e.code(), e.getMessage(), e);
         return ResponseEntity.status(e.status()).body(new ErrorVO(e.code(), e.getMessage()));
@@ -42,9 +40,7 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ErrorVO> conflict(DataIntegrityViolationException e, HttpServletRequest request) {
-        // Keep the stable API response while retaining the concrete constraint
-        // and endpoint in the server log.  Without this, an export constraint
-        // failure is indistinguishable from a workflow-state conflict.
+        // 保持 API 响应稳定，同时在服务端日志中保留具体约束和端点；否则导出约束失败会与工作流状态冲突无法区分。
         LOG.warn("API data conflict: method={}, uri={}, message={}",
                 request.getMethod(), request.getRequestURI(), e.getMostSpecificCause().getMessage(), e);
         return ResponseEntity.status(409).body(new ErrorVO("DATA_CONFLICT", "数据状态冲突，请刷新后重试"));

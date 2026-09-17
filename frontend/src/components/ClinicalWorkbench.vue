@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../api'
+import '../routeSelection.css'
 import Icon from './Icon.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
-import type { AsrProvider, Confirmation, Doctor, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
+import type { AsrProvider, ClinicalExtraction, Confirmation, Doctor, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
+const CURRENT_EXPORT_TEMPLATE_VERSION = 2
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export' | 'audit' | 'config'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export'
@@ -21,17 +23,20 @@ const selectedPatientId = ref('')
 const view = ref<MainView>('workbench')
 const queueSearch = ref('')
 const busy = ref(false)
-const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
+const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
 const transcript = ref<Transcript | null>(null)
+const extraction = ref<ClinicalExtraction | null>(null)
 const record = ref<MedicalRecord | null>(null)
 const recordForm = ref<MedicalRecordContent | null>(null)
 const confirmations = ref<Confirmation[]>([])
 const exports = ref<RecordExport[]>([])
 const transcriptTab = ref<'dialogue' | 'edit' | 'facts'>('dialogue')
 const transcriptDraft = ref('')
+// 混合来源只能在当前快照上由医生一次性选择；快照变动后旧选择不能复用。
+const selectedLlmRoute = ref<LlmProvider | null>(null)
 const modal = ref<ModalKind>(null)
 const modalError = ref('')
 const confirmChecked = ref(false)
@@ -76,6 +81,10 @@ watch(modal, async value => {
   }
 })
 
+watch(() => transcript.value?.snapshot_id, () => {
+  selectedLlmRoute.value = null
+})
+
 const titles: Record<MainView, [string, string]> = {
   workbench: ['接诊工作台', '从医患对话到结构化病历，让每一次接诊更从容。'],
   audio: ['录音上传', '完整上传问诊录音，支持一次接诊关联多段录音。'],
@@ -102,15 +111,15 @@ const recordFields = [
   { key: 'date', label: '接诊日期', required: true, input: true }
 ] as const
 
-/** Pick the visit that represents a patient in the queue.
- * An active visit wins over waiting, followed by the most recent historical visit.
- * This keeps patient-level status correct when a patient has more than one visit.
+/**
+ * 选择队列中代表患者状态的接诊记录。
+ *
+ * <p>优先选择进行中接诊，其次是待接诊，最后选择最近的历史接诊，确保多次接诊患者的状态正确。
  */
 function patientVisit(patientId: string): Visit | null {
   if (!patientId) return null
   const list = visits.value
-    // Cancelled visits are deleted by the backend and are ignored here for
-    // compatibility with older data that may still contain a cancelled row.
+    // 后端会删除已取消接诊；此处忽略它们，以兼容仍可能保留取消记录的历史数据。
     .filter(visit => visit.patient_id === patientId && visit.status !== 'CANCELLED')
     .slice()
     .sort((a, b) => {
@@ -172,6 +181,13 @@ const exported = computed(() => !!record.value && exports.value.some(item =>
   item.version_no === record.value?.version_no && item.status === 'SUCCEEDED'))
 const sourceDirty = computed(() => !!record.value?.source_dirty)
 const locked = computed(() => closed.value || confirmed.value || !!actionBusy.value)
+const llmRouting = computed(() => extraction.value || transcript.value)
+const routeSelectionRequired = computed(() => !!llmRouting.value?.route_selection_required)
+const sourceRouteLabel = computed(() => {
+  const route = llmRouting.value?.source_route
+  return route === 'DASHSCOPE' ? '公网 LLM（DashScope）' : route === 'LOCAL' ? '内网 LLM' : ''
+})
+const routeSelectionReady = computed(() => !routeSelectionRequired.value || !!selectedLlmRoute.value)
 const workflowView = computed<WorkflowView>(() => {
   if (waiting.value) return 'workbench'
   if (!recordings.value.length || !allTranscribed.value) return 'audio'
@@ -182,16 +198,18 @@ const workflowView = computed<WorkflowView>(() => {
 })
 const stage = computed(() => {
   const stages: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'confirm', 'export']
-  // A completed visit is immutable, but its retained artifacts are still
-  // reviewable. Highlight the page the doctor is reviewing rather than
-  // always pinning the progress indicator to the final step.
+  // 已完成接诊不可变更，但保留产物仍可查看；应高亮医生正在查看的页面，
+  // 而不是始终将进度指示固定在最后一步。
   if (completed.value && view.value !== 'workbench' && stages.includes(view.value as WorkflowView)) {
     return stages.indexOf(view.value as WorkflowView)
   }
   return stages.indexOf(workflowView.value)
 })
 const activeCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'ACTIVE').length)
-const waitingCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'WAITING').length)
+const waitingCount = computed(() => patients.value.filter(patient => {
+  const visit = patientVisit(patient.id)
+  return !visit || visit.status === 'WAITING'
+}).length)
 const openVisitCount = computed(() => patients.value.filter(patient => ['ACTIVE', 'WAITING'].includes(patientVisit(patient.id)?.status || '')).length)
 const completedCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'COMPLETED').length)
 const missingFields = computed(() => {
@@ -227,14 +245,21 @@ const segments = computed(() => {
 const roleReviewCount = computed(() => transcript.value?.turns.filter(turn => turn.role_review_required).length || 0)
 const unclassifiedRoleCount = computed(() => transcript.value?.turns.filter(turn =>
   turn.role_source === 'AUTO' || turn.role_source === 'UNKNOWN').length || 0)
-const facts = computed(() => {
-  const lines = segments.value.filter(item => item.role === '患者').map(item => item.text)
-  return [
-    ['症状与主诉', lines[0] || ''],
-    ['时间线与伴随症状', lines[1] || ''],
-    ['病史与生活情况', lines.slice(2).join(' ') || '']
-  ].filter(([, value]) => value)
-})
+const extractionFieldLabels: Record<string, string> = {
+  chief_complaint: '主诉', onset_course: '起病与病程', symptom_characteristics: '症状特征',
+  associated_symptoms: '伴随症状', past_medical_history: '既往史', medication_history: '用药史',
+  allergy_history: '过敏史', family_history: '家族史', social_history: '生活史',
+  doctor_diagnosis: '医生明确诊断意见', doctor_medication: '医生明确用药方案', doctor_followup: '医生明确随访安排'
+}
+const extractionFacts = computed(() => Object.entries(extraction.value?.fields || {}).map(([key, fact]) => ({
+  key, label: extractionFieldLabels[key] || key, fact
+})))
+const extractionConfirmed = computed(() => extraction.value?.status === 'CONFIRMED'
+  && extraction.value.snapshot_id === transcript.value?.snapshot_id
+  && extraction.value.snapshot_hash === transcript.value?.snapshot_hash)
+const extractionStatusText = computed(() => ({
+  PENDING: '待生成', GENERATED: '待整体确认', CONFIRMED: '已整体确认', FAILED: '需修正转写', STALE: '转写已更新'
+})[extraction.value?.status || 'PENDING'] || extraction.value?.status || '待生成')
 
 const statusText = (visit: Visit | null) => {
   if (!visit) return '待接诊'
@@ -281,6 +306,7 @@ async function refreshVisitState() {
   if (!visit) {
     recordings.value = []
     transcript.value = null
+    extraction.value = null
     record.value = null
     recordForm.value = null
     confirmations.value = []
@@ -288,9 +314,10 @@ async function refreshVisitState() {
     transcriptDraft.value = ''
     return
   }
-  const [recordingList, transcriptState, recordState, confirmationList, exportList] = await Promise.all([
+  const [recordingList, transcriptState, extractionState, recordState, confirmationList, exportList] = await Promise.all([
     api.recordings(visit.id),
     api.transcript(visit.id),
+    api.clinicalExtraction(visit.id),
     api.medicalRecord(visit.id),
     api.confirmations(visit.id),
     api.exports(visit.id)
@@ -298,6 +325,7 @@ async function refreshVisitState() {
   if (revision !== visitStateRevision || currentVisit.value?.id !== visit.id) return
   recordings.value = recordingList
   transcript.value = transcriptState
+  extraction.value = extractionState
   record.value = recordState
   recordForm.value = recordState.content ? JSON.parse(JSON.stringify(recordState.content)) : null
   confirmations.value = confirmationList
@@ -401,6 +429,10 @@ async function startVisit() {
 
 async function doCancel() {
   if (!currentVisit.value) return
+  if (actionBusy.value) {
+    modalError.value = '当前操作正在处理中，请等待完成后再取消接诊。'
+    return
+  }
   if (recordingState.value !== 'idle' || recorder) {
     modalError.value = '请先结束当前网页录音，再取消接诊。'
     return
@@ -413,7 +445,8 @@ async function doCancel() {
     navigate('workbench')
     toast('本次接诊及其录音、转写、病历和导出文件已清空。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '取消接诊失败')
+    modalError.value = error instanceof Error ? error.message : '取消接诊失败'
+    toast(modalError.value)
   } finally {
     busy.value = false
   }
@@ -569,9 +602,8 @@ async function startTranscription() {
     }
     throw new Error('转写等待超时，请稍后查看任务状态')
   } catch (error) {
-    // The server may have recovered a stale PROCESSING row before rejecting
-    // this submission (for example, when storage credentials are missing).
-    // Reload so the card immediately returns to a retryable state.
+  // 服务器可能在拒绝本次提交前恢复了过期 PROCESSING 记录（例如缺少存储凭据时），
+  // 重新加载可让卡片立即恢复为可重试状态。
     await loadAll(true)
     toast(error instanceof Error ? error.message : '转写失败')
   } finally {
@@ -635,7 +667,9 @@ async function reclassifyTranscriptRoles() {
   if (!currentVisit.value || !roleReviewCount.value || !turnsMatchTranscript.value || locked.value) return
   actionBusy.value = 'reclassify-roles'
   try {
-    const updated = await api.reclassifyTranscriptRoles(currentVisit.value.id)
+    const updated = selectedLlmRoute.value
+      ? await api.reclassifyTranscriptRoles(currentVisit.value.id, selectedLlmRoute.value)
+      : await api.reclassifyTranscriptRoles(currentVisit.value.id)
     transcript.value = updated
     transcriptDraft.value = updated.transcript
     addLog('使用 AI 重新判断未人工确认的句段角色')
@@ -758,8 +792,51 @@ function stopRecording() {
   }
 }
 
+async function generateClinicalExtraction() {
+  if (!currentVisit.value || locked.value) return
+  actionBusy.value = 'extract'
+  try {
+    extraction.value = selectedLlmRoute.value
+      ? await api.generateClinicalExtraction(currentVisit.value.id, selectedLlmRoute.value)
+      : await api.generateClinicalExtraction(currentVisit.value.id)
+    transcriptTab.value = 'facts'
+    await loadAll(true)
+    if (extraction.value?.status === 'GENERATED') {
+      addLog('生成可追溯信息提取结果')
+      toast('信息提取已生成，请核对原文证据后整体确认。')
+    } else {
+      toast(extraction.value?.quality_issues[0] || '请先在全文编辑中修正转写。')
+    }
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '信息提取失败')
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
+async function confirmClinicalExtraction() {
+  if (!currentVisit.value || locked.value || extraction.value?.status !== 'GENERATED') return
+  actionBusy.value = 'confirm-extraction'
+  try {
+    extraction.value = await api.confirmClinicalExtraction(currentVisit.value.id)
+    addLog('整体确认信息提取结果')
+    await loadAll(true)
+    toast('信息提取已确认，可生成病历草稿。')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '信息提取确认失败')
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
 async function generateRecord() {
   if (!currentVisit.value || locked.value) return
+  if (!extractionConfirmed.value) {
+    transcriptTab.value = 'facts'
+    navigate('transcript')
+    toast('请先生成并整体确认当前转写的信息提取结果。')
+    return
+  }
   actionBusy.value = 'generate'
   try {
     record.value = await api.generateMedicalRecord(currentVisit.value.id)
@@ -851,13 +928,14 @@ async function recordExportLog(format: 'DOCX' | 'PDF') {
 async function waitForExport(format: 'DOCX' | 'PDF') {
   if (!currentVisit.value || !record.value) return null
   const versionNo = record.value.version_no
-  let item = exports.value.find(e => e.format === format && e.version_no === versionNo)
-  // Reuse an already completed export (especially for completed visits) instead
-  // of creating duplicate jobs every time the user opens the export page.
+  let item = exports.value.find(e => e.format === format && e.version_no === versionNo
+    && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
+  // 复用已完成的导出任务（尤其是已完成接诊），避免用户每次打开导出页面都创建重复任务。
   if (item?.status === 'SUCCEEDED') return item.id
   if (!item || item.status === 'FAILED') {
     await recordExportLog(format)
-    item = exports.value.find(e => e.format === format && e.version_no === versionNo)
+    item = exports.value.find(e => e.format === format && e.version_no === versionNo
+      && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
   }
   if (!item) return null
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -879,28 +957,39 @@ async function downloadExport(exportId: string, format: 'DOCX' | 'PDF') {
   URL.revokeObjectURL(url)
 }
 
-async function exportWord() {
+function isMissingExportFile(error: unknown) {
+  return typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 404
+}
+
+async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
   if (busy.value || !record.value?.content || !confirmed.value) return
   busy.value = true
   try {
-    const exportId = await waitForExport('DOCX')
-    if (exportId) await downloadExport(exportId, 'DOCX')
-    await loadAll(true)
-    toast('Word 病历已生成并下载。')
-  } catch (error) { toast(error instanceof Error ? error.message : 'Word 导出失败') }
+    // 旧成功记录可能没有物理文件。下载接口会将其回退为 FAILED；刷新后本次点击自动重新提交一次。
+    for (let recoveryAttempt = 0; recoveryAttempt < 2; recoveryAttempt++) {
+      const exportId = await waitForExport(format)
+      if (!exportId) throw new Error(`${label} 导出任务未创建`)
+      try {
+        await downloadExport(exportId, format)
+        await loadAll(true)
+        toast(`${label} 病历已生成并下载。`)
+        return
+      } catch (error) {
+        if (recoveryAttempt === 0 && isMissingExportFile(error)) {
+          await loadAll(true)
+          continue
+        }
+        throw error
+      }
+    }
+  } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`) }
   finally { busy.value = false }
 }
 
+async function exportWord() { await exportRecord('DOCX', 'Word') }
+
 async function exportPdf() {
-  if (busy.value || !record.value?.content || !confirmed.value) return
-  busy.value = true
-  try {
-    const exportId = await waitForExport('PDF')
-    if (exportId) await downloadExport(exportId, 'PDF')
-    await loadAll(true)
-    toast('PDF 病历已生成并下载。')
-  } catch (error) { toast(error instanceof Error ? error.message : 'PDF 导出失败') }
-  finally { busy.value = false }
+  await exportRecord('PDF', 'PDF')
 }
 
 async function exportFromBottom() {
@@ -909,9 +998,8 @@ async function exportFromBottom() {
     navigate('export')
     return
   }
-  // The bottom action is available on every workflow page. Once already on
-  // the export page, make it useful by exporting the default Word document;
-  // PDF remains available through the explicit format card above.
+  // 底部操作在每个工作流页面均可用；已处于导出页时默认导出 Word 文档，
+  // PDF 仍可通过上方明确的格式卡片导出。
   await exportWord()
 }
 
@@ -926,8 +1014,7 @@ async function playRecording(item: Recording) {
   const controller = new AbortController()
   audioLoadAbort = controller
   try {
-    // The audio endpoint is authenticated. Fetching the bytes first lets us
-    // attach the bearer token; a native Audio(src) request cannot do that.
+  // 音频端点需要鉴权。先获取字节可附加 Bearer Token，原生 Audio(src) 请求无法做到。
     const blob = await api.audioBlob(item.id, controller.signal)
     if (controller.signal.aborted || playingId.value !== item.id) return
     audioObjectUrl = URL.createObjectURL(blob)
@@ -1109,7 +1196,7 @@ defineExpose({ selectPatient })
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
           <template v-else-if="!closed">
             <button class="btn" :disabled="!exported || busy" title="当前版本确认并完成导出后可结束接诊" @click="modal='finish'"><Icon name="stop" />结束接诊</button>
-            <button class="btn" :disabled="busy" @click="modal='cancel'">取消接诊</button>
+            <button class="btn" :disabled="busy || !!actionBusy" @click="modalError=''; modal='cancel'">取消接诊</button>
           </template>
           <span v-else class="small-muted">该患者接诊已完成，不支持重复接诊</span>
         </div>
@@ -1206,7 +1293,7 @@ defineExpose({ selectPatient })
                 <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
                   <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
                 </div>
-                <div class="role-attention-actions"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+                <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
               </aside>
            <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -1227,9 +1314,23 @@ defineExpose({ selectPatient })
                 <label for="transcript-edit" class="transcript-note">核对转写文字；修改后需重新生成并确认病历</label>
                 <textarea id="transcript-edit" v-model="transcriptDraft" class="transcript-editor" :disabled="locked"></textarea>
               </div>
-              <div v-else class="transcript-body">
-                <div class="transcript-note"><Icon name="info" />仅整理患者陈述，不输出自动诊断或医嘱。</div>
-                <div v-for="[label, value] in facts" :key="label" class="source-fact"><b>{{ label }}</b>{{ value }}</div>
+              <div v-else class="transcript-body extraction-body">
+                <div class="transcript-note"><Icon name="shield" />仅展示可追溯的原文事实；未确认内容不能生成病历。</div>
+                <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
+                <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
+                <template v-else-if="extractionFacts.length">
+                  <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact">
+                    <div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div>
+                    <p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p>
+                    <small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small>
+                  </div>
+                </template>
+                <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
+                <div v-if="!locked" class="extraction-actions">
+                  <span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div>
+                  <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button>
+                  <button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
+                </div>
               </div>
               <div class="transcript-actions">
                 <span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
@@ -1350,8 +1451,8 @@ defineExpose({ selectPatient })
               <div v-if="recordings.length" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
                   <legend>转写模型</legend>
-                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网 ASR</label>
-                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地 ASR</label>
+                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网转写</label>
+                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地转写</label>
                 </fieldset>
                 <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
@@ -1396,7 +1497,7 @@ defineExpose({ selectPatient })
             <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
               <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
             </div>
-            <div class="role-attention-actions"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+            <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
           </aside>
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -1417,7 +1518,16 @@ defineExpose({ selectPatient })
             <label for="transcript-edit" class="transcript-note">核对转写文字；修改后需重新生成并确认病历</label>
             <textarea id="transcript-edit" v-model="transcriptDraft" class="transcript-editor" :disabled="locked"></textarea>
           </div>
-          <div v-else class="transcript-body"><div class="transcript-note"><Icon name="info" />仅整理患者陈述，不输出自动诊断或医嘱。</div><div v-for="[label, value] in facts" :key="label" class="source-fact"><b>{{ label }}</b>{{ value }}</div></div>
+          <div v-else class="transcript-body extraction-body">
+            <div class="transcript-note"><Icon name="shield" />仅展示可追溯的原文事实；未确认内容不能生成病历。</div>
+            <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
+            <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
+            <template v-else-if="extractionFacts.length">
+              <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact"><div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
+            </template>
+            <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
+            <div v-if="!locked" class="extraction-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
+          </div>
           <div class="transcript-actions"><span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
             <button v-if="transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
             <button v-else class="btn small soft" :disabled="locked || !allTranscribed" @click="generateRecord"><Icon name="sparkle" />生成病历</button>
@@ -1630,7 +1740,7 @@ defineExpose({ selectPatient })
               <div v-if="modalError" class="modal-error">{{ modalError }}</div>
             </template>
           </template>
-          <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>取消后将清空本次接诊的录音、转写、病历和导出文件；该患者之后可以重新开始接诊。</p></template>
+          <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>取消后将清空本次接诊的录音、转写、病历和导出文件；该患者之后可以重新开始接诊。</p><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已确认并导出。</p><p>结束后本次接诊将归档。</p></template>
           <template v-else-if="modal === 'regenerate'"><p>将使用当前已采用的转写文本，覆盖 <b>接诊 {{ currentVisit?.visit_no }}</b> 的当前草稿内容，并创建新版本。</p><p>医生手动编辑的内容也会被替换，请确认已保存所需内容。</p></template>
           <template v-else-if="modal === 'confirm'">

@@ -109,7 +109,7 @@ public class AudioStorageService {
         }
     }
 
-    /** Validates the configuration required before an ASR job is created. */
+    /** 在创建 ASR 任务前校验所需存储配置。 */
     public void assertAsrSubmissionReady() {
         if (!credentialsConfigured) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "STORAGE_CREDENTIALS_MISSING",
@@ -117,7 +117,7 @@ public class AudioStorageService {
         }
     }
 
-    /** Removes MinIO recordings and locally generated exports owned by a visit. */
+    /** 删除指定接诊关联的 MinIO 录音和本地生成的导出文件。 */
     public void deleteVisitAssets(UUID visitId) {
         String prefix = key(visitId + "/");
         try {
@@ -183,10 +183,9 @@ public class AudioStorageService {
     }
 
     /**
-     * Keep application startup independent from optional storage credentials.
-     * The client can still be created for anonymous reads, while write/presign
-     * operations fail with the existing explicit storage error when credentials
-     * have not been injected.
+     * 使应用启动不依赖可选的存储凭据。
+     *
+     * <p>客户端仍可用于匿名读取；未注入凭据时，写入和预签名操作会返回既有的明确存储错误。
      */
     private MinioClient buildClient(String endpoint, String accessKey, String secretKey) {
         var builder = MinioClient.builder().endpoint(endpoint);

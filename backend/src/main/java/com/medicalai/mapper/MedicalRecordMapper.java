@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class MedicalRecordMapper {
+    public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 2;
     private static final RowMapper<MedicalRecordVersion> VERSION = (rs, n) -> new MedicalRecordVersion(
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
@@ -26,9 +27,8 @@ public class MedicalRecordMapper {
     }
 
     public String status(UUID visitId) {
-        // A transcript can be edited before a medical record is generated.  In
-        // that state no medical_record row exists yet, which means "not
-        // confirmed" rather than a database failure.
+        // 转写可在病历生成前编辑。此时尚不存在 medical_record 记录，应视为“未确认”，
+        // 而非数据库故障。
         return jdbc.query("SELECT r.status FROM medical_record r WHERE r.visit_id=?", (rs, n) -> rs.getString("status"), visitId)
                 .stream().findFirst().orElse("DRAFT");
     }
@@ -127,27 +127,46 @@ public class MedicalRecordMapper {
 
     public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format) {
         return jdbc.query("""
-                SELECT e.id,e.record_id,v.version_no,e.format,e.status,d.display_name,e.created_at
+                SELECT e.id,e.record_id,v.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
                 FROM record_export e
                 JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=e.record_id
                 JOIN doctor d ON d.id=e.created_by
                 WHERE e.record_id=? AND e.version_id=? AND e.confirmation_id=? AND e.format=?
+                  AND e.template_version=?
                   AND e.status IN ('PENDING','RUNNING','SUCCEEDED')
                 ORDER BY e.created_at DESC LIMIT 1
                 """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
-                        rs.getInt("version_no"), rs.getString("format"), rs.getString("status"),
+                        rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"), rs.getString("status"),
                         rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at")),
-                recordId, versionId, confirmationId, format).stream().findFirst();
+                recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION).stream().findFirst();
     }
 
-    public RecordExport insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
-                                     String format, UUID doctorId) {
+    public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
+                                                               String format) {
+        return jdbc.query("""
+                SELECT e.id,e.record_id,v.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
+                FROM record_export e
+                JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=e.record_id
+                JOIN doctor d ON d.id=e.created_by
+                WHERE e.record_id=? AND e.version_id=? AND e.confirmation_id=? AND e.format=?
+                  AND e.template_version=? AND e.status='FAILED'
+                ORDER BY e.created_at DESC LIMIT 1
+                """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
+                        rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"),
+                        rs.getString("status"), rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at")),
+                recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION).stream().findFirst();
+    }
+
+    public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
+                                               String format, UUID doctorId) {
         UUID id = UUID.randomUUID();
-        jdbc.update("""
-                INSERT INTO record_export(id,record_id,version_id,confirmation_id,format,status,object_key,created_by)
-                VALUES (?,?,?,?,?, 'PENDING', NULL,?)
-                """, id, recordId, versionId, confirmationId, format, doctorId);
-        return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst().orElseThrow();
+        int inserted = jdbc.update("""
+                INSERT INTO record_export(id,record_id,version_id,confirmation_id,format,template_version,status,object_key,created_by)
+                VALUES (?,?,?,?,?,?, 'PENDING', NULL,?)
+                ON CONFLICT DO NOTHING
+                """, id, recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION, doctorId);
+        if (inserted == 0) return Optional.empty();
+        return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst();
     }
 
     public UUID createExportJob(UUID visitId, UUID exportId, String format) {
@@ -158,6 +177,20 @@ public class MedicalRecordMapper {
                 VALUES (?,?,?,?,'PENDING',?,'BACKEND')
                 """, id, type, visitId, "export:" + exportId, exportId);
         return id;
+    }
+
+    public void requeueFailedExport(UUID visitId, UUID exportId, String format) {
+        int reset = jdbc.update("""
+                UPDATE record_export SET status='PENDING',object_key=NULL,error_message=NULL
+                WHERE id=? AND status='FAILED'
+                """, exportId);
+        if (reset == 0) return;
+        int updated = jdbc.update("""
+                UPDATE ai_job SET status='PENDING',attempt_count=0,started_at=NULL,finished_at=NULL,
+                    last_error=NULL,locked_at=NULL,lease_token=NULL
+                WHERE idempotency_key=?
+                """, "export:" + exportId);
+        if (updated == 0) createExportJob(visitId, exportId, format);
     }
 
     public Optional<ExportJob> claimNextExportJob(UUID leaseToken) {
@@ -197,6 +230,18 @@ public class MedicalRecordMapper {
                 """, jobId, exportId);
     }
 
+    /**
+     * 历史记录可能因部署清理或旧下载链路误读存储位置而丢失本地导出文件。
+     * 不能继续保留 SUCCEEDED，否则前端会永久复用一个无法下载的导出记录。
+     */
+    public void markExportFileMissing(UUID exportId) {
+        jdbc.update("""
+                UPDATE record_export
+                SET status='FAILED',object_key=NULL,error_message='导出文件不存在，请重新导出'
+                WHERE id=? AND status='SUCCEEDED'
+                """, exportId);
+    }
+
     public void markExportFailed(UUID exportId, UUID jobId, int attempt, String error) {
         if (attempt < 3) {
             jdbc.update("UPDATE record_export SET status='PENDING',error_message=? WHERE id=?", error, exportId);
@@ -216,26 +261,24 @@ public class MedicalRecordMapper {
     public Optional<ExportPayload> exportPayload(UUID exportId) {
         return jdbc.query("""
                 SELECT e.id,e.format,e.version_id,e.record_id,
-                       r.visit_id,vi.visit_no,p.name AS patient_name,v.version_no,
+                       r.visit_id,vi.visit_no,v.version_no,
                        v.content_json,v.edited_content_json,
-                       d.display_name AS doctor_name,c.confirmed_at
+                       c.confirmed_at
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
                 JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=r.id
                 JOIN medical_record_confirmation c ON c.id=e.confirmation_id
                     AND c.record_id=r.id AND c.version_id=v.id
                 JOIN visit vi ON vi.id=r.visit_id
-                JOIN patient p ON p.id=vi.patient_id
-                JOIN doctor d ON d.id=c.doctor_id
                 WHERE e.id=? AND r.status='CONFIRMED'
                   AND r.current_version=r.confirmed_version
                   AND v.version_no=r.current_version AND c.declaration=true
                 """, (rs, n) -> new ExportPayload(rs.getObject("id", UUID.class),
                         rs.getObject("record_id", UUID.class), rs.getObject("version_id", UUID.class),
                         rs.getObject("visit_id", UUID.class), rs.getString("visit_no"),
-                        rs.getString("patient_name"), rs.getInt("version_no"), rs.getString("format"),
+                        rs.getInt("version_no"), rs.getString("format"),
                         rs.getString("content_json"), rs.getString("edited_content_json"),
-                        rs.getString("doctor_name"), DatabaseDateTime.getInstant(rs, "confirmed_at")), exportId)
+                        DatabaseDateTime.getInstant(rs, "confirmed_at")), exportId)
                 .stream().findFirst();
     }
 
@@ -253,7 +296,7 @@ public class MedicalRecordMapper {
 
     public List<RecordExport> exportsByVisit(UUID visitId) {
         return jdbc.query("""
-                SELECT e.id,e.record_id,ver.version_no,e.format,e.status,d.display_name,e.created_at
+                SELECT e.id,e.record_id,ver.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
                 JOIN visit v ON v.id=r.visit_id
@@ -261,8 +304,8 @@ public class MedicalRecordMapper {
                 JOIN doctor d ON d.id=e.created_by
                 WHERE r.visit_id=? ORDER BY e.created_at DESC
                 """, (rs,n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
-                        rs.getInt("version_no"),
-                        rs.getString("format"), rs.getString("status"), rs.getString("display_name"),
+                        rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"),
+                        rs.getString("status"), rs.getString("display_name"),
                         DatabaseDateTime.getInstant(rs, "created_at")), visitId);
     }
 
@@ -280,7 +323,7 @@ public class MedicalRecordMapper {
     public record ConfirmedVersion(UUID recordId, UUID versionId, int versionNo, UUID confirmationId) {}
     public record ExportJob(UUID jobId, UUID exportId, int attempt) {}
     public record ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
-                                String patientName, int versionNo, String format, String contentJson,
-                                String editedContentJson, String doctorName, Instant confirmedAt) {}
+                                int versionNo, String format, String contentJson, String editedContentJson,
+                                Instant confirmedAt) {}
     public record ExportDownload(UUID id, String format, String status, String objectKey, String errorMessage) {}
 }

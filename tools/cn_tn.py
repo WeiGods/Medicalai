@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
-# Authors:
+# 作者：
 #   2019.5 Zhiyang Zhou (https://github.com/Joee1995/chn_text_norm.git)
 #   2019.9 - 2022 Jiayu DU
 #
-# requirements:
-#   - python 3.X
-# notes: python 2.X WILL fail or produce misleading results
+# 运行环境：
+#   - Python 3.X
+# 注意：Python 2.X 会运行失败或产生误导性结果。
 
 import argparse
 import csv
@@ -17,7 +17,7 @@ import string
 import sys
 
 # ================================================================================ #
-#                                    basic constant
+#                                    基础常量
 # ================================================================================ #
 CHINESE_DIGIS = "零一二三四五六七八九"
 BIG_CHINESE_DIGIS_SIMPLIFIED = "零壹贰叁肆伍陆柒捌玖"
@@ -67,7 +67,7 @@ COM_QUANTIFIERS = (
 )
 
 
-# Punctuation information are based on Zhon project (https://github.com/tsroten/zhon.git)
+# 标点符号信息基于 Zhon 项目（https://github.com/tsroten/zhon.git）。
 CN_PUNCS_STOP = "！？｡。"
 CN_PUNCS_NONSTOP = "＂＃＄％＆＇（）＊＋，－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､、〃《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘’‛“”„‟…‧﹏·〈〉-"
 CN_PUNCS = CN_PUNCS_STOP + CN_PUNCS_NONSTOP
@@ -177,8 +177,8 @@ QJ2BJ = {
 QJ2BJ_TRANSFORM = str.maketrans("".join(QJ2BJ.keys()), "".join(QJ2BJ.values()), "")
 
 
-# 2013 China National Standard: https://zh.wikipedia.org/wiki/通用规范汉字表, raw resources:
-#   https://github.com/mozillazg/pinyin-data/blob/master/kMandarin_8105.txt with 8105 chinese chars in total
+# 2013 年中国国家标准：https://zh.wikipedia.org/wiki/通用规范汉字表；原始资源：
+#   https://github.com/mozillazg/pinyin-data/blob/master/kMandarin_8105.txt，共含 8105 个汉字。
 CN_CHARS_COMMON = (
     "一丁七万丈三上下不与丏丐丑专且丕世丘丙业丛东丝丞丢两严丧个丫中丰串临丸丹为主丽举"
     "乂乃久么义之乌乍乎乏乐乒乓乔乖乘乙乜九乞也习乡书乩买乱乳乸乾了予争事二亍于亏云互"
@@ -397,7 +397,7 @@ IN_VALID_CHARS = {c: True for c in VALID_CHARS}
 
 
 # ================================================================================ #
-#                                    basic class
+#                                    基础类
 # ================================================================================ #
 class ChineseChar(object):
     """
@@ -556,7 +556,7 @@ class MathSymbol(object):
 
 
 # ================================================================================ #
-#                                    basic utils
+#                                    基础工具方法
 # ================================================================================ #
 def create_system(numbering_type=NUMBERING_TYPES[1]):
     """
@@ -568,7 +568,7 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     返回对应的数字系统
     """
 
-    # chinese number units of '亿' and larger
+    # “亿”及以上的中文数字单位。
     all_larger_units = zip(
         LARGER_CHINESE_NUMERING_UNITS_SIMPLIFIED,
         LARGER_CHINESE_NUMERING_UNITS_TRADITIONAL,
@@ -576,7 +576,7 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     larger_units = [
         CNU.create(i, v, numbering_type, False) for i, v in enumerate(all_larger_units)
     ]
-    # chinese number units of '十, 百, 千, 万'
+    # “十、百、千、万”的中文数字单位。
     all_smaller_units = zip(
         SMALLER_CHINESE_NUMERING_UNITS_SIMPLIFIED,
         SMALLER_CHINESE_NUMERING_UNITS_TRADITIONAL,
@@ -584,7 +584,7 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     smaller_units = [
         CNU.create(i, v, small_unit=True) for i, v in enumerate(all_smaller_units)
     ]
-    # digis
+    # 数字字符。
     chinese_digis = zip(
         CHINESE_DIGIS,
         CHINESE_DIGIS,
@@ -596,7 +596,7 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     digits[1].alt_s, digits[1].alt_t = ONE_ALT, ONE_ALT
     digits[2].alt_s, digits[2].alt_t = TWO_ALTS[0], TWO_ALTS[1]
 
-    # symbols
+    # 符号。
     positive_cn = CM(POSITIVE[0], POSITIVE[1], "+", lambda x: x)
     negative_cn = CM(NEGATIVE[0], NEGATIVE[1], "-", lambda x: -x)
     point_cn = CM(POINT[0], POINT[1], ".", lambda x, y: float(str(x) + "." + str(y)))
@@ -727,18 +727,18 @@ def num2chn(
     def get_value(value_string, use_zeros=True):
         striped_string = value_string.lstrip("0")
 
-        # record nothing if all zeros
+        # 全为零时不记录内容。
         if not striped_string:
             return []
 
-        # record one digits
+        # 记录单个数字。
         elif len(striped_string) == 1:
             if use_zeros and len(value_string) != len(striped_string):
                 return [system.digits[0], system.digits[int(striped_string)]]
             else:
                 return [system.digits[int(striped_string)]]
 
-        # recursively record multiple digits
+        # 递归记录多个数字。
         else:
             result_unit = next(
                 u for u in reversed(system.units) if u.power < len(striped_string)
@@ -794,7 +794,7 @@ def num2chn(
                     ):
                         result_symbols[i] = liang
 
-    # if big is True, '两' will not be used and `alt_two` has no impact on output
+    # big 为 True 时不使用“两”，alt_two 不影响输出。
     if big:
         attr_name = "big_"
         if traditional:
@@ -847,7 +847,7 @@ def num2chn(
 
 
 # ================================================================================ #
-#                          different types of rewriters
+#                          不同类型的重写器
 # ================================================================================ #
 class Cardinal:
     """
@@ -1133,7 +1133,7 @@ def normalize_nsw(raw_text):
                 matcher[0], Cardinal(cardinal=matcher[0]).cardinal2chntext(), 1
             )
 
-    # restore P2P, O2O, B2C, B2B etc
+    # 还原 P2P、O2O、B2C、B2B 等表达。
     pattern = re.compile(r"(([a-zA-Z]+)二([a-zA-Z]+))")
     matchers = pattern.findall(text)
     if matchers:
@@ -1237,7 +1237,7 @@ class TextNorm:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
-    # normalizer options
+    # 规范化器选项。
     p.add_argument(
         "--to_banjiao", action="store_true", help="convert quanjiao chars to banjiao"
     )
@@ -1260,7 +1260,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--remove_space", action="store_true", help="remove whitespace")
 
-    # I/O options
+    # 输入输出选项。
     p.add_argument(
         "--log_interval",
         type=int,

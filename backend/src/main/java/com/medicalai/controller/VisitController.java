@@ -21,7 +21,7 @@ public class VisitController {
     }
 
     @GetMapping("/{id}")
-    public VisitVO get(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+    public VisitVO get(@PathVariable("id") UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.get(id, current.doctor().id());
     }
 
@@ -32,18 +32,18 @@ public class VisitController {
     }
 
     @PostMapping("/{id}/start")
-    public VisitVO start(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+    public VisitVO start(@PathVariable("id") UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.start(id, current.doctor().id());
     }
 
     @PostMapping("/{id}/complete")
-    public VisitVO complete(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+    public VisitVO complete(@PathVariable("id") UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.complete(id, current.doctor().id());
     }
 
     @PostMapping("/{id}/cancel")
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    public void cancel(@PathVariable UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+    public void cancel(@PathVariable("id") UUID id, @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         service.cancel(id, current.doctor().id());
     }
 }

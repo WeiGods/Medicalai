@@ -71,9 +71,7 @@ class JapaneseNormalizerTest(unittest.TestCase):
             whisper_mix_normalize.configure_open_jtalk_dict(temp_dir)
 
     def test_explicit_dictionary_uses_dedicated_frontend_after_default_init(self):
-        # Reproduce the process-lifetime ordering that previously caused an
-        # explicit dictionary path to reuse pyopenjtalk's cached default
-        # frontend.
+        # 复现此前进程生命周期顺序导致显式词典路径复用 pyopenjtalk 默认缓存前端的问题。
         whisper_mix_normalize.pyopenjtalk.g2p("テスト", kana=True)
         with whisper_mix_normalize.pyopenjtalk._global_jtalk() as default_jtalk:
             default_jtalk_id = id(default_jtalk)

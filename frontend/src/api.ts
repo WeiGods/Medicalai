@@ -1,6 +1,6 @@
 import type {
-  AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, MedicalRecord, Patient, RecordExport,
-  Recording, Transcript, Visit
+  AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
+  Recording, Transcript, Visit, ClinicalExtraction
 } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
@@ -86,8 +86,17 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ role })
     }),
-  reclassifyTranscriptRoles: (visitId: string) => request<Transcript>(
-    `/api/v1/visits/${visitId}/transcript/roles/reclassify`, { method: 'POST' }),
+  reclassifyTranscriptRoles: (visitId: string, provider?: LlmProvider) => request<Transcript>(
+    `/api/v1/visits/${visitId}/transcript/roles/reclassify`, {
+      method: 'POST', body: provider ? JSON.stringify({ provider }) : undefined
+    }),
+  clinicalExtraction: (visitId: string) => request<ClinicalExtraction>(`/api/v1/visits/${visitId}/clinical-extraction`),
+  generateClinicalExtraction: (visitId: string, provider?: LlmProvider) => request<ClinicalExtraction>(
+    `/api/v1/visits/${visitId}/clinical-extraction/generate`, {
+      method: 'POST', body: provider ? JSON.stringify({ provider }) : undefined
+    }),
+  confirmClinicalExtraction: (visitId: string) => request<ClinicalExtraction>(
+    `/api/v1/visits/${visitId}/clinical-extraction/confirm`, { method: 'POST' }),
 
   medicalRecord: (visitId: string) => request<MedicalRecord>(`/api/v1/visits/${visitId}/medical-record`),
   generateMedicalRecord: (visitId: string) => request<MedicalRecord>(`/api/v1/visits/${visitId}/medical-record/generate`, { method: 'POST' }),
@@ -112,14 +121,24 @@ export const api = {
     const token = localStorage.getItem('medicalai_token')
     if (token) headers.set('Authorization', `Bearer ${token}`)
     const response = await fetch(`${base}/api/v1/exports/${exportId}/download`, { headers })
-    if (!response.ok) throw new Error(`导出文件下载失败（${response.status}）`)
+    if (!response.ok) {
+      let message = `导出文件下载失败（${response.status}）`
+      try {
+        const error = await response.json() as { message?: string }
+        if (error.message) message = error.message
+      } catch {
+        // 下载端点可能由代理返回非 JSON 错误页，保留包含 HTTP 状态的稳定提示。
+      }
+      const error = Object.assign(new Error(message), { status: response.status })
+      throw error
+    }
     return response.blob()
   },
   audioUrl: (recordingId: string) => `${base}/api/v1/recordings/${recordingId}/audio`,
   /**
-   * Audio is protected by the same bearer-token interceptor as the rest of the
-   * API.  A native <audio src="..."> request cannot attach that header, so
-   * fetch the bytes explicitly and let the caller create an object URL.
+   * 音频与其他 API 一样受 Bearer Token 拦截器保护。
+   *
+   * <p>原生 <audio src="..."> 请求无法附带该请求头，因此显式获取字节后由调用方创建对象 URL。
    */
   audioBlob: async (recordingId: string, signal?: AbortSignal) => {
     const headers = new Headers()
