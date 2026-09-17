@@ -130,6 +130,12 @@ def test_completed_segment_uses_absolute_offsets_after_audio_compaction(monkeypa
     for _ in range(11):
         session.add_audio(one_second)
 
+    # VAD-confirmed segments are deferred to the next decode() cycle.
+    assert engine.input_lengths == []
+    assert session.locked_sentences == []
+
+    session.decode(is_final=False)
+
     assert engine.input_lengths == [sample_rate]
     assert session.locked_sentences == [{"text": "hello", "start": 10000, "end": 11000}]
     assert session._build_response(is_final=False)["duration_ms"] == 11000
@@ -254,6 +260,50 @@ def test_speaker_history_and_identity_state_have_hard_limits(monkeypatch):
         {"text": "abc", "start": 0, "end": 3000, "spk": 1},
         {"text": "def", "start": 3000, "end": 6000, "spk": 0},
     ]
+
+
+def test_finalize_uses_direct_cosine_for_short_speaker_history(monkeypatch):
+    utils_stub = types.ModuleType("funasr.models.campplus.utils")
+    utils_stub.sv_chunk = lambda segments: segments
+    utils_stub.distribute_spk = lambda sentences, speaker_segments: sentences
+
+    def postprocess(segments, vad_segments, labels, embeddings, return_spk_center=False):
+        output = [[segment[0], segment[1], int(label)] for segment, label in zip(segments, labels)]
+        centers = torch.stack(
+            [embeddings[labels == label].mean(0) for label in sorted(set(labels.tolist()))]
+        )
+        return (output, centers) if return_spk_center else output
+
+    utils_stub.postprocess = postprocess
+    cluster_stub = types.ModuleType("funasr.models.campplus.cluster_backend")
+    cluster_stub.ClusterBackend = lambda merge_thr: types.SimpleNamespace(
+        to=lambda device: None,
+        __call__=lambda embeddings, oracle_num=None: (_ for _ in ()).throw(AssertionError("short history must not cluster")),
+    )
+    monkeypatch.setitem(sys.modules, "funasr.models.campplus.utils", utils_stub)
+    monkeypatch.setitem(sys.modules, "funasr.models.campplus.cluster_backend", cluster_stub)
+    module = load_service_module(monkeypatch)
+
+    class FakeSpeakerModel:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, input, **kwargs):
+            center = [1.0, 0.0] if self.calls in (0, 2) else [0.0, 1.0]
+            self.calls += len(input)
+            return [{"spk_embedding": torch.tensor([center])} for _ in input]
+
+    tracker = module.HybridSpeakerTracker(FakeSpeakerModel(), "cpu", max_history_chunks=8)
+    tracker.sv_chunk = lambda segments: segments
+
+    for index, expected_speaker in enumerate((0, 1, 0)):
+        sentence = {"text": f"segment {index}", "start": index * 1000, "end": (index + 1) * 1000}
+        tracker.assign_streaming(
+            np.ones(16000, dtype=np.float32), index, index + 1, sentence
+        )
+        assert sentence["spk"] == expected_speaker
+
+    assert [row[2] for row in tracker._cluster_recent(update_centers=False)] == [0, 1, 0]
 
 
 def test_handler_is_responsive_and_serializes_shared_model_work(monkeypatch):
@@ -461,6 +511,7 @@ def test_decode_segment_drops_silent_audio_and_short_fillers(monkeypatch):
         audio_lookback_sec=5,
     )
     silent_session.add_audio(np.zeros(sample_rate, dtype=np.int16).tobytes())
+    silent_session.decode(is_final=False)
     assert silent_session.locked_sentences == []
 
     # Short segments that decode to nothing but interjections are dropped.
@@ -473,6 +524,7 @@ def test_decode_segment_drops_silent_audio_and_short_fillers(monkeypatch):
         audio_lookback_sec=5,
     )
     filler_session.add_audio(loud_second)
+    filler_session.decode(is_final=False)
     assert filler_session.locked_sentences == []
 
     # Real speech survives the filters.
@@ -485,6 +537,7 @@ def test_decode_segment_drops_silent_audio_and_short_fillers(monkeypatch):
         audio_lookback_sec=5,
     )
     speech_session.add_audio(loud_second)
+    speech_session.decode(is_final=False)
 
     assert [s["text"] for s in speech_session.locked_sentences] == ["多西环素要吃两周"]
 

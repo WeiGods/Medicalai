@@ -249,7 +249,7 @@ def baked_model_kwargs(hub_id, dir_name):
 
 
 class HybridSpeakerTracker:
-    """Speaker diarization: streaming ClusterBackend + final re-clustering."""
+    """Speaker diarization: streaming cosine matching + final re-clustering."""
 
     def __init__(
         self,
@@ -282,10 +282,14 @@ class HybridSpeakerTracker:
         self.all_chunks = deque(maxlen=max_history_chunks)
         self.all_embeddings = deque(maxlen=max_history_chunks)
         self.last_speaker_id = 0
+        # Guard against an overly permissive configured threshold, while keeping
+        # stricter operator overrides. Real intra-speaker samples measured ~0.72,
+        # while cross-speaker samples measured well below 0.14.
+        self.new_speaker_threshold = max(0.65, threshold)
 
     @torch.no_grad()
     def assign_streaming(self, audio_samples, seg_start_s, seg_end_s, sentence):
-        """Assign speaker ID during streaming using ClusterBackend."""
+        """Assign speaker ID during streaming using direct cosine matching."""
         if (seg_end_s - seg_start_s) * 1000 < self.min_segment_ms:
             # Embeddings from very short fragments are unreliable; inherit the
             # last stable speaker and let the final re-clustering keep it.
@@ -307,15 +311,48 @@ class HybridSpeakerTracker:
             self.all_chunks.append((float(chunk[0]), float(chunk[1])))
             self.all_embeddings.append(embedding.clone())
 
-        sv_output = self._cluster_recent(update_centers=True)
-        temp = [{"start": int(seg_start_s*1000), "end": int(seg_end_s*1000), "text": sentence["text"]}]
-        self.distribute_spk(temp, sv_output)
-        sentence["spk"] = temp[0].get("spk", self.last_speaker_id)
-        self.last_speaker_id = sentence["spk"]
+        center = torch.nn.functional.normalize(embeddings.mean(dim=0), dim=0)
+        speaker_id = self._match_or_create_center(center)
+        sentence["spk"] = speaker_id
+        self.last_speaker_id = speaker_id
+
+    def _match_or_create_center(self, center):
+        """Cosine-match a segment center against known speaker centers."""
+        if not self.speaker_centers:
+            self.speaker_centers.append(center.clone())
+            self.speaker_center_updates.append(1)
+            return 0
+
+        centers = torch.stack(self.speaker_centers)
+        similarities = torch.mv(centers, center)
+        best_idx = int(torch.argmax(similarities))
+        best_similarity = float(similarities[best_idx])
+
+        if best_similarity >= self.new_speaker_threshold:
+            count = self.speaker_center_updates[best_idx]
+            weight = 1.0 / min(count + 1, 20)
+            updated = (1.0 - weight) * self.speaker_centers[best_idx] + weight * center
+            self.speaker_centers[best_idx] = torch.nn.functional.normalize(updated, dim=0)
+            self.speaker_center_updates[best_idx] = count + 1
+            return best_idx
+
+        if len(self.speaker_centers) < self.max_speakers:
+            self.speaker_centers.append(center.clone())
+            self.speaker_center_updates.append(1)
+            return len(self.speaker_centers) - 1
+
+        return best_idx
 
     def _cluster_recent(self, update_centers):
         all_embeddings = torch.stack(list(self.all_embeddings), dim=0)
-        labels = self.cluster_backend(all_embeddings, oracle_num=None)
+        # ClusterBackend collapses every short session (<20 chunks) to a single
+        # cluster, which overwrites correct streaming IDs at finalize. For those
+        # small sets, assign chunks directly to the centers already built.
+        if len(all_embeddings) < 20 and self.speaker_centers:
+            centers = torch.stack(self.speaker_centers)
+            labels = torch.argmax(all_embeddings @ centers.T, dim=1).numpy()
+        else:
+            labels = self.cluster_backend(all_embeddings, oracle_num=None)
         if not isinstance(labels, np.ndarray):
             labels = np.asarray(labels)
 
@@ -351,7 +388,8 @@ class HybridSpeakerTracker:
                         break
 
             matched = best_id is not None and best_similarity >= self.threshold
-            if not matched and update and len(self.speaker_centers) < self.max_speakers:
+            create_threshold = self.new_speaker_threshold if update else self.threshold
+            if not matched and update and best_similarity < create_threshold and len(self.speaker_centers) < self.max_speakers:
                 best_id = len(self.speaker_centers)
                 self.speaker_centers.append(center.clone())
                 self.speaker_center_updates.append(1)
@@ -531,6 +569,7 @@ class RealtimeASRSession:
         self.min_rms = min_rms
         self.drop_filler_ms = drop_filler_ms
         self.is_active = False
+        self.pending_segments = []
 
     def add_audio(self, pcm_bytes):
         audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -542,17 +581,12 @@ class RealtimeASRSession:
             new_confirmed = self.vad.feed(torch.from_numpy(audio_float).float(), is_final=False)
 
             for seg in new_confirmed:
-                seg_text = self._decode_segment(seg)
-                self.prev_text = ""
-                if not seg_text.strip():
-                    continue
-                self.locked_sentences.append({"text": seg_text, "start": int(seg[0]), "end": int(seg[1])})
-                if self.spk_tracker:
-                    s0 = int(seg[0] * self.sample_rate / 1000)
-                    s1 = min(int(seg[1] * self.sample_rate / 1000), self.total_samples)
-                    segment_audio = self._slice_audio(s0, s1).copy()
-                    self.spk_tracker.assign_streaming(segment_audio, seg[0]/1000, seg[1]/1000, self.locked_sentences[-1])
-                logger.info(f"Locked: [{seg[0]}-{seg[1]}ms] \"{seg_text[:40]}\"")
+                s0 = int(seg[0] * self.sample_rate / 1000)
+                s1 = min(int(seg[1] * self.sample_rate / 1000), self.total_samples)
+                # Cache the audio now: _compact_audio_buffer may drop it before
+                # the deferred decode runs in the next decode() cycle.
+                seg_audio = self._slice_audio(s0, s1).copy()
+                self.pending_segments.append((seg, seg_audio))
 
         self._compact_audio_buffer()
 
@@ -583,6 +617,21 @@ class RealtimeASRSession:
         threshold = self.first_chunk_samples if not self.first_decode_done else self.chunk_samples
         return (self.total_samples - self.last_decode_samples) >= threshold
 
+    def _process_pending_segments(self):
+        """Decode confirmed VAD segments that were deferred from add_audio."""
+        for seg, seg_audio in self.pending_segments:
+            seg_text = self._decode_segment(seg, seg_audio=seg_audio)
+            self.prev_text = ""
+            if not seg_text.strip():
+                continue
+            self.locked_sentences.append({"text": seg_text, "start": int(seg[0]), "end": int(seg[1])})
+            if self.spk_tracker:
+                self.spk_tracker.assign_streaming(
+                    seg_audio, seg[0]/1000, seg[1]/1000, self.locked_sentences[-1]
+                )
+            logger.info(f"Locked: [{seg[0]}-{seg[1]}ms] \"{seg_text[:40]}\"")
+        self.pending_segments.clear()
+
     @torch.no_grad()
     def _engine_generate(self, audio_tensor, max_new_tokens, context_text=""):
         if self.use_context:
@@ -604,6 +653,8 @@ class RealtimeASRSession:
             if is_final:
                 self._release_audio_buffer()
             return self._build_response(is_final)
+
+        self._process_pending_segments()
 
         if is_final:
             if self.vad.current_speech_start is not None:
@@ -674,28 +725,31 @@ class RealtimeASRSession:
         return self._slice_audio(decode_start_sample, self.total_samples), start_ms
 
     @torch.no_grad()
-    def _decode_segment(self, seg):
+    def _decode_segment(self, seg, seg_audio=None):
         """Decode a completed VAD segment via vLLM."""
-        start_sample = int(seg[0] * self.sample_rate / 1000)
-        end_sample = min(int(seg[1] * self.sample_rate / 1000), self.total_samples)
-        seg_audio = self._slice_audio(start_sample, end_sample)
+        duration_ms = seg[1] - seg[0]
+        if seg_audio is None:
+            start_sample = int(seg[0] * self.sample_rate / 1000)
+            end_sample = min(int(seg[1] * self.sample_rate / 1000), self.total_samples)
+            seg_audio = self._slice_audio(start_sample, end_sample)
         if len(seg_audio) < 1600:
             return ""
+        max_tokens = max(64, min(512, duration_ms // 40))
         if self.min_rms > 0 and _audio_rms(seg_audio) < self.min_rms:
             # VAD occasionally confirms segments of room tone; the model then
             # hallucinates strings of 嗯. Skip near-silent audio outright.
             return ""
         audio_tensor = torch.from_numpy(seg_audio).float()
         try:
-            text = self._engine_generate(audio_tensor, 512, context_text=self.prev_seg_text)
+            text = self._engine_generate(audio_tensor, max_tokens, context_text=self.prev_seg_text)
             text = _clean_asr_text(text)
             if (
                 self.drop_filler_ms > 0
                 and _is_filler_only(text)
-                and (end_sample - start_sample) * 1000 / self.sample_rate < self.drop_filler_ms
+                and duration_ms < self.drop_filler_ms
             ):
                 return ""
-            if _is_sparse_text(text, (end_sample - start_sample) * 1000 / self.sample_rate):
+            if _is_sparse_text(text, duration_ms):
                 return ""
             self.prev_seg_text = text
             return text
@@ -735,6 +789,7 @@ class RealtimeASRSession:
         self.last_partial_start_ms = 0
         self.last_decode_samples = 0
         self.locked_sentences = []
+        self.pending_segments = []
         if self.spk_tracker:
             self.spk_tracker.reset()
 
@@ -884,7 +939,10 @@ async def handle_client(websocket, args):
             elif isinstance(message, bytes) and session.is_active:
                 await run_session_work(args, session.add_audio, message)
                 now = time.time()
-                if now - last_decode_time >= decode_interval and session.should_decode():
+                has_pending = bool(getattr(session, "pending_segments", None))
+                if now - last_decode_time >= decode_interval and (
+                    session.should_decode() or has_pending
+                ):
                     result = await run_session_work(args, session.decode, is_final=False)
                     await websocket.send(json.dumps(result))
                     last_decode_time = now

@@ -552,7 +552,10 @@ async def ws_asr(websocket: WebSocket):
             elif message.get("bytes") is not None and session.is_active:
                 await asyncio.to_thread(work, session.add_audio, message["bytes"])
                 now = time.time()
-                if now - last_decode_time >= decode_interval and session.should_decode():
+                has_pending = bool(getattr(session, "pending_segments", None))
+                if now - last_decode_time >= decode_interval and (
+                    session.should_decode() or has_pending
+                ):
                     result = await asyncio.to_thread(work, session.decode, False)
                     await websocket.send_json(result)
                     last_decode_time = now
