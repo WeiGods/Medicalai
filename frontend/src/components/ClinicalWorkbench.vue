@@ -9,6 +9,7 @@ import type { AsrProvider, ClinicalExtraction, Confirmation, Doctor, LlmProvider
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
+const CURRENT_EXPORT_TEMPLATE_VERSION = 2
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export' | 'audit' | 'config'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export'
@@ -205,7 +206,10 @@ const stage = computed(() => {
   return stages.indexOf(workflowView.value)
 })
 const activeCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'ACTIVE').length)
-const waitingCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'WAITING').length)
+const waitingCount = computed(() => patients.value.filter(patient => {
+  const visit = patientVisit(patient.id)
+  return !visit || visit.status === 'WAITING'
+}).length)
 const openVisitCount = computed(() => patients.value.filter(patient => ['ACTIVE', 'WAITING'].includes(patientVisit(patient.id)?.status || '')).length)
 const completedCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'COMPLETED').length)
 const missingFields = computed(() => {
@@ -924,12 +928,14 @@ async function recordExportLog(format: 'DOCX' | 'PDF') {
 async function waitForExport(format: 'DOCX' | 'PDF') {
   if (!currentVisit.value || !record.value) return null
   const versionNo = record.value.version_no
-  let item = exports.value.find(e => e.format === format && e.version_no === versionNo)
+  let item = exports.value.find(e => e.format === format && e.version_no === versionNo
+    && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
   // 复用已完成的导出任务（尤其是已完成接诊），避免用户每次打开导出页面都创建重复任务。
   if (item?.status === 'SUCCEEDED') return item.id
   if (!item || item.status === 'FAILED') {
     await recordExportLog(format)
-    item = exports.value.find(e => e.format === format && e.version_no === versionNo)
+    item = exports.value.find(e => e.format === format && e.version_no === versionNo
+      && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
   }
   if (!item) return null
   for (let attempt = 0; attempt < 30; attempt++) {

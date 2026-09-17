@@ -164,6 +164,7 @@ export interface Confirmation {
 export interface RecordExport {
   id: string
   version_no: number
+  template_version: number
   format: 'DOCX' | 'PDF' | string
   status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | string
   doctor_name: string

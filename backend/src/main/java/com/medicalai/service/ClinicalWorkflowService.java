@@ -1,6 +1,5 @@
 package com.medicalai.service;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.medicalai.domain.*;
 import com.medicalai.dto.*;
@@ -462,8 +461,25 @@ public class ClinicalWorkflowService {
         if (reusable != null) {
             return exports(visitId, doctorId);
         }
+        RecordExport failed = records.failedCurrentTemplateExport(version.recordId(), version.id(),
+                confirmedVersion.confirmationId(), request.format()).orElse(null);
+        if (failed != null) {
+            records.requeueFailedExport(visit.id(), failed.id(), request.format());
+            records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", failed.id());
+            return exports(visitId, doctorId);
+        }
         RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
-                version.id(), request.format(), doctorId);
+                version.id(), request.format(), doctorId).orElse(null);
+        if (export == null) {
+            // A concurrent request inserted the current template first. Reuse that job after the unique-index race.
+            RecordExport concurrent = records.reusableExport(version.recordId(), version.id(),
+                    confirmedVersion.confirmationId(), request.format()).orElse(null);
+            if (concurrent == null) {
+                throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_IN_PROGRESS", "导出任务正在创建，请稍后重试");
+            }
+            records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", concurrent.id());
+            return exports(visitId, doctorId);
+        }
         records.createExportJob(visit.id(), export.id(), request.format());
         records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", export.id());
         return exports(visitId, doctorId);
@@ -473,7 +489,8 @@ public class ClinicalWorkflowService {
     public List<RecordExportVO> exports(UUID visitId, UUID doctorId) {
         Visit visit = owned(visitId, doctorId, false);
         return records.exportsByVisit(visit.id()).stream()
-                .map(e -> new RecordExportVO(e.id(), e.versionNo(), e.format(), e.status(), e.doctorName(), e.createdAt()))
+                .map(e -> new RecordExportVO(e.id(), e.versionNo(), e.templateVersion(), e.format(), e.status(),
+                        e.doctorName(), e.createdAt()))
                 .toList();
     }
 
@@ -567,18 +584,7 @@ public class ClinicalWorkflowService {
 
     private MedicalRecordContent effectiveContent(MedicalRecordVersion version) {
         try {
-            Map<String, Object> map = new LinkedHashMap<>();
-            if (version.contentJson() != null && !version.contentJson().isBlank()) {
-                map.putAll(objectMapper.readValue(version.contentJson(), new TypeReference<Map<String, Object>>() {}));
-            }
-            if (version.editedContentJson() != null && !version.editedContentJson().isBlank()) {
-                map.putAll(objectMapper.readValue(version.editedContentJson(), new TypeReference<Map<String, Object>>() {}));
-            }
-            return new MedicalRecordContent(
-                    string(map.get("name")), string(map.get("gender")), integer(map.get("age")),
-                    string(map.get("phone")), string(map.get("chief")), string(map.get("present")),
-                    string(map.get("past")), string(map.get("opinion")), string(map.get("medication")),
-                    string(map.get("followup")), string(map.get("doctor")), string(map.get("date")));
+            return MedicalRecordContentCodec.parse(objectMapper, version.contentJson(), version.editedContentJson());
         } catch (Exception e) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "RECORD_PARSE_FAILED", "病历内容读取失败");
         }
@@ -673,11 +679,6 @@ public class ClinicalWorkflowService {
 
     private String displayProvider(String providerRoute) {
         return AsrJobWorker.PUBLIC_ROLE_ROUTE.equals(providerRoute) ? "DASHSCOPE" : providerRoute;
-    }
-
-    private Integer integer(Object value) {
-        try { return value == null || String.valueOf(value).isBlank() ? null : Integer.valueOf(String.valueOf(value)); }
-        catch (NumberFormatException e) { return null; }
     }
 
     private String string(Map<String, Object> map, String key) {

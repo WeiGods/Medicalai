@@ -261,6 +261,7 @@ CREATE TABLE IF NOT EXISTS record_export (
     version_id uuid NOT NULL,
     confirmation_id uuid NOT NULL REFERENCES medical_record_confirmation(id),
     format varchar(8) NOT NULL CHECK (format IN ('DOCX','PDF')),
+    template_version smallint NOT NULL DEFAULT 1 CHECK (template_version > 0),
     status varchar(16) NOT NULL CHECK (status IN ('PENDING','RUNNING','SUCCEEDED','FAILED')),
     object_key varchar(512),
     error_message varchar(1024),
@@ -336,6 +337,7 @@ ALTER TABLE asr_utterance ADD COLUMN IF NOT EXISTS role_provider_route varchar(3
 ALTER TABLE clinical_extraction_version ADD COLUMN IF NOT EXISTS provider_route varchar(32);
 CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
+ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_version smallint NOT NULL DEFAULT 1;
 
 -- 兼容旧版前端直接写入的伪成功导出：没有真实文件时必须回到可重试的 PENDING。
 UPDATE record_export
@@ -459,6 +461,8 @@ CREATE INDEX IF NOT EXISTS ix_record_version_record ON medical_record_version(re
 CREATE INDEX IF NOT EXISTS ix_clinical_extraction_version_source
     ON clinical_extraction_version(extraction_id, source_snapshot_id, version_no DESC);
 CREATE INDEX IF NOT EXISTS ix_record_export_record ON record_export(record_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template
+    ON record_export(version_id, format, template_version) WHERE template_version = 2;
 CREATE INDEX IF NOT EXISTS ix_audit_visit_time ON audit_log(visit_id, created_at);
 
 -- 当前病历通过 medical_record.visit_id（唯一）和 medical_record.current_version 定位。
