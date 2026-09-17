@@ -8,7 +8,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 
-/** Converts the database's timezone-free Beijing timestamps at the JDBC boundary. */
+/** 在 JDBC 边界转换数据库中不带时区的北京时间时间戳。 */
 public final class DatabaseDateTime {
     private static final ZoneId STORAGE_ZONE = ZoneId.of("Asia/Shanghai");
 

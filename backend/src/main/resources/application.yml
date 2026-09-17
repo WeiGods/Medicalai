@@ -29,7 +29,10 @@ medicalai:
   storage:
     root: ${STORAGE_ROOT:./data/recordings}
   ai:
+    # 旧属性仅为已有部署保留；新代码统一读取 internal-ai，公网快照不会使用此地址。
     base-url: ${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}
+  internal-ai:
+    base-url: ${INTERNAL_AI_SERVICE_BASE_URL:${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}}
   minio:
     api-endpoint: ${MINIO_API_ENDPOINT:http://106.55.225.222:9000}
     access-key: ${MINIO_ACCESS_KEY:Zerojy}
@@ -47,8 +50,16 @@ medicalai:
     role-model: ${DASHSCOPE_ROLE_MODEL:qwen-plus}
     role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:70}
     role-batch-size: ${DASHSCOPE_ROLE_BATCH_SIZE:40}
+    # 公网信息提取由后端直连 DashScope，不经过 internal-ai 或 127.0.0.1:8000。
+    extraction-model: ${DASHSCOPE_EXTRACTION_MODEL:qwen-plus}
+    extraction-timeout-ms: ${DASHSCOPE_EXTRACTION_TIMEOUT_MS:${DASHSCOPE_READ_TIMEOUT_MS:60000}}
+    extraction-max-tokens: ${DASHSCOPE_EXTRACTION_MAX_TOKENS:4096}
+    role-retry-max-attempts: ${DASHSCOPE_ROLE_RETRY_MAX_ATTEMPTS:2}
+    role-retry-delay-ms: ${DASHSCOPE_ROLE_RETRY_DELAY_MS:200}
     api-key: ${DASHSCOPE_API_KEY:sk-ws-H.PDYIRDH.WTGk.MEQCIA1Cg2vaLpNLwHfiXquEK6FGX_pbkwclvF_JaaO2t7GkAiBEL0fBqwtkdCArw3wPbnt4JIVOOrVOKTWRwi1n4QSnMg}
     endpoint: ${DASHSCOPE_ENDPOINT:https://dashscope.aliyuncs.com}
+    connect-timeout-ms: ${DASHSCOPE_CONNECT_TIMEOUT_MS:5000}
+    read-timeout-ms: ${DASHSCOPE_READ_TIMEOUT_MS:60000}
     asr-model: ${DASHSCOPE_ASR_MODEL:qwen-audio-3.0-asr-flash-filetrans}
     diarization-enabled: ${DASHSCOPE_DIARIZATION_ENABLED:true}
     poll-delay-ms: ${DASHSCOPE_POLL_DELAY_MS:3000}

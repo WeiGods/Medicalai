@@ -28,7 +28,7 @@
 @media(max-width:760px){.source-column{align-items:stretch}.source-column .audio-name{max-width:100%!important}.audio-info>.badge{flex-shrink:0}.patient-details{font-size:9px}.record-subbar{font-size:9px}.brand strong{font-size:19px}.brand strong span{font-size:13px!important}.transcript-body{max-height:380px}.card-head h2{font-size:13px}.record-form .field textarea{font-size:12px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 
-/* Layered modal surface: keep the confirmation flow centered and usable on every viewport. */
+/* 分层弹窗容器：确保确认流程在各种视口下均居中且可用。 */
 .modal-backdrop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:24px;background:rgba(32,61,52,.26);backdrop-filter:blur(4px);overscroll-behavior:contain;animation:modal-fade-in .18s ease-out}
 .modal-dialog{width:min(510px,calc(100vw - 32px));max-height:min(720px,calc(100vh - 48px));display:flex;flex-direction:column;overflow:hidden;margin:0;background:var(--white);border:1px solid #dce8df;border-radius:13px;color:var(--ink);box-shadow:0 24px 80px rgba(29,57,44,.22);animation:modal-slide-in .2s ease-out}
 .modal-dialog:focus{outline:none}
@@ -62,7 +62,7 @@ body.modal-open{overflow:hidden}
 
 @media(min-width:1100px){.main>.queue .queue-cards{max-height:650px;overflow-y:auto;scrollbar-width:thin}.queue-load-more{text-align:center;color:#9aaba2;font-size:11px;padding:10px;border-top:1px solid var(--line)}}
 
-/* Consultation start and browser recorder surfaces. */
+/* 接诊开始和浏览器录音相关样式。 */
 .consultation-start-view{margin-bottom:22px;min-width:0}
 .consultation-start-card{position:relative;min-height:390px;display:flex;flex-direction:column;overflow:hidden;background:linear-gradient(145deg,#fff 0%,#fbfefc 72%,#f4faf6 100%)}
 .consultation-start-card:after{content:"";position:absolute;width:300px;height:300px;right:-115px;bottom:-170px;border-radius:50%;background:#eaf6ef;opacity:.7;pointer-events:none}
@@ -203,7 +203,7 @@ body.modal-open{overflow:hidden}
   .live-waveform i{width:3px}
 }
 
-/* New-patient entry form */
+/* 新患者录入表单。 */
 .modal-switch{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:4px;background:#f1f6f2;border-radius:8px;margin-bottom:18px}
 .modal-switch-btn{border:0;border-radius:6px;background:transparent;color:#7b9382;font-size:11px;padding:9px 10px;cursor:pointer;transition:background .2s,color .2s,box-shadow .2s}
 .modal-switch-btn:hover{color:#4a8068}
@@ -217,6 +217,7 @@ body.modal-open{overflow:hidden}
 }
 
 .asr-controls{margin-top:16px}.asr-selector{display:flex;flex-wrap:wrap;gap:16px;border:1px solid #dce7e1;border-radius:10px;padding:12px}.asr-selector legend{font-size:12px;padding:0 6px}.asr-selector label{display:flex;align-items:center;gap:6px;font-size:13px}.asr-selector input{accent-color:#168477}.asr-selector:disabled{opacity:.6}
-/* Role-review metadata stays adjacent to the source utterance, so clinicians can verify it in context. */
+/* 角色复核元数据紧邻原始句段，便于医生结合上下文核对。 */
 .dialogue.needs-review{border-left:3px solid #d69c65;padding-left:10px}.role-status{display:inline-flex;align-items:center;margin-left:7px;padding:1px 5px;border-radius:3px;background:#eaf1f8;color:#5c7f9a;font-size:9px;line-height:1.4}.role-status.review{background:#fdf4e6;color:#a6722f}.role-status.manual{background:#e7f4ec;color:#3d8b69}.role-control{display:flex;align-items:center;gap:7px;margin-top:8px;color:#83918c;font-size:10px}.role-control label{display:flex;align-items:center;gap:6px}.role-control select{min-width:88px;border:1px solid #dce6e1;border-radius:4px;background:#fff;color:#4b6259;padding:3px 5px;font-size:10px}.role-confirm{border:1px solid #b9d9cf;border-radius:4px;background:#eff8f4;color:#176f62;padding:4px 7px;font-size:10px;line-height:1.2}.role-confirm:hover:not(:disabled){background:#dff1e9}.role-confirm:disabled{cursor:not-allowed;opacity:.55}
 .role-attention{display:flex;align-items:center;gap:13px;margin:14px 18px 10px;padding:13px 14px;border:1px solid #f0dcb9;border-radius:7px;background:#fff9ef;color:#695438}.role-attention.is-analysis{border-color:#c9e4da;background:#f1f9f5;color:#315e51}.role-attention-icon{width:32px;height:32px;border-radius:6px;background:#fff0d6;color:#ae7731;display:grid;place-items:center;flex:0 0 auto}.role-attention.is-analysis .role-attention-icon{background:#dff1e9;color:#147d72}.role-attention-icon svg{width:17px;height:17px}.role-attention-copy{min-width:0;flex:1}.role-attention-title{display:flex;align-items:center;gap:8px;min-width:0}.role-attention-title h3{font-size:12px;font-weight:650;color:inherit}.role-attention-title span{padding:2px 6px;border-radius:3px;background:#fbeccf;color:#9a6825;font-size:9px;line-height:1.35;white-space:nowrap}.role-attention.is-analysis .role-attention-title span{background:#d9eee5;color:#307a65}.role-attention-copy p{margin-top:4px;font-size:10px;line-height:1.65;color:#8a7860}.role-attention.is-analysis .role-attention-copy p{color:#67867b}.role-attention-actions{display:flex;align-items:center;flex:0 0 auto}.role-attention-action{min-height:31px;padding:7px 10px;font-size:10px}.role-attention-action svg{width:14px;height:14px}@media(max-width:760px){.role-attention{align-items:flex-start;flex-wrap:wrap;margin:12px 12px 8px;padding:12px}.role-attention-copy{min-width:calc(100% - 45px)}.role-attention-actions{width:100%;padding-left:45px}.role-attention-action{width:100%}}
+.extraction-body{background:#fcfefd}.extraction-status{display:flex;align-items:center;gap:8px;margin:-3px 0 13px}.extraction-issues{display:grid;gap:6px;padding:12px 13px;border:1px solid #f0d4ca;background:#fff5f1;color:#9a6154;font-size:10px;line-height:1.6;border-radius:6px}.extraction-issues b{font-size:10px}.extraction-fact{padding:12px 0}.extraction-fact:first-of-type{border-top:1px solid var(--line)}.fact-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.fact-head b{margin:0}.fact-head span{font-size:9px;color:#819a8a;background:#eef6f0;padding:2px 5px;border-radius:3px;white-space:nowrap}.extraction-fact p{font-size:11px;line-height:1.75;color:#698071;margin:0 0 7px}.extraction-fact small{display:block;color:#98a79e;font-size:9px;line-height:1.55;margin-top:3px}.empty-extraction{padding:18px 0;color:#94a69a;font-size:11px}.extraction-actions{display:flex;justify-content:flex-end;margin-top:12px}

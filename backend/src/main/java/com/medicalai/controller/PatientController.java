@@ -15,12 +15,12 @@ public class PatientController {
     public PatientController(PatientService service) { this.service=service; }
 
     @GetMapping
-    public List<PatientVO> list(@RequestParam(defaultValue="") String keyword) {
+    public List<PatientVO> list(@RequestParam(name = "keyword", defaultValue = "") String keyword) {
         return service.list(keyword);
     }
 
     @GetMapping("/{id}")
-    public PatientVO get(@PathVariable UUID id) { return service.get(id); }
+    public PatientVO get(@PathVariable("id") UUID id) { return service.get(id); }
 
     @PostMapping
     public PatientVO create(@Valid @RequestBody CreatePatientRequest request,

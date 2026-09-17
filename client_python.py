@@ -4,16 +4,16 @@
 Supports real-time microphone recording and audio file streaming.
 
 Usage:
-    # Microphone mode
+    # 麦克风模式
     python client_python.py --server ws://localhost:10095 --mic
 
-    # File mode
+    # 文件模式
     python client_python.py --server ws://localhost:10095 --file audio.wav
 
-    # With hotwords
+    # 指定热词
     python client_python.py --server ws://localhost:10095 --file audio.wav --hotwords "张三,李四,北京"
 
-    # Disable speaker diarization display
+    # 关闭说话人分离结果展示
     python client_python.py --server ws://localhost:10095 --mic --no-spk
 """
 

@@ -35,7 +35,7 @@ public class PatientMapper {
         return jdbc.query("SELECT * FROM patient WHERE id=? AND status='ACTIVE'", ROW, id).stream().findFirst();
     }
 
-    /** Locks the patient while a new visit is created, preventing duplicate workflows. */
+    /** 创建新接诊时锁定患者，避免产生重复工作流。 */
     public Optional<Patient> findByIdForUpdate(UUID id) {
         return jdbc.query("SELECT * FROM patient WHERE id=? AND status='ACTIVE' FOR UPDATE", ROW, id)
                 .stream().findFirst();

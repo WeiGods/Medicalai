@@ -10,7 +10,7 @@ import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.Map;
 
-/** Sanitizes provider payloads before they are retained for backend-only audit. */
+/** 在服务商响应留存为仅后端可见的审计数据前执行脱敏。 */
 public final class AsrRawResponse {
     private AsrRawResponse() {}
 

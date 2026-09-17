@@ -5,7 +5,7 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
-/** Patient details entered by a doctor when no directory record is available. */
+/** 无可用患者目录记录时由医生录入的患者信息。 */
 public record CreatePatientRequest(
         @NotBlank(message = "请输入患者姓名")
         @Size(max = 128, message = "患者姓名不能超过128个字符") String name,

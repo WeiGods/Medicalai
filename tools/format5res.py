@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/python
-# Author: Mengze Chen
+# 作者：Mengze Chen
 
 import re
 import sys

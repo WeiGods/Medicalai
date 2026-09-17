@@ -23,31 +23,31 @@ public class MedicalRecordController {
     public MedicalRecordController(ClinicalWorkflowService service) { this.service = service; }
 
     @GetMapping("/medical-record")
-    public MedicalRecordVO get(@PathVariable UUID visitId,
+    public MedicalRecordVO get(@PathVariable("visitId") UUID visitId,
                                @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.medicalRecord(visitId, current.doctor().id());
     }
 
     @PostMapping("/medical-record/generate")
-    public MedicalRecordVO generate(@PathVariable UUID visitId,
+    public MedicalRecordVO generate(@PathVariable("visitId") UUID visitId,
                                     @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.generate(visitId, current.doctor().id());
     }
 
     @PutMapping("/medical-record")
-    public MedicalRecordVO save(@PathVariable UUID visitId, @Valid @RequestBody SaveMedicalRecordRequest request,
+    public MedicalRecordVO save(@PathVariable("visitId") UUID visitId, @Valid @RequestBody SaveMedicalRecordRequest request,
                                 @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.saveDraft(visitId, current.doctor().id(), request);
     }
 
     @PostMapping("/medical-record/edit")
-    public MedicalRecordVO edit(@PathVariable UUID visitId,
+    public MedicalRecordVO edit(@PathVariable("visitId") UUID visitId,
                                 @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.editConfirmed(visitId, current.doctor().id());
     }
 
     @PostMapping("/medical-record/confirm")
-    public MedicalRecordVO confirm(@PathVariable UUID visitId, @Valid @RequestBody ConfirmMedicalRecordRequest request,
+    public MedicalRecordVO confirm(@PathVariable("visitId") UUID visitId, @Valid @RequestBody ConfirmMedicalRecordRequest request,
                                    HttpServletRequest request2,
                                    @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         String ip = request2.getHeader("X-Forwarded-For");
@@ -56,21 +56,21 @@ public class MedicalRecordController {
     }
 
     @GetMapping("/confirmations")
-    public List<ConfirmationVO> confirmations(@PathVariable UUID visitId,
+    public List<ConfirmationVO> confirmations(@PathVariable("visitId") UUID visitId,
                                               @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.confirmations(visitId, current.doctor().id());
     }
 
     @PostMapping("/exports")
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public List<RecordExportVO> export(@PathVariable UUID visitId,
+    public List<RecordExportVO> export(@PathVariable("visitId") UUID visitId,
                                        @Valid @RequestBody ExportMedicalRecordRequest request,
                                        @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.recordExport(visitId, current.doctor().id(), request);
     }
 
     @GetMapping("/exports")
-    public List<RecordExportVO> exports(@PathVariable UUID visitId,
+    public List<RecordExportVO> exports(@PathVariable("visitId") UUID visitId,
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.exports(visitId, current.doctor().id());
     }

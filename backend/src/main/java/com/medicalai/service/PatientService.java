@@ -65,7 +65,7 @@ public class PatientService {
         if (value == null) return null;
         String normalized = value.strip();
         if (normalized.isBlank()) return null;
-        // Preserve a value that was already masked by an upstream system.
+        // 保留上游系统已完成脱敏的值。
         if (normalized.indexOf('*') >= 0 || normalized.indexOf('X') >= 0 || normalized.indexOf('x') >= 0) {
             return normalized;
         }

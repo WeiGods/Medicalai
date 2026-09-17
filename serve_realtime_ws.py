@@ -119,8 +119,8 @@ class HybridSpeakerTracker:
         spk_res = self.spk_model.generate(input=speech_list, cache={}, is_final=True)
         embeddings = torch.cat([r["spk_embedding"] for r in spk_res], dim=0).detach().cpu()
         for chunk, embedding in zip(chunks, embeddings):
-            # Speaker post-processing only needs timestamps after embedding extraction.
-            # Do not retain NumPy views into the session audio buffer.
+            # 提取嵌入后，说话人后处理仅需要时间戳。
+            # 不保留指向会话音频缓冲区的 NumPy 视图。
             self.all_chunks.append((float(chunk[0]), float(chunk[1])))
             self.all_embeddings.append(embedding.clone())
 
@@ -175,7 +175,7 @@ class HybridSpeakerTracker:
                 matched = True
                 created = True
             elif best_id is None:
-                # There can be more active clusters than the configured identity cap.
+                # 活跃聚类数可能超过配置的身份数量上限。
                 if not self.speaker_centers:
                     best_id = 0
                 else:
@@ -379,7 +379,7 @@ class RealtimeASRSession:
         keep_from = min(self.total_samples, max(self.audio_buffer_start_sample, keep_from))
         drop_samples = keep_from - self.audio_buffer_start_sample
         if drop_samples > 0:
-            # A copy releases the discarded backing array instead of retaining a view.
+            # 复制数据以释放被丢弃的底层数组，避免继续保留视图。
             self.audio_buffer = self.audio_buffer[drop_samples:].copy()
             self.audio_buffer_start_sample = keep_from
 

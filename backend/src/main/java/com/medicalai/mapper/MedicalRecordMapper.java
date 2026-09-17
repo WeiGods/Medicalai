@@ -26,9 +26,8 @@ public class MedicalRecordMapper {
     }
 
     public String status(UUID visitId) {
-        // A transcript can be edited before a medical record is generated.  In
-        // that state no medical_record row exists yet, which means "not
-        // confirmed" rather than a database failure.
+        // 转写可在病历生成前编辑。此时尚不存在 medical_record 记录，应视为“未确认”，
+        // 而非数据库故障。
         return jdbc.query("SELECT r.status FROM medical_record r WHERE r.visit_id=?", (rs, n) -> rs.getString("status"), visitId)
                 .stream().findFirst().orElse("DRAFT");
     }
@@ -195,6 +194,18 @@ public class MedicalRecordMapper {
                 UPDATE ai_job SET status='SUCCEEDED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=NULL
                 WHERE id=? AND result_ref=?
                 """, jobId, exportId);
+    }
+
+    /**
+     * 历史记录可能因部署清理或旧下载链路误读存储位置而丢失本地导出文件。
+     * 不能继续保留 SUCCEEDED，否则前端会永久复用一个无法下载的导出记录。
+     */
+    public void markExportFileMissing(UUID exportId) {
+        jdbc.update("""
+                UPDATE record_export
+                SET status='FAILED',object_key=NULL,error_message='导出文件不存在，请重新导出'
+                WHERE id=? AND status='SUCCEEDED'
+                """, exportId);
     }
 
     public void markExportFailed(UUID exportId, UUID jobId, int attempt, String error) {

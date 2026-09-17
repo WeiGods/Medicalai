@@ -104,7 +104,7 @@ public class VisitMapper {
                 """,ROW,status,status,status,status,doctorId,id,doctorId);
     }
 
-    /** Deletes every persisted artifact of one cancelled visit in FK-safe order. */
+    /** 按外键安全顺序删除一次已取消接诊的全部持久化产物。 */
     public void deleteCancelledVisit(UUID visitId, UUID doctorId) {
         jdbc.update("DELETE FROM audit_log WHERE visit_id=?", visitId);
         jdbc.update("DELETE FROM ai_job WHERE visit_id=?", visitId);
@@ -121,6 +121,13 @@ public class VisitMapper {
                 WHERE v.record_id=r.id AND r.visit_id=?
                 """, visitId);
         jdbc.update("DELETE FROM medical_record WHERE visit_id=?", visitId);
+        // 提取版本以快照作为证据来源。取消接诊会清空整份问诊数据，必须先删除该引用，
+        // 否则删除 dialogue_snapshot 时会触发外键保护，造成取消操作整体回滚。
+        jdbc.update("""
+                DELETE FROM clinical_extraction_version v USING clinical_extraction e
+                WHERE v.extraction_id=e.id AND e.visit_id=?
+                """, visitId);
+        jdbc.update("DELETE FROM clinical_extraction WHERE visit_id=?", visitId);
         jdbc.update("DELETE FROM visit_transcript WHERE visit_id=?", visitId);
         jdbc.update("""
                 DELETE FROM dialogue_snapshot_source s USING dialogue_snapshot d

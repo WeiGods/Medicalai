@@ -23,7 +23,8 @@ public class RecordingMapper {
             rs.getString("result_type"), rs.getString("text"), rs.getString("role"),
             rs.getLong("start_ms"), rs.getLong("end_ms"), rs.getBoolean("is_current"),
             DatabaseDateTime.getInstant(rs, "created_at"), rs.getObject("speaker_id", Integer.class),
-            rs.getString("role_source"), rs.getObject("role_confidence", Integer.class));
+            rs.getString("role_source"), rs.getObject("role_confidence", Integer.class),
+            rs.getString("role_provider_route"));
 
     private final JdbcTemplate jdbc;
     public RecordingMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
@@ -106,7 +107,7 @@ public class RecordingMapper {
         return jobs.stream().findFirst();
     }
 
-    /** Called inside a short transaction before any job or result mutation. */
+    /** 在短事务内、变更任务或结果之前调用。 */
     public boolean lockAsrLease(UUID jobId, UUID token) {
         return !jdbc.queryForList("""
                 SELECT id FROM ai_job WHERE id=? AND lease_token=?
@@ -129,8 +130,7 @@ public class RecordingMapper {
         jdbc.queryForList("SELECT id FROM visit WHERE id=? FOR UPDATE", visitId);
     }
 
-    // Mutators below require lockAsrLease in the SAME transaction. Holding that
-    // row lock prevents a newer lease owner from being installed before commit.
+    // 以下变更方法必须与 lockAsrLease 处于同一事务；持有行锁可阻止新租约持有者在提交前写入。
     public void beginAsrRecording(UUID jobId, UUID recordingId, String provider) {
         jdbc.update("""
                 UPDATE ai_job SET status='RUNNING',recording_id=?,started_at=medicalai_local_now(),
@@ -146,7 +146,7 @@ public class RecordingMapper {
                 """, providerTaskId, jobId, recordingId);
     }
 
-    /** Makes failed jobs, and pre-fix orphaned PROCESSING rows, eligible for an explicit retry. */
+    /** 使失败任务及修复前遗留的孤立 PROCESSING 记录能够显式重试。 */
     public void requeueRetryableRecordings(UUID visitId) {
         jdbc.update("""
                 UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,updated_at=medicalai_local_now()
@@ -225,10 +225,11 @@ public class RecordingMapper {
             ids.add(id);
             jdbc.update("""
                     INSERT INTO asr_utterance(id,visit_id,recording_id,session_id,utterance_id,revision,result_type,
-                                              text,role,speaker_id,role_source,role_confidence,start_ms,end_ms,is_current)
-                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,?,?,?,?,true)
+                                              text,role,speaker_id,role_source,role_confidence,role_provider_route,start_ms,end_ms,is_current)
+                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,?,?,?,?,?,true)
                     """, id, visitId, recordingId, sessionId, "u-" + (i + 1), 0,
-                    t.text(), t.role(), t.speakerId(), t.roleSource(), t.roleConfidence(), t.startMs(), t.endMs());
+                    t.text(), t.role(), t.speakerId(), t.roleSource(), t.roleConfidence(), t.roleProviderRoute(),
+                    t.startMs(), t.endMs());
         }
         return ids;
     }
@@ -249,15 +250,13 @@ public class RecordingMapper {
         return snapshotId;
     }
 
-    /** Create a new adopted snapshot from doctor-edited transcript text. */
+    /** 根据医生编辑后的转写文本创建新的已采纳快照。 */
     public UUID createEditedSnapshot(UUID visitId, DialogueSnapshot base, List<Turn> turns,
                                      String snapshotHash, UUID doctorId) {
         Optional<UUID> existing = snapshotIdByHash(visitId, snapshotHash);
         if (existing.isPresent()) {
             UUID snapshotId = existing.get();
-            // A role-source-only change (for example OTHER -> MANUAL) leaves the
-            // immutable dialogue content unchanged. Re-adopt its content snapshot
-            // instead of attempting to insert the same globally unique hash.
+            // 哈希包含全部冻结字段；命中时表示文本、角色、时间及角色元数据均未变化，可安全重新采纳。
             jdbc.update("""
                     UPDATE dialogue_snapshot
                     SET authority_status=CASE WHEN id=? THEN 'ADOPTED' ELSE 'SUPERSEDED' END
@@ -300,6 +299,24 @@ public class RecordingMapper {
         return latestSnapshot(visitId);
     }
 
+    /** 返回快照固化的句段 JSON，结构化提取不能使用可变的展示文本替代它。 */
+    public Optional<String> snapshotTurnsJson(UUID snapshotId) {
+        return jdbc.query("SELECT turns_json::text FROM dialogue_snapshot WHERE id=?",
+                (rs, n) -> rs.getString(1), snapshotId).stream().findFirst();
+    }
+
+    /** 快照来源表是路由唯一可信来源，编辑快照复制来源表后仍可保持同一处理边界。 */
+    public List<String> snapshotAsrRoutes(UUID snapshotId) {
+        return jdbc.query("""
+                SELECT DISTINCT COALESCE(r.asr_route,'')
+                FROM dialogue_snapshot_source source
+                JOIN asr_utterance utterance ON utterance.id=source.utterance_id
+                JOIN recording r ON r.id=utterance.recording_id
+                WHERE source.snapshot_id=?
+                ORDER BY 1
+                """, (rs, n) -> rs.getString(1), snapshotId);
+    }
+
     public Optional<Utterance> firstUtterance(UUID sessionId) {
         return jdbc.query("SELECT * FROM asr_utterance WHERE session_id=? ORDER BY start_ms LIMIT 1",
                 UTTERANCE, sessionId).stream().findFirst();
@@ -317,20 +334,21 @@ public class RecordingMapper {
     public boolean updateRole(UUID visitId, UUID utteranceId, String role) {
         return jdbc.update("""
                 UPDATE asr_utterance
-                SET role=?, role_source='MANUAL', role_confidence=NULL
+                SET role=?, role_source='MANUAL', role_confidence=NULL, role_provider_route='MANUAL'
                 WHERE id=? AND visit_id=?
                 """, role, utteranceId, visitId) == 1;
     }
 
-    /** Applies a complete LLM reclassification without ever overwriting a clinician decision. */
+    /** 应用完整的 LLM 重新分类结果，且绝不覆盖医生的人工决定。 */
     public int updateRoleAssignments(UUID visitId, List<RoleUpdate> updates) {
         int updated = 0;
         for (RoleUpdate update : updates) {
             updated += jdbc.update("""
                     UPDATE asr_utterance
-                    SET role=?, role_source=?, role_confidence=?
+                    SET role=?, role_source=?, role_confidence=?, role_provider_route=?
                     WHERE id=? AND visit_id=? AND role_source <> 'MANUAL'
-                    """, update.role(), update.source(), update.confidence(), update.utteranceId(), visitId);
+                    """, update.role(), update.source(), update.confidence(), update.providerRoute(),
+                    update.utteranceId(), visitId);
         }
         return updated;
     }
@@ -365,26 +383,60 @@ public class RecordingMapper {
         for (int i = 0; i < turns.size(); i++) {
             Turn t = turns.get(i);
             if (i > 0) json.append(',');
+            // 角色来源和置信度与文本一起冻结，确保之后的提取能判断该快照是否可安全使用。
             json.append("{\"role\":\"").append(escape(t.role())).append("\",\"text\":\"").append(escape(t.text()))
-                    .append("\",\"startMs\":").append(t.startMs()).append(",\"endMs\":").append(t.endMs()).append(",\"speaker_id\":").append(t.speakerId()).append('}');
+                    .append("\",\"startMs\":").append(t.startMs()).append(",\"endMs\":").append(t.endMs())
+                    .append(",\"speaker_id\":").append(t.speakerId())
+                    .append(",\"role_source\":\"").append(escape(t.roleSource())).append("\"")
+                    .append(",\"role_confidence\":").append(t.roleConfidence())
+                    .append(",\"role_provider_route\":\"").append(escape(t.roleProviderRoute())).append("\"}");
         }
         return json.append(']').toString();
     }
 
     private String escape(String value) {
-        return String.valueOf(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "");
+        String source = String.valueOf(value);
+        StringBuilder escaped = new StringBuilder(source.length() + 16);
+        for (int index = 0; index < source.length(); index++) {
+            char character = source.charAt(index);
+            switch (character) {
+                case '\\' -> escaped.append("\\\\");
+                case '"' -> escaped.append("\\\"");
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                case '\b' -> escaped.append("\\b");
+                case '\f' -> escaped.append("\\f");
+                default -> {
+                    if (character < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) character));
+                    } else {
+                        escaped.append(character);
+                    }
+                }
+            }
+        }
+        return escaped.toString();
     }
 
     public record Turn(String role, String text, long startMs, long endMs, Integer speakerId,
-                       String roleSource, Integer roleConfidence) {
+                       String roleSource, Integer roleConfidence, String roleProviderRoute) {
+        public Turn(String role, String text, long startMs, long endMs, Integer speakerId,
+                    String roleSource, Integer roleConfidence) {
+            this(role, text, startMs, endMs, speakerId, roleSource, roleConfidence, "UNKNOWN");
+        }
         public Turn(String role, String text, long startMs, long endMs, Integer speakerId) {
-            this(role, text, startMs, endMs, speakerId, "AUTO", null);
+            this(role, text, startMs, endMs, speakerId, "AUTO", null, "UNKNOWN");
         }
         public Turn(String role, String text, long startMs, long endMs) {
-            this(role, text, startMs, endMs, null, "AUTO", null);
+            this(role, text, startMs, endMs, null, "AUTO", null, "UNKNOWN");
         }
     }
-    public record RoleUpdate(UUID utteranceId, String role, String source, Integer confidence) {}
+    public record RoleUpdate(UUID utteranceId, String role, String source, Integer confidence, String providerRoute) {
+        public RoleUpdate(UUID utteranceId, String role, String source, Integer confidence) {
+            this(utteranceId, role, source, confidence, "UNKNOWN");
+        }
+    }
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
     public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
                          int attemptCount, String lastError, Instant startedAt, String providerRoute) {}

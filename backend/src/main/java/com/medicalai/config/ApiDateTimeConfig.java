@@ -17,7 +17,7 @@ public class ApiDateTimeConfig {
     private static final DateTimeFormatter API_DATE_TIME_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(API_TIME_ZONE);
 
-    /** Keep API timestamps human-readable while persistence continues to use instants. */
+    /** 保持 API 时间戳可读，同时持久化层仍使用瞬时时间。 */
     @Bean
     public Jackson2ObjectMapperBuilderCustomizer apiDateTimeCustomizer() {
         return builder -> builder.serializerByType(Instant.class, new JsonSerializer<Instant>() {

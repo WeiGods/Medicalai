@@ -18,7 +18,7 @@ import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.web.MockMultipartFile;
 
-/** Opt-in live verification; creates and deletes only a unique test recording. */
+/** 按需执行的在线验证，仅创建和删除唯一的测试录音。 */
 @EnabledIfEnvironmentVariable(named = "RUN_MINIO_INTEGRATION_TEST", matches = "true")
 class AudioStorageIntegrationTest {
     @TempDir java.nio.file.Path localRoot;
@@ -38,7 +38,7 @@ class AudioStorageIntegrationTest {
                 env.getProperty("medicalai.minio.presign-expiry-seconds", Integer.class, 900),
                 localRoot.toString());
         UUID visit = UUID.randomUUID();
-        // One second of synthetic PCM silence; no patient data is used.
+        // 一秒合成 PCM 静音数据，不使用任何患者数据。
         byte[] audio = ByteBuffer.allocate(32044).order(ByteOrder.LITTLE_ENDIAN)
                 .put("RIFF".getBytes(java.nio.charset.StandardCharsets.US_ASCII)).putInt(32036)
                 .put("WAVEfmt ".getBytes(java.nio.charset.StandardCharsets.US_ASCII)).putInt(16)

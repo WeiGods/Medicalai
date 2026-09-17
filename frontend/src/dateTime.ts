@@ -5,7 +5,7 @@ const formatter = new Intl.DateTimeFormat('en-GB', {
 
 const apiDateTimePattern = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
 
-/** Display instants in Beijing time, independent of the browser's timezone. */
+/** 不受浏览器时区影响，统一以北京时间展示瞬时时间。 */
 export function formatDateTime(value: string | Date | null | undefined): string {
   if (!value) return ''
   if (typeof value === 'string' && apiDateTimePattern.test(value)) return value

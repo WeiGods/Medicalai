@@ -64,8 +64,11 @@ export interface Utterance {
   end_ms: number
   role_source?: 'AUTO' | 'LLM' | 'FALLBACK' | 'MANUAL' | 'UNKNOWN' | string
   role_confidence?: number | null
+  role_provider_route?: string | null
   role_review_required?: boolean
 }
+
+export type LlmProvider = 'DASHSCOPE' | 'LOCAL'
 
 export interface Transcript {
   snapshot_id: string | null
@@ -76,6 +79,39 @@ export interface Transcript {
   edited: boolean
   source_dirty: boolean
   turns: Utterance[]
+  source_route: 'DASHSCOPE' | 'LOCAL' | 'MIXED' | 'UNKNOWN' | string
+  available_routes: LlmProvider[]
+  route_selection_required: boolean
+}
+
+export interface ClinicalEvidence {
+  turn_index: number
+  start_ms: number
+  end_ms: number
+  role: 'DOCTOR' | 'PATIENT' | string
+  quote: string
+}
+
+export interface ClinicalFact {
+  value: string | null
+  confidence: number | null
+  evidence: ClinicalEvidence[]
+}
+
+export interface ClinicalExtraction {
+  extraction_id: string | null
+  version_no: number
+  status: 'PENDING' | 'GENERATED' | 'CONFIRMED' | 'FAILED' | 'STALE' | string
+  snapshot_id: string | null
+  snapshot_hash: string | null
+  fields: Record<string, ClinicalFact>
+  quality_issues: string[]
+  generated_at: string | null
+  confirmed_at: string | null
+  provider_route: LlmProvider | null
+  source_route: 'DASHSCOPE' | 'LOCAL' | 'MIXED' | 'UNKNOWN' | string
+  available_routes: LlmProvider[]
+  route_selection_required: boolean
 }
 
 export type AsrProvider = 'DASHSCOPE' | 'LOCAL'

@@ -51,9 +51,8 @@ def configure_open_jtalk_dict(dict_dir):
     if not (dict_path / "sys.dic").is_file():
         raise RuntimeError(f"OpenJTalk dictionary is missing sys.dic: {dict_path}")
 
-    # Do not mutate OPEN_JTALK_DICT_DIR or _global_jtalk. The package caches its
-    # global frontend after the first g2p call, so changing the global path can
-    # silently leave a previously initialized dictionary in use.
+    # 不要修改 OPEN_JTALK_DICT_DIR 或 _global_jtalk。该包会在首次 g2p 调用后缓存全局前端，
+    # 修改全局路径可能导致已初始化的词典在无提示的情况下继续被使用。
     return pyopenjtalk.OpenJTalk(dn_mecab=str(dict_path).encode("utf-8"))
 
 
@@ -124,7 +123,7 @@ def normalize_text(
             text = re.sub(r"=", " ", text)
             text = re.sub(r"\(", " ", text)
             text = re.sub(r"\)", " ", text)
-            # From Chongjia Ni
+            # 来源：Chongjia Ni
             if kana:
                 text = safe_ja_g2p(
                     text,

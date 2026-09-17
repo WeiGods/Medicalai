@@ -57,7 +57,34 @@ class DashScopeRoleClientTest {
         assertEquals(Map.of(0,new DashScopeRoleClient.RoleAssignment("OTHER",null,"FALLBACK")),
                 new DashScopeRoleClient(new ObjectMapper(),endpoint,"test-key","qwen-plus",70,40)
                         .assignRoles(List.of(Map.of("index",0,"speaker_id",0,"text","嗯"))));
+        assertEquals(1, requests.get());
+    }
+
+    @Test void retriesRateLimitThenUsesTheSuccessfulResponse() throws Exception {
+        var mapper = new ObjectMapper();
+        var requests = new AtomicInteger();
+        server.createContext("/compatible-mode/v1/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            if (requests.incrementAndGet() == 1) {
+                exchange.sendResponseHeaders(429, -1);
+                exchange.close();
+                return;
+            }
+            String content = mapper.writeValueAsString(Map.of("items", List.of(
+                    Map.of("index", 0, "role", "DOCTOR", "confidence", 90))));
+            byte[] output = mapper.writeValueAsBytes(Map.of(
+                    "choices", List.of(Map.of("message", Map.of("content", content)))));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, output.length);
+            exchange.getResponseBody().write(output);
+            exchange.close();
+        });
+
+        var result = new DashScopeRoleClient(mapper, endpoint, "test-key", "qwen-plus", 70, 40)
+                .assignRoles(List.of(Map.of("index", 0, "speaker_id", 0, "text", "哪里不舒服")));
+
         assertEquals(2, requests.get());
+        assertEquals(new DashScopeRoleClient.RoleAssignment("DOCTOR", 90, "LLM"), result.get(0));
     }
 
     @Test void batchesLargeRoleRequestsSoOneResponseCannotInvalidateTheWholeRecording() throws Exception {

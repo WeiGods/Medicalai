@@ -7,11 +7,8 @@ import com.medicalai.dto.*;
 import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.*;
 import com.medicalai.vo.*;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.*;
 import java.util.*;
-import java.util.HexFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -19,6 +16,23 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
+/**
+ * 临床工作流服务。
+ *
+ * 录音上传、转写与角色 LLM 主链路如下：
+ *
+ *
+ *    客户端调用 {@code POST /api/v1/visits/{visitId}/recordings} 上传录音。
+ *    校验录音后写入对象存储，并创建状态为 {@code UPLOADED} 的录音记录。
+ *    客户端调用 {@code POST /api/v1/visits/{visitId}/recordings/transcribe} 选择公网或本地 ASR。
+ *    校验配置和待转写录音后创建 {@code PENDING} ASR 任务，由定时工作线程异步处理。
+ *    工作线程领取任务并持有租约，将本次录音状态改为 {@code PROCESSING}。
+ *    本地路由同步调用本地 ASR；公网路由提交 DashScope 异步任务。
+ *    公网路由轮询 DashScope；任务成功后下载并解析最终转写句段。
+ *    将句段文本、时间和声学说话人编号发送给角色 LLM，得到医生、患者或其他人及置信度。
+ *    在短事务中脱敏保存原始响应、写入句段和对话快照，并更新录音与任务状态。
+ *
+ */
 @Service
 public class ClinicalWorkflowService {
     private static final Logger LOG = LoggerFactory.getLogger(ClinicalWorkflowService.class);
@@ -28,11 +42,13 @@ public class ClinicalWorkflowService {
     private final DoctorMapper doctors;
     private final RecordingMapper recordings;
     private final MedicalRecordMapper records;
+    private final ClinicalExtractionService extractions;
     private final AiServiceClient ai;
     private final AudioStorageService storage;
     private final ObjectMapper objectMapper;
     private final Clock clock;
-    private final DashScopeRoleClient roleClient;
+    private final LlmRouteResolver routes;
+    private final LlmRoleRouter roleRouter;
     private final TranscriptRoleReclassificationStore roleReclassificationStore;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
@@ -40,20 +56,41 @@ public class ClinicalWorkflowService {
     private String dashscopeApiKey;
 
     public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
-                                   MedicalRecordMapper records, AiServiceClient ai, AudioStorageService storage,
-                                   ObjectMapper objectMapper, Clock clock, DashScopeRoleClient roleClient,
+                                   MedicalRecordMapper records, ClinicalExtractionService extractions, AiServiceClient ai,
+                                   AudioStorageService storage, ObjectMapper objectMapper, Clock clock, DashScopeRoleClient roleClient,
                                    TranscriptRoleReclassificationStore roleReclassificationStore) {
+        this(visits, patients, doctors, recordings, records, extractions, ai, storage, objectMapper, clock,
+                roleReclassificationStore, new LlmRouteResolver(recordings), new LlmRoleRouter(roleClient, ai));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
+                                   MedicalRecordMapper records, ClinicalExtractionService extractions, AiServiceClient ai,
+                                   AudioStorageService storage, ObjectMapper objectMapper, Clock clock,
+                                   TranscriptRoleReclassificationStore roleReclassificationStore,
+                                   LlmRouteResolver routes, LlmRoleRouter roleRouter) {
         this.visits = visits;
         this.patients = patients;
         this.doctors = doctors;
         this.recordings = recordings;
         this.records = records;
+        this.extractions = extractions;
         this.ai = ai;
         this.storage = storage;
         this.objectMapper = objectMapper;
         this.clock = clock;
-        this.roleClient = roleClient;
         this.roleReclassificationStore = roleReclassificationStore;
+        this.routes = routes;
+        this.roleRouter = roleRouter;
+    }
+
+    /** 保留既有单元测试和旧组装代码的构造方式；运行时始终注入完整的提取服务。 */
+    public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
+                                   MedicalRecordMapper records, AiServiceClient ai, AudioStorageService storage,
+                                   ObjectMapper objectMapper, Clock clock, DashScopeRoleClient roleClient,
+                                   TranscriptRoleReclassificationStore roleReclassificationStore) {
+        this(visits, patients, doctors, recordings, records, null, ai, storage, objectMapper, clock,
+                roleClient, roleReclassificationStore);
     }
 
     @Transactional
@@ -64,6 +101,7 @@ public class ClinicalWorkflowService {
 
     @Transactional
     public RecordingVO upload(UUID visitId, UUID doctorId, MultipartFile file, Long durationMs) {
+        // 步骤 1：接收录音上传请求，并校验接诊归属、接诊状态、病历可编辑性及录音基本信息。
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
@@ -76,16 +114,19 @@ public class ClinicalWorkflowService {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "AUDIO_TOO_LARGE", "录音文件不能超过 200MB");
         }
         UUID id = UUID.randomUUID();
+        // 步骤 2：保存录音到对象存储，创建 UPLOADED 状态的录音记录并记录审计日志。
         String objectKey = storage.save(file, visit.id().toString(), id.toString());
         Recording recording = recordings.insert(new Recording(id, visit.id(), nextRecordingNo(visit.id()),
                 "UPLOAD", objectKey, name, file.getContentType(), file.getSize(),
                 durationMs == null || durationMs < 0 ? null : durationMs, "UPLOADED", null, Instant.now(clock)));
+        invalidateClinicalExtraction(visit.id());
         records.audit(doctorId, visit.id(), "RECORDING_UPLOADED", id);
         return RecordingVO.from(recording);
     }
 
     @Transactional(noRollbackFor = BusinessException.class)
     public AsrJobVO transcribe(UUID visitId, UUID doctorId, String provider) {
+        // 步骤 3：接收转写请求，校验接诊状态、任务幂等性和所选 ASR 路由的运行条件。
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
@@ -96,12 +137,12 @@ public class ClinicalWorkflowService {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
         recordings.requeueRetryableRecordings(visit.id());
-        // Recover stale PROCESSING rows before validating storage credentials
-        // so failed submissions leave recordings in a retryable state.
+        // 先恢复过期的 PROCESSING 记录，再校验存储凭据，确保失败提交后的录音可以重试。
         storage.assertAsrSubmissionReady();
         List<Recording> pending = recordings.list(visit.id()).stream()
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
+        // 步骤 4：创建 PENDING ASR 任务；定时工作线程会按任务路由异步领取并处理。
         UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider));
         return asrJob(visitId, doctorId, jobId);
     }
@@ -133,8 +174,47 @@ public class ClinicalWorkflowService {
         String text = state.map(RecordingMapper.TurnState::transcript).orElse("");
         boolean edited = state.map(RecordingMapper.TurnState::edited).orElse(false);
         boolean dirty = state.isPresent() && !state.get().snapshotId().equals(snapshot.get().id());
+        LlmRouting routing = routes.routing(snapshot.get());
         return new TranscriptVO(snapshot.get().id().toString(), snapshot.get().snapshotVersion(),
-                snapshot.get().snapshotHash(), snapshot.get().authorityStatus(), text, edited, dirty, turns);
+                snapshot.get().snapshotHash(), snapshot.get().authorityStatus(), text, edited, dirty, turns,
+                routing.sourceRoute().name(), routing.availableRoutes().stream().map(Enum::name).toList(),
+                routing.selectionRequired());
+    }
+
+    @Transactional(readOnly = true)
+    public ClinicalExtractionVO clinicalExtraction(UUID visitId, UUID doctorId) {
+        Visit visit = owned(visitId, doctorId, false);
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElse(null);
+        if (snapshot == null) {
+            return new ClinicalExtractionVO(null, 0, "PENDING", null, null, Map.of(), List.of(), null, null);
+        }
+        return extractionService().current(visit.id(), snapshot);
+    }
+
+    public ClinicalExtractionVO generateClinicalExtraction(UUID visitId, UUID doctorId) {
+        return generateClinicalExtraction(visitId, doctorId, null);
+    }
+
+    public ClinicalExtractionVO generateClinicalExtraction(UUID visitId, UUID doctorId, String requestedProvider) {
+        // 提取会同步等待远程 LLM 返回，不能在这段网络等待期间持有 visit 的 FOR UPDATE 锁。
+        // 否则取消接诊会被无谓阻塞；提取服务不会在远程调用前获取这把接诊行锁。
+        Visit visit = owned(visitId, doctorId, false);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
+                new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
+        // 先在写入提取版本之前校验路由。混合来源未选择时必须返回 409，不能伪装成模型失败。
+        return extractionService().generate(visit.id(), doctorId, snapshot, routes.resolve(snapshot, requestedProvider));
+    }
+
+    @Transactional
+    public ClinicalExtractionVO confirmClinicalExtraction(UUID visitId, UUID doctorId) {
+        Visit visit = owned(visitId, doctorId, true);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
+                new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
+        return extractionService().confirm(visit.id(), doctorId, snapshot);
     }
 
     @Transactional
@@ -156,8 +236,9 @@ public class ClinicalWorkflowService {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "TRANSCRIPT_EMPTY", "转写内容不能为空");
         }
         UUID editedSnapshotId = recordings.createEditedSnapshot(visit.id(), snapshot, editedTurns,
-                snapshotHash(visit.id(), editedTurns), doctorId);
+                DialogueSnapshotHasher.hash(visit.id(), editedTurns), doctorId);
         recordings.saveTranscript(visit.id(), editedSnapshotId, editedText, true);
+        invalidateClinicalExtraction(visit.id());
         records.audit(doctorId, visit.id(), "TRANSCRIPT_EDITED", editedSnapshotId);
         return transcript(visitId, doctorId);
     }
@@ -183,26 +264,32 @@ public class ClinicalWorkflowService {
         if (!recordings.updateRole(visit.id(), utteranceId, request.role())) throw BusinessException.notFound();
         List<RecordingMapper.Turn> turns = currentTurns(visit.id());
         UUID snapshotId = recordings.createEditedSnapshot(visit.id(), snapshot, turns,
-                snapshotHash(visit.id(), turns), doctorId);
+                DialogueSnapshotHasher.hash(visit.id(), turns), doctorId);
         recordings.saveTranscript(visit.id(), snapshotId, transcriptText(turns), true);
+        invalidateClinicalExtraction(visit.id());
         records.audit(doctorId, visit.id(), "TRANSCRIPT_ROLE_UPDATED", utteranceId);
         return transcript(visitId, doctorId);
     }
 
     /**
-     * Applies the current per-turn role model to a completed, older transcript.
-     * The DashScope call deliberately happens outside a database transaction;
-     * the transactional store rechecks all mutable state before it writes.
+     * 将当前逐句角色模型应用到已完成的历史转写。
+     *
+     * <p>模型调用刻意放在数据库事务外，事务性存储会在写入前重新校验所有可变状态。
      */
     public TranscriptVO reclassifyTranscriptRoles(UUID visitId, UUID doctorId) {
+        return reclassifyTranscriptRoles(visitId, doctorId, null);
+    }
+
+    public TranscriptVO reclassifyTranscriptRoles(UUID visitId, UUID doctorId, String requestedProvider) {
         Visit visit = owned(visitId, doctorId, false);
         requireActive(visit);
         requireRecordEditable(visit.id());
         if (isConfirmed(visit.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
         }
-        recordings.latestSnapshot(visit.id())
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
+        LlmRoute route = routes.resolve(snapshot, requestedProvider);
 
         List<Utterance> candidates = currentUtterances(visit.id()).stream()
                 .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
@@ -221,15 +308,16 @@ public class ClinicalWorkflowService {
             inputs.add(input);
         }
 
-        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleClient.assignRoles(inputs);
+        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleRouter.assignRoles(route, inputs);
         List<RecordingMapper.RoleUpdate> updates = new ArrayList<>();
         for (int index = 0; index < candidates.size(); index++) {
             DashScopeRoleClient.RoleAssignment assignment = assignments.get(index);
             if (assignment == null) assignment = new DashScopeRoleClient.RoleAssignment("OTHER", null, "FALLBACK");
             updates.add(new RecordingMapper.RoleUpdate(candidates.get(index).id(), assignment.role(),
-                    assignment.source(), assignment.confidence()));
+                    assignment.source(), assignment.confidence(), route.name()));
         }
-        roleReclassificationStore.apply(visit.id(), doctorId, updates);
+        roleReclassificationStore.apply(visit.id(), doctorId, updates, route);
+        invalidateClinicalExtraction(visit.id());
         return transcript(visitId, doctorId);
     }
 
@@ -249,10 +337,10 @@ public class ClinicalWorkflowService {
         if (!snapshot.id().equals(state.snapshotId())) {
             throw new BusinessException(HttpStatus.CONFLICT, "SOURCE_CHANGED", "转写已更新，请重新确认当前转写后再生成病历");
         }
+        // 病历只能消费医生已确认且哈希匹配的事实，禁止直接把未核对转写交给模型生成。
+        Map<String, ClinicalFactVO> facts = extractionService().requireConfirmedFields(visit.id(), snapshot);
         Patient patient = patient(visit);
-        AiServiceClient.GenerateResponse response = ai.generate(snapshot.snapshotHash(),
-                dialogueForAi(state.transcript()), patientInfo(patient, visit));
-        MedicalRecordContent content = contentFromAi(response.record(), patient, visit, doctorName(doctorId));
+        MedicalRecordContent content = contentFromExtraction(facts, patient, visit, doctorName(doctorId));
         validateContent(content);
         UUID recordId = records.findRecordId(visit.id()).orElseGet(() -> records.createRecord(UUID.randomUUID(), visit.id()));
         int versionNo = records.latestVersion(recordId) + 1;
@@ -406,7 +494,7 @@ public class ClinicalWorkflowService {
         return currentUtterances(visitId).stream()
                 .map(utterance -> new RecordingMapper.Turn(utterance.role(), utterance.text(),
                         utterance.startMs(), utterance.endMs(), utterance.speakerId(),
-                        utterance.roleSource(), utterance.roleConfidence()))
+                        utterance.roleSource(), utterance.roleConfidence(), utterance.roleProviderRoute()))
                 .toList();
     }
 
@@ -431,7 +519,8 @@ public class ClinicalWorkflowService {
             String text = value.replaceFirst("^(医生|患者|其他人|未识别角色|说话人 ?[0-9]+)[：:]\\s*", "").strip();
             if (text.isEmpty()) continue;
             long end = cursor + Math.max(500, text.length() * 120L);
-            turns.add(new RecordingMapper.Turn(role, text, cursor, end));
+            // 全文编辑是医生对文本及行首角色的人工采纳，保存后无需再沿用旧的 ASR 置信度。
+            turns.add(new RecordingMapper.Turn(role, text, cursor, end, null, "MANUAL", null, "MANUAL"));
             cursor = end + 500;
         }
         return turns;
@@ -452,6 +541,28 @@ public class ClinicalWorkflowService {
                 patient.phoneMasked(), string(generated, "chief"), string(generated, "present"),
                 string(generated, "past"), string(generated, "opinion"), string(generated, "medication"),
                 string(generated, "followup"), doctorName, today);
+    }
+
+    private MedicalRecordContent contentFromExtraction(Map<String, ClinicalFactVO> facts, Patient patient,
+                                                       Visit visit, String doctorName) {
+        String present = joinFacts(facts, List.of("onset_course", "symptom_characteristics", "associated_symptoms"));
+        String past = joinFacts(facts, List.of("past_medical_history", "medication_history", "allergy_history",
+                "family_history", "social_history"));
+        return new MedicalRecordContent(patient.name(), patient.gender(),
+                patient.birthDate() == null ? null : Period.between(patient.birthDate(), LocalDate.now(clock)).getYears(),
+                patient.phoneMasked(), factValue(facts, "chief_complaint"), present, past,
+                factValue(facts, "doctor_diagnosis"), factValue(facts, "doctor_medication"),
+                factValue(facts, "doctor_followup"), doctorName, LocalDate.now(clock).toString());
+    }
+
+    private String joinFacts(Map<String, ClinicalFactVO> facts, List<String> keys) {
+        return keys.stream().map(key -> factValue(facts, key)).filter(value -> !value.isBlank())
+                .reduce((left, right) -> left + "；" + right).orElse("");
+    }
+
+    private String factValue(Map<String, ClinicalFactVO> facts, String key) {
+        ClinicalFactVO fact = facts.get(key);
+        return fact == null || fact.value() == null ? "" : fact.value().strip();
     }
 
     private MedicalRecordContent effectiveContent(MedicalRecordVersion version) {
@@ -564,15 +675,6 @@ public class ClinicalWorkflowService {
         return AsrJobWorker.PUBLIC_ROLE_ROUTE.equals(providerRoute) ? "DASHSCOPE" : providerRoute;
     }
 
-    private String snapshotHash(UUID visitId, List<RecordingMapper.Turn> turns) {
-        try {
-            String source = visitId + "|" + turns.stream().map(t -> t.role() + ":" + t.text()).reduce((a, b) -> a + "\n" + b).orElse("");
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(source.getBytes(StandardCharsets.UTF_8)));
-        } catch (Exception e) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "HASH_FAILED", "快照生成失败");
-        }
-    }
-
     private Integer integer(Object value) {
         try { return value == null || String.valueOf(value).isBlank() ? null : Integer.valueOf(String.valueOf(value)); }
         catch (NumberFormatException e) { return null; }
@@ -589,4 +691,13 @@ public class ClinicalWorkflowService {
     }
     private boolean blank(String value) { return value == null || value.isBlank(); }
     private String nullSafe(String value) { return value == null ? "" : value; }
+
+    private void invalidateClinicalExtraction(UUID visitId) {
+        if (extractions != null) extractions.invalidate(visitId);
+    }
+
+    private ClinicalExtractionService extractionService() {
+        if (extractions == null) throw new IllegalStateException("结构化提取服务未注入");
+        return extractions;
+    }
 }
