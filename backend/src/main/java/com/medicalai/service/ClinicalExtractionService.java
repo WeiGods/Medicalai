@@ -123,7 +123,6 @@ public class ClinicalExtractionService {
             ClinicalExtractionMapper.Version saved = extractions.insert(visitId, snapshot.id(), snapshot.snapshotHash(),
                     "GENERATED", json(fields), "[]", route.name(),
                     response.model() == null ? "clinical-extraction" : response.model(), doctorId);
-            records.audit(doctorId, visitId, "CLINICAL_EXTRACTION_GENERATED_" + route.name(), saved.id());
             LOG.info("信息提取完成: visitId={}, snapshotHash={}, route={}, model={}, version={}, fields={}, evidence={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, response.model(), saved.versionNo(),
                     populatedFields(fields), evidenceCount(fields), elapsedMs(startedAt));
@@ -154,7 +153,6 @@ public class ClinicalExtractionService {
         }
         ClinicalExtractionMapper.Version confirmed = extractions.confirm(visitId, snapshot.id(), snapshot.snapshotHash(), doctorId)
                 .orElseThrow(() -> BusinessException.conflict("CLINICAL_EXTRACTION_NOT_CONFIRMABLE", "当前提取结果不可确认，请重新生成"));
-        records.audit(doctorId, visitId, "CLINICAL_EXTRACTION_CONFIRMED", confirmed.id());
         return toVO(confirmed, snapshot, routes.routing(snapshot));
     }
 
@@ -181,7 +179,6 @@ public class ClinicalExtractionService {
                                             LlmRouting routing, LlmRoute route, List<String> issues) {
         ClinicalExtractionMapper.Version saved = extractions.insert(visitId, snapshot.id(), snapshot.snapshotHash(),
                 "FAILED", "{}", json(issues), route.name(), "clinical-extraction", doctorId);
-        records.audit(doctorId, visitId, "CLINICAL_EXTRACTION_FAILED_" + route.name(), saved.id());
         return toVO(saved, snapshot, routing);
     }
 

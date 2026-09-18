@@ -1,8 +1,12 @@
 package com.medicalai.mapper;
 
 import com.medicalai.domain.Doctor;
-import java.util.*;
-import org.springframework.jdbc.core.*;
+import com.medicalai.domain.DoctorRole;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 @Repository
@@ -17,15 +21,27 @@ public class DoctorMapper {
 
     public DoctorMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
 
-    public Doctor upsertDemo(String externalId, String name) {
+    public Doctor upsertDemo(String externalId, String name, DoctorRole role) {
         UUID id = UUID.randomUUID();
-        return jdbc.queryForObject("""
-                INSERT INTO doctor(id, external_system, external_user_id, display_name, department_name)
-                VALUES (?, 'LOCAL_DEMO', ?, ?, '神经内科')
+        jdbc.update("""
+                INSERT INTO doctor(id, external_system, external_user_id, display_name, department_name, role)
+                VALUES (?, 'LOCAL_DEMO', ?, ?, '神经内科', ?)
                 ON CONFLICT (external_system, external_user_id)
-                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=medicalai_local_now()
-                RETURNING *
-                """, ROW, id, externalId, name);
+                DO NOTHING
+                """, id, externalId, name, role.name());
+        return jdbc.query("""
+                SELECT * FROM doctor WHERE external_system='LOCAL_DEMO' AND external_user_id=?
+                """, ROW, externalId).stream().findFirst()
+                .orElseThrow(() -> new IllegalStateException("演示医生账号创建后无法读取"));
+    }
+
+    /** 查询演示环境中的同名账号，角色限制由身份提供方统一处理。 */
+    public List<Doctor> findLocalDemoByDisplayName(String displayName) {
+        return jdbc.query("""
+                SELECT * FROM doctor
+                WHERE external_system='LOCAL_DEMO' AND display_name=?
+                ORDER BY created_at, id
+                """, ROW, displayName);
     }
 
     public void markLogin(UUID id) {

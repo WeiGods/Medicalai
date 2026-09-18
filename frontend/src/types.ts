@@ -22,6 +22,8 @@ export interface Patient {
   phone_masked: string
   id_no_masked: string
   status: string
+  created_by: string | null
+  created_by_name: string | null
 }
 
 export interface Visit {
@@ -38,7 +40,10 @@ export interface Visit {
   chief_complaint: string | null
   version: number
   created_at: string
+  last_activity_at: string
 }
+
+export type DemoRole = 'DOCTOR' | 'DEPARTMENT_HEAD'
 
 export interface Recording {
   id: string
@@ -169,4 +174,30 @@ export interface RecordExport {
   status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | string
   doctor_name: string
   created_at: string
+}
+
+export type AuditAction = 'LOGIN' | 'RECORDING_UPLOADED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
+
+export interface AuditLog {
+  id: string
+  action: AuditAction | string
+  result: 'SUCCESS' | 'FAILED' | string
+  operator_name: string | null
+  patient_name: string | null
+  visit_no: string | null
+  detail: string | null
+  client_ip: string | null
+  created_at: string
+}
+
+export interface AuditLogPage {
+  items: AuditLog[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface AuditOperator {
+  id: string
+  display_name: string
 }

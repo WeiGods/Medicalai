@@ -14,13 +14,18 @@ public class VisitMapper {
             rs.getString("status"),rs.getString("department_name"),
             rs.getString("patient_name_snapshot"),rs.getString("patient_gender_snapshot"),
             rs.getObject("patient_age_snapshot",Integer.class),rs.getString("doctor_name_snapshot"),
-            rs.getString("chief_complaint"),rs.getInt("version"),DatabaseDateTime.getInstant(rs,"created_at"));
+            rs.getString("chief_complaint"),rs.getInt("version"),DatabaseDateTime.getInstant(rs,"started_at"),
+            DatabaseDateTime.getInstant(rs,"completed_at"),DatabaseDateTime.getInstant(rs,"created_at"));
     private final JdbcTemplate jdbc;
 
     public VisitMapper(JdbcTemplate jdbc) { this.jdbc=jdbc; }
 
     public List<Visit> findAll(UUID doctorId) {
         return jdbc.query("SELECT * FROM visit WHERE doctor_id=? ORDER BY created_at DESC,id", ROW, doctorId);
+    }
+
+    public List<Visit> findAll() {
+        return jdbc.query("SELECT * FROM visit ORDER BY created_at DESC,id", ROW);
     }
 
     public Optional<Visit> find(UUID id, UUID doctorId, boolean lock) {

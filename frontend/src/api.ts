@@ -1,6 +1,6 @@
 import type {
   AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
-  Recording, Transcript, Visit, ClinicalExtraction
+  Recording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole
 } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
@@ -32,10 +32,10 @@ export function clearSession() {
 }
 
 export const api = {
-  login: async (name: string) => {
+  login: async (name: string, role: DemoRole) => {
     const result = await request<LoginResult>('/api/v1/auth/demo-login', {
       method: 'POST',
-      body: JSON.stringify({ doctor_name: name })
+      body: JSON.stringify({ doctor_name: name, role })
     })
     localStorage.setItem('medicalai_token', result.access_token)
     return result
@@ -115,6 +115,18 @@ export const api = {
     body: JSON.stringify({ format })
   }),
   exports: (visitId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`),
+  auditLogs: (query: { from?: string; to?: string; doctorId?: string; action?: AuditAction; page?: number; pageSize?: number }) => {
+    const params = new URLSearchParams()
+    if (query.from) params.set('from', query.from)
+    if (query.to) params.set('to', query.to)
+    if (query.doctorId) params.set('doctorId', query.doctorId)
+    if (query.action) params.set('action', query.action)
+    if (query.page) params.set('page', String(query.page))
+    if (query.pageSize) params.set('pageSize', String(query.pageSize))
+    const suffix = params.size ? `?${params.toString()}` : ''
+    return request<AuditLogPage>(`/api/v1/audit-logs${suffix}`)
+  },
+  auditOperators: () => request<AuditOperator[]>('/api/v1/audit-logs/operators'),
   exportStatus: (exportId: string) => request<{ id: string; format: string; status: string; object_key?: string | null; error_message?: string | null }>(`/api/v1/exports/${exportId}`),
   exportBlob: async (exportId: string) => {
     const headers = new Headers()

@@ -12,6 +12,21 @@
 .login-card input{width:100%;padding:14px;border:1px solid #dfe8e3;border-radius:8px;margin:20px 0 10px;font-size:15px}
 .login-card .quick{display:flex;gap:8px;margin-bottom:18px}
 .login-card .quick button,.profile button{border:0;background:#edf7f0;color:#518272;padding:7px 11px;border-radius:6px}
+.login-role{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:18px 0 0;padding:4px;border-radius:8px;background:#edf4f0}
+.login-role button{min-height:34px;border:0;border-radius:5px;background:transparent;color:#688078;font-size:13px}
+.login-role button.active{background:#fff;color:var(--login-teal);box-shadow:0 1px 4px #23483b18;font-weight:600}
+.audit-filter-card{margin-bottom:16px}
+.audit-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;align-items:end;gap:12px;padding:17px 19px}
+.audit-filters label{display:grid;gap:6px;min-width:0;color:#889b8d;font-size:10px}
+.audit-filters input,.audit-filters select{width:100%;height:34px;border:1px solid #e0e9e4;border-radius:5px;background:#fff;color:#536d61;padding:7px 9px;font-size:11px}
+.audit-search{min-width:78px}
+.audit-table-card{overflow:hidden}
+.audit-log-table td{vertical-align:middle}
+.audit-error{margin:14px 19px 0;padding:9px 11px;border:1px solid #f0d3cb;border-radius:5px;background:#fff5f2;color:#ad6257;font-size:11px}
+.audit-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 19px;border-top:1px solid var(--line);color:#94a398;font-size:10px}
+.audit-pagination>div{display:flex;gap:7px}
+@media(max-width:980px){.audit-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.audit-search{grid-column:span 2}}
+@media(max-width:560px){.audit-filters{grid-template-columns:1fr}.audit-search{grid-column:auto;width:100%}.audit-log-table{min-width:760px}}
 .login-card .primary{border:0;border-radius:7px;background:var(--login-teal);color:#fff;padding:12px 18px;cursor:pointer}
 .login-card .primary:disabled{opacity:.5}
 .login-card .notice{font-size:11px;color:#9aa69f;margin-top:20px}
@@ -204,10 +219,6 @@ body.modal-open{overflow:hidden}
 }
 
 /* 新患者录入表单。 */
-.modal-switch{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:4px;background:#f1f6f2;border-radius:8px;margin-bottom:18px}
-.modal-switch-btn{border:0;border-radius:6px;background:transparent;color:#7b9382;font-size:11px;padding:9px 10px;cursor:pointer;transition:background .2s,color .2s,box-shadow .2s}
-.modal-switch-btn:hover{color:#4a8068}
-.modal-switch-btn.active{background:#fff;color:var(--teal);box-shadow:0 2px 8px #2c6b5314;font-weight:600}
 .manual-patient-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
 .manual-patient-grid .modal-field{min-width:0}
 .manual-patient-wide{grid-column:1/-1}
@@ -225,3 +236,34 @@ body.modal-open{overflow:hidden}
 /* Align the desktop workbench with the approved 110% visual scale. */
 :root{--desktop-ui-scale:1.1}
 @media(min-width:1210px){html{zoom:var(--desktop-ui-scale)}}
+
+.read-only-actions{align-items:center}
+.read-only-note{display:inline-flex;align-items:center;gap:6px;padding:9px 12px;border:1px solid #dce9df;border-radius:6px;background:#f4f9f5;color:#789381;font-size:10px;line-height:1.5}
+.read-only-note svg{width:14px;height:14px}
+.read-only-banner{margin-top:0}
+.patient-owner{display:block;max-width:100%;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b9b92;font-size:8px;line-height:1.35}
+
+/* The record review step combines draft editing and physician signing. */
+.steps{grid-template-columns:repeat(5,minmax(0,1fr))}
+.record-signing-status{display:flex;align-items:flex-start;gap:10px;margin:16px 22px 0;padding:12px 14px;border:1px solid #f0dcb9;border-radius:7px;background:#fff9ef;color:#8c6d3e}
+.record-signing-status.signed{border-color:#c9e4da;background:#f1f9f5;color:#39755e}
+.record-signing-status>svg{width:17px;height:17px;flex:0 0 auto;margin-top:1px}
+.record-signing-status>div{min-width:0;display:grid;gap:3px}
+.record-signing-status strong{font-size:11px;font-weight:650}
+.record-signing-status span{font-size:10px;line-height:1.6;color:inherit}
+@media(max-width:760px){.record-signing-status{margin:12px 16px 0;padding:11px 12px}.record-signing-status span{font-size:9px}}
+
+.recent-item{border-radius:6px;color:#4d675d;transition:background .18s,color .18s}
+.recent-item:hover{background:#f5f9f6}
+.recent-item.selected{background:#eaf5f0;color:var(--teal);font-weight:600}
+.recent-copy{display:grid;min-width:0;flex:1;gap:3px;text-align:left}
+.recent-name,.recent-meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recent-name{font-size:12px;line-height:1.35}
+.recent-meta{font-size:9px;line-height:1.4;color:#92a39a;font-weight:400}
+.recent-item.selected .recent-meta{color:#60917d}
+
+/* 审计是全局页面，不复用当前接诊的左侧队列布局。 */
+.audit-view{max-width:none;width:100%}
+@media(min-width:1100px){.main>.full-view.audit-view{width:100%;max-width:100%;margin-left:0}}
+
+.global-message{position:fixed;left:50%;top:24px;transform:translate(-50%,-12px);display:flex;align-items:center;gap:9px;max-width:min(520px,calc(100vw - 32px));padding:12px 18px;border:1px solid #cfe4d7;border-radius:7px;background:#fff;color:#456c59;box-shadow:0 10px 30px #244b3a24;font-size:12px;line-height:1.6;z-index:200;animation:message-in .2s ease-out forwards}.global-message-error{border-color:#efd2cb;background:#fff8f6;color:#a55e52}.global-message-success{border-color:#c9e4d2;background:#f7fcf8;color:#3f805a}.global-message-mark{width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:#68a683}.global-message-error .global-message-mark{background:#cf796b}.global-message-success .global-message-mark{background:#4d9b70}@keyframes message-in{to{transform:translate(-50%,0)}}

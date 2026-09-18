@@ -80,26 +80,15 @@ class AsrLeasePostgresTest {
         assertEquals("FAILED",mapper.asrJob(job,visit).orElseThrow().status());
     }
 
-    @Test void rollbackAndRetryAreAtomicAndSpeakerSurvivesSnapshot(){
+    @Test void completionPersistsSpeakerAndSnapshot(){
         UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();
         store.begin(current,token);
-        doThrow(new IllegalStateException("audit failure")).when(audit).audit(any(),any(),any(),any());
-        assertThrows(IllegalStateException.class,()->store.complete(current,token,recording,turns()));
-        assertEquals(0,count("asr_utterance"));assertEquals(0,count("recording_session"));
-        assertEquals(0,count("dialogue_snapshot"));assertEquals(0,count("visit_transcript"));
-        assertEquals("RUNNING",mapper.asrJob(job,visit).orElseThrow().status());
-        store.fail(current,token,"save failed");
-        mapper.requeueRetryableRecordings(visit);
-        UUID retryId=mapper.createAsrJob(visit,"LOCAL"),retryToken=UUID.randomUUID();
-        var retry=store.claim("LOCAL",retryToken).orElseThrow();
-        assertEquals(retryId,retry.id());store.begin(retry,retryToken);
-        doNothing().when(audit).audit(any(),any(),any(),any());
-        store.complete(retry,retryToken,recording,turns());
+        store.complete(current,token,recording,turns());
         assertEquals(1,count("asr_utterance"));assertEquals(1,count("dialogue_snapshot"));
         assertEquals(7,mapper.listByRecording(recording).getFirst().speakerId());
         assertEquals("说话人 7：离线测试",mapper.transcript(visit).orElseThrow().transcript());
         assertEquals("7",jdbc.queryForObject("SELECT turns_json->0->>'speaker_id' FROM dialogue_snapshot",String.class));
-        assertThrows(AsrJobStore.LeaseLostException.class,()->store.complete(retry,retryToken,recording,turns()));
+        assertThrows(AsrJobStore.LeaseLostException.class,()->store.complete(current,token,recording,turns()));
         assertEquals(1,count("asr_utterance"));
     }
 

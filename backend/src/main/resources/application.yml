@@ -24,8 +24,6 @@ spring:
 medicalai:
   auth:
     mode: ${AUTH_MODE:DEMO}
-  patient-directory:
-    mode: ${PATIENT_DIRECTORY_MODE:LOCAL_DEMO}
   storage:
     root: ${STORAGE_ROOT:./data/recordings}
   ai:

@@ -17,7 +17,7 @@ public class VisitController {
 
     @GetMapping
     public List<VisitVO> list(@RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return service.list(current.doctor().id());
+        return service.list(current.doctor());
     }
 
     @GetMapping("/{id}")

@@ -49,6 +49,7 @@ public class ClinicalWorkflowService {
     private final LlmRouteResolver routes;
     private final LlmRoleRouter roleRouter;
     private final TranscriptRoleReclassificationStore roleReclassificationStore;
+    private final AuditLogService auditLogs;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
@@ -62,12 +63,21 @@ public class ClinicalWorkflowService {
                 roleReclassificationStore, new LlmRouteResolver(recordings), new LlmRoleRouter(roleClient));
     }
 
-    @org.springframework.beans.factory.annotation.Autowired
     public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
                                    MedicalRecordMapper records, ClinicalExtractionService extractions, AiServiceClient ai,
                                    AudioStorageService storage, ObjectMapper objectMapper, Clock clock,
                                    TranscriptRoleReclassificationStore roleReclassificationStore,
                                    LlmRouteResolver routes, LlmRoleRouter roleRouter) {
+        this(visits, patients, doctors, recordings, records, extractions, ai, storage, objectMapper, clock,
+                roleReclassificationStore, routes, roleRouter, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public ClinicalWorkflowService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors, RecordingMapper recordings,
+                                   MedicalRecordMapper records, ClinicalExtractionService extractions, AiServiceClient ai,
+                                   AudioStorageService storage, ObjectMapper objectMapper, Clock clock,
+                                   TranscriptRoleReclassificationStore roleReclassificationStore,
+                                   LlmRouteResolver routes, LlmRoleRouter roleRouter, AuditLogService auditLogs) {
         this.visits = visits;
         this.patients = patients;
         this.doctors = doctors;
@@ -81,6 +91,7 @@ public class ClinicalWorkflowService {
         this.roleReclassificationStore = roleReclassificationStore;
         this.routes = routes;
         this.roleRouter = roleRouter;
+        this.auditLogs = auditLogs;
     }
 
     /** 保留既有单元测试和旧组装代码的构造方式；运行时始终注入完整的提取服务。 */
@@ -119,7 +130,7 @@ public class ClinicalWorkflowService {
                 "UPLOAD", objectKey, name, file.getContentType(), file.getSize(),
                 durationMs == null || durationMs < 0 ? null : durationMs, "UPLOADED", null, Instant.now(clock)));
         invalidateClinicalExtraction(visit.id());
-        records.audit(doctorId, visit.id(), "RECORDING_UPLOADED", id);
+        auditRecordingUploaded(doctorId, visit.id(), id, name);
         return RecordingVO.from(recording);
     }
 
@@ -238,7 +249,6 @@ public class ClinicalWorkflowService {
                 DialogueSnapshotHasher.hash(visit.id(), editedTurns), doctorId);
         recordings.saveTranscript(visit.id(), editedSnapshotId, editedText, true);
         invalidateClinicalExtraction(visit.id());
-        records.audit(doctorId, visit.id(), "TRANSCRIPT_EDITED", editedSnapshotId);
         return transcript(visitId, doctorId);
     }
 
@@ -266,7 +276,6 @@ public class ClinicalWorkflowService {
                 DialogueSnapshotHasher.hash(visit.id(), turns), doctorId);
         recordings.saveTranscript(visit.id(), snapshotId, transcriptText(turns), true);
         invalidateClinicalExtraction(visit.id());
-        records.audit(doctorId, visit.id(), "TRANSCRIPT_ROLE_UPDATED", utteranceId);
         return transcript(visitId, doctorId);
     }
 
@@ -349,7 +358,6 @@ public class ClinicalWorkflowService {
         int versionNo = records.latestVersion(recordId) + 1;
         records.insertVersion(recordId, versionNo, snapshot.id(), snapshot.snapshotHash(),
                 json(content), doctorName(doctorId), doctorId);
-        records.audit(doctorId, visit.id(), "MEDICAL_RECORD_GENERATED", recordId);
         return medicalRecord(visitId, doctorId);
     }
 
@@ -387,7 +395,6 @@ public class ClinicalWorkflowService {
         MedicalRecordContent merged = merge(current, request);
         validateContent(merged);
         records.saveDraft(version.recordId(), version.versionNo(), json(merged));
-        records.audit(doctorId, visit.id(), "MEDICAL_RECORD_DRAFT_SAVED", version.recordId());
         return medicalRecord(visitId, doctorId);
     }
 
@@ -404,7 +411,6 @@ public class ClinicalWorkflowService {
         int nextVersion = records.latestVersion(version.recordId()) + 1;
         records.insertVersion(version.recordId(), nextVersion, version.sourceSnapshotId(),
                 version.sourceSnapshotHash(), json(content), doctorName(doctorId), doctorId);
-        records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EDIT_STARTED", version.recordId());
         return medicalRecord(visitId, doctorId);
     }
 
@@ -439,7 +445,7 @@ public class ClinicalWorkflowService {
         }
         UUID confirmationId = records.insertConfirmation(version.recordId(), version.id(), doctorId, clientIp);
         records.confirm(version.recordId(), version.versionNo(), doctorId, confirmationId);
-        records.audit(doctorId, visit.id(), "MEDICAL_RECORD_CONFIRMED", version.recordId());
+        auditMedicalRecordConfirmed(doctorId, visit.id(), version.recordId(), version.versionNo());
         return medicalRecord(visitId, doctorId);
     }
 
@@ -469,7 +475,6 @@ public class ClinicalWorkflowService {
                 confirmedVersion.confirmationId(), request.format()).orElse(null);
         if (failed != null) {
             records.requeueFailedExport(visit.id(), failed.id(), request.format());
-            records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", failed.id());
             return exports(visitId, doctorId);
         }
         RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
@@ -481,11 +486,9 @@ public class ClinicalWorkflowService {
             if (concurrent == null) {
                 throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_IN_PROGRESS", "导出任务正在创建，请稍后重试");
             }
-            records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", concurrent.id());
             return exports(visitId, doctorId);
         }
         records.createExportJob(visit.id(), export.id(), request.format());
-        records.audit(doctorId, visit.id(), "MEDICAL_RECORD_EXPORTED", export.id());
         return exports(visitId, doctorId);
     }
 
@@ -670,6 +673,18 @@ public class ClinicalWorkflowService {
 
     private String doctorName(UUID doctorId) {
         return doctors.findById(doctorId).map(Doctor::displayName).orElse(doctorId.toString());
+    }
+
+    private void auditRecordingUploaded(UUID doctorId, UUID visitId, UUID recordingId, String fileName) {
+        if (auditLogs != null) {
+            auditLogs.recordRecordingUploaded(doctorId, visitId, recordingId, fileName);
+        }
+    }
+
+    private void auditMedicalRecordConfirmed(UUID doctorId, UUID visitId, UUID recordId, int versionNo) {
+        if (auditLogs != null) {
+            auditLogs.recordMedicalRecordConfirmed(doctorId, visitId, recordId, versionNo);
+        }
     }
 
     private String nextRecordingNo(UUID visitId) {

@@ -5,16 +5,17 @@ import '../routeSelection.css'
 import Icon from './Icon.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
-import type { AsrProvider, ClinicalExtraction, Confirmation, Doctor, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
+import { showMessage, type MessageType } from '../message'
+import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
 const CURRENT_EXPORT_TEMPLATE_VERSION = 2
 
-type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export' | 'audit' | 'config'
-type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'confirm' | 'export'
-type ModalKind = 'new-visit' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | null
-type NewPatientMode = 'existing' | 'manual'
+type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
+type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
+type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | null
+type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 
 const patients = ref<Patient[]>([])
@@ -22,6 +23,8 @@ const visits = ref<Visit[]>([])
 const selectedPatientId = ref('')
 const view = ref<MainView>('workbench')
 const queueSearch = ref('')
+const patientSearchResults = ref<Patient[] | null>(null)
+const searchBusy = ref(false)
 const busy = ref(false)
 const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
@@ -33,6 +36,15 @@ const record = ref<MedicalRecord | null>(null)
 const recordForm = ref<MedicalRecordContent | null>(null)
 const confirmations = ref<Confirmation[]>([])
 const exports = ref<RecordExport[]>([])
+const auditLogs = ref<AuditLog[]>([])
+const auditOperators = ref<AuditOperator[]>([])
+const auditFrom = ref(dateInputValue(daysBefore(30)))
+const auditTo = ref(dateInputValue(new Date()))
+const auditDoctorId = ref('')
+const auditAction = ref<AuditAction | ''>('')
+const auditPage = ref(1)
+const auditTotal = ref(0)
+const auditBusy = ref(false)
 const transcriptTab = ref<'dialogue' | 'edit' | 'facts'>('dialogue')
 const transcriptDraft = ref('')
 // 混合来源只能在当前快照上由医生一次性选择；快照变动后旧选择不能复用。
@@ -40,19 +52,14 @@ const selectedLlmRoute = ref<LlmProvider | null>(null)
 const modal = ref<ModalKind>(null)
 const modalError = ref('')
 const confirmChecked = ref(false)
-const newPatientId = ref('')
-const newPatientMode = ref<NewPatientMode>('existing')
 const newPatientForm = ref<ManualPatientForm>({ name: '', gender: '', age: null, phone: '', idNo: '' })
 const dragging = ref(false)
-const toastText = ref('')
-const toastVisible = ref(false)
 const playingId = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
 const modalDialog = ref<HTMLElement | null>(null)
 const activity = ref<{ time: string; text: string }[]>([])
 const recordingElapsedMs = ref(0)
 const roleReviewElements = new Map<string, HTMLElement>()
-let toastTimer: number | undefined
 let recordingTimer: number | undefined
 let recordingStartedAt = 0
 let audioPlayer: HTMLAudioElement | null = null
@@ -62,17 +69,14 @@ let recordChunks: Blob[] = []
 let audioObjectUrl: string | null = null
 let audioLoadAbort: AbortController | null = null
 let visitStateRevision = 0
+let patientSearchRevision = 0
 const recordingState = ref<'idle' | 'recording' | 'paused'>('idle')
 
 
 watch(modal, async value => {
   document.body.classList.toggle('modal-open', !!value)
-  if (value === 'new-visit') {
+  if (value === 'new-patient') {
     modalError.value = ''
-    newPatientMode.value = 'existing'
-    newPatientId.value = canCreateVisit(selectedPatientId.value)
-      ? selectedPatientId.value
-      : patients.value.find(patient => canCreateVisit(patient.id))?.id || ''
     newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
   }
   if (value) {
@@ -89,11 +93,22 @@ const titles: Record<MainView, [string, string]> = {
   workbench: ['接诊工作台', '从医患对话到结构化病历，让每一次接诊更从容。'],
   audio: ['录音上传', '完整上传问诊录音，支持一次接诊关联多段录音。'],
   transcript: ['转写结果', '回看医患对话，核对并编辑本次接诊采用的转写文本。'],
-  record: ['病历展示与编辑', '按照标准模板整理记录，由医生核对与完善。'],
-  confirm: ['医生确认', '核对必填信息，确认本次接诊的病历版本。'],
+  record: ['病历审核与签署', '核对并完善病历草稿，确认后锁定当前版本。'],
   export: ['病历导出', '将已确认的病历由后端生成 Word 或 PDF 文件。'],
-  audit: ['日志审计', '查看当前接诊的确认与导出审计记录。'],
-  config: ['系统配置', '查看当前服务的接入环境与健康状态。']
+  audit: ['日志审计', '查看全系统医生的关键操作记录。']
+}
+
+function dateInputValue(value: Date) {
+  const year = value.getFullYear()
+  const month = String(value.getMonth() + 1).padStart(2, '0')
+  const day = String(value.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function daysBefore(days: number) {
+  const value = new Date()
+  value.setDate(value.getDate() - days)
+  return value
 }
 
 const recordFields = [
@@ -149,6 +164,33 @@ function exportStatusLabel(status: string) {
   } as Record<string, string>)[status] || status
 }
 
+function recentVisitStatus(visit: Visit) {
+  return ({
+    WAITING: '待接诊',
+    ACTIVE: '接诊中',
+    COMPLETED: '已完成',
+    ARCHIVED: '已归档',
+    CANCELLED: '已取消'
+  } as Record<string, string>)[visit.status] || visit.status
+}
+
+function auditActionLabel(action: string) {
+  return ({
+    LOGIN: '登录系统',
+    RECORDING_UPLOADED: '上传录音',
+    MEDICAL_RECORD_CONFIRMED: '确认病历',
+    MEDICAL_RECORD_EXPORT: '病历导出'
+  } as Record<string, string>)[action] || action
+}
+
+function auditResultLabel(result: string) {
+  return result === 'SUCCESS' ? '成功' : result === 'FAILED' ? '失败' : result
+}
+
+function doctorRoleLabel(role: string) {
+  return ({ DOCTOR: '医生', DEPARTMENT_HEAD: '科室长', ADMIN: '管理员' } as Record<string, string>)[role] || '医生'
+}
+
 function compactVisitNo(value: string | null | undefined) {
   if (!value) return '待创建'
   const visitNo = String(value)
@@ -161,15 +203,39 @@ function patientVisitNo(patientId: string) {
 }
 
 const currentPatient = computed(() => patients.value.find(p => p.id === selectedPatientId.value) || null)
+const canViewAudit = computed(() => ['DEPARTMENT_HEAD', 'ADMIN'].includes(props.doctor.role))
+const showLegacyWorkspace = false
+const readOnlyCurrentPatient = computed(() => {
+  if (!currentPatient.value || !canViewAudit.value) return false
+  return currentPatient.value.created_by !== props.doctor.id
+})
 const canCreateVisit = (patientId: string) => !patientVisit(patientId)
 const currentVisit = computed(() => {
   return patientVisit(selectedPatientId.value)
 })
-const queuePatients = computed(() => {
-  const keyword = queueSearch.value.trim().toLowerCase()
-  if (!keyword) return patients.value
-  return patients.value.filter(p => [p.name, p.patient_no, p.phone_masked]
-    .some(value => String(value || '').toLowerCase().includes(keyword)))
+const queuePatients = computed(() => patientSearchResults.value ?? patients.value)
+const recentVisits = computed(() => {
+  const patientById = new Map(patients.value.map(patient => [patient.id, patient]))
+  const seenPatientIds = new Set<string>()
+  const items: { patient: Patient; visit: Visit }[] = []
+  const orderedVisits = visits.value
+    .filter(visit => visit.status !== 'CANCELLED')
+    .slice()
+    .sort((left, right) => {
+      const leftTime = String(left.last_activity_at || left.created_at || '')
+      const rightTime = String(right.last_activity_at || right.created_at || '')
+      return rightTime.localeCompare(leftTime)
+    })
+
+  for (const visit of orderedVisits) {
+    if (seenPatientIds.has(visit.patient_id)) continue
+    const patient = patientById.get(visit.patient_id)
+    if (!patient) continue
+    seenPatientIds.add(visit.patient_id)
+    items.push({ patient, visit })
+    if (items.length === 3) break
+  }
+  return items
 })
 const closed = computed(() => !!currentVisit.value && ['COMPLETED', 'CANCELLED', 'ARCHIVED'].includes(currentVisit.value.status))
 const completed = computed(() => currentVisit.value?.status === 'COMPLETED')
@@ -193,14 +259,14 @@ const workflowView = computed<WorkflowView>(() => {
   if (!recordings.value.length || !allTranscribed.value) return 'audio'
   if (sourceDirty.value) return 'transcript'
   if (!record.value?.record_id) return 'transcript'
-  if (!confirmed.value) return view.value === 'confirm' ? 'confirm' : 'record'
+  if (!confirmed.value) return 'record'
   return 'export'
 })
 const stage = computed(() => {
-  const stages: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'confirm', 'export']
+  const stages: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'export']
   // 已完成接诊不可变更，但保留产物仍可查看；应高亮医生正在查看的页面，
   // 而不是始终将进度指示固定在最后一步。
-  if (completed.value && view.value !== 'workbench' && stages.includes(view.value as WorkflowView)) {
+  if ((completed.value || view.value === 'record') && view.value !== 'workbench' && stages.includes(view.value as WorkflowView)) {
     return stages.indexOf(view.value as WorkflowView)
   }
   return stages.indexOf(workflowView.value)
@@ -279,11 +345,8 @@ const highlightText = (text: string) => [{ text, mark: false }]
 const recordingStateLabel = computed(() => ({ idle: '准备录音', recording: '正在录音', paused: '已暂停' })[recordingState.value])
 const recordingTimeLabel = computed(() => formatRecordingDuration(recordingElapsedMs.value))
 
-function toast(text: string) {
-  toastText.value = text
-  toastVisible.value = true
-  window.clearTimeout(toastTimer)
-  toastTimer = window.setTimeout(() => { toastVisible.value = false }, 3400)
+function toast(text: string, type: MessageType = 'info') {
+  showMessage(text, type)
 }
 
 function addLog(text: string) {
@@ -297,13 +360,12 @@ async function refreshCore(keepSelection = true) {
   if (!keepSelection || !patientList.some(p => p.id === selectedPatientId.value)) {
     selectedPatientId.value = patientList[0]?.id || ''
   }
-  newPatientId.value = selectedPatientId.value
 }
 
 async function refreshVisitState() {
   const visit = currentVisit.value
   const revision = ++visitStateRevision
-  if (!visit) {
+  if (!visit || readOnlyCurrentPatient.value) {
     recordings.value = []
     transcript.value = null
     extraction.value = null
@@ -339,22 +401,64 @@ async function loadAll(keepSelection = true) {
     await refreshCore(keepSelection)
     await refreshVisitState()
   } catch (error) {
-    toast(error instanceof Error ? error.message : '数据加载失败')
+    toast(error instanceof Error ? error.message : '数据加载失败', 'error')
   } finally {
     busy.value = false
+  }
+}
+
+async function loadAudit(page = 1) {
+  auditBusy.value = true
+  try {
+    const result = await api.auditLogs({
+      from: auditFrom.value || undefined,
+      to: auditTo.value || undefined,
+      doctorId: auditDoctorId.value || undefined,
+      action: auditAction.value || undefined,
+      page,
+      pageSize: 20
+    })
+    auditLogs.value = result.items
+    auditTotal.value = result.total
+    auditPage.value = result.page
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '日志查询失败', 'error')
+  } finally {
+    auditBusy.value = false
+  }
+}
+
+async function searchPatients() {
+  const revision = ++patientSearchRevision
+  searchBusy.value = true
+  try {
+    const results = await api.patients(queueSearch.value.trim())
+    // 连续搜索时仅展示最后一次请求的结果，避免慢请求覆盖较新的查询。
+    if (revision === patientSearchRevision) patientSearchResults.value = results
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '患者搜索失败', 'error')
+  } finally {
+    if (revision === patientSearchRevision) searchBusy.value = false
+  }
+}
+
+async function loadAuditOperators() {
+  try {
+    auditOperators.value = await api.auditOperators()
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '操作人列表加载失败', 'error')
   }
 }
 
 async function selectPatient(patientId: string) {
   if (busy.value || actionBusy.value) return
   if (recordingState.value !== 'idle' || recorder) {
-    toast('请先结束当前网页录音，再切换患者。')
+    toast('请先结束当前网页录音，再切换患者。', 'error')
     return
   }
   stopAudio()
   visitStateRevision += 1
   selectedPatientId.value = patientId
-  newPatientId.value = patientId
   view.value = 'workbench'
   transcriptTab.value = 'dialogue'
   await loadAll(true)
@@ -362,7 +466,22 @@ async function selectPatient(patientId: string) {
 }
 
 function navigate(next: MainView) {
-  const workflowViews: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'confirm', 'export']
+  const workflowViews: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'export']
+  if (readOnlyCurrentPatient.value && workflowViews.includes(next as WorkflowView) && next !== 'workbench') {
+    view.value = 'workbench'
+    toast('当前为只读状态，该患者由其他医生负责接诊。', 'info')
+    return
+  }
+  if (next === 'audit') {
+    if (!canViewAudit.value) {
+      toast('当前账号无权查看日志审计。', 'error')
+      return
+    }
+    view.value = 'audit'
+    void Promise.all([loadAudit(1), loadAuditOperators()])
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    return
+  }
   if (!workflowViews.includes(next as WorkflowView)) {
     view.value = next
   } else {
@@ -372,13 +491,11 @@ function navigate(next: MainView) {
       view.value = requested
     } else if (completed.value) {
       view.value = workflowView.value
-      toast('已完成接诊仅支持查看步骤 02 至 06。')
+      toast('已完成接诊仅支持查看步骤 02 至 05。')
     } else {
     const sameStep = requested === current
-    const reviewTransition = (requested === 'record' || requested === 'confirm')
-      && (current === 'record' || current === 'confirm')
-      && !!record.value?.record_id && !confirmed.value
-    if (sameStep || reviewTransition) view.value = requested
+    const reviewingSignedRecord = requested === 'record' && current === 'export' && !!record.value?.record_id
+    if (sameStep || reviewingSignedRecord) view.value = requested
     else {
       view.value = current
       toast('请按当前接诊流程完成本步骤后再继续。')
@@ -402,7 +519,7 @@ async function createAndStart(patientId: string) {
     navigate('audio')
     toast('新接诊已创建，可上传录音。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '创建接诊失败')
+    toast(error instanceof Error ? error.message : '创建接诊失败', 'error')
   } finally {
     busy.value = false
   }
@@ -410,6 +527,10 @@ async function createAndStart(patientId: string) {
 
 async function startVisit() {
   if (!currentPatient.value) return
+  if (readOnlyCurrentPatient.value) {
+    toast('当前为只读状态，该患者由其他医生负责接诊。', 'info')
+    return
+  }
   if (!currentVisit.value) {
     await createAndStart(currentPatient.value.id)
     return
@@ -421,7 +542,7 @@ async function startVisit() {
     navigate('audio')
     toast(`已开始 ${currentPatient.value.name} 的接诊，可上传录音。`)
   } catch (error) {
-    toast(error instanceof Error ? error.message : '开始接诊失败')
+    toast(error instanceof Error ? error.message : '开始接诊失败', 'error')
   } finally {
     busy.value = false
   }
@@ -430,11 +551,11 @@ async function startVisit() {
 async function doCancel() {
   if (!currentVisit.value) return
   if (actionBusy.value) {
-    modalError.value = '当前操作正在处理中，请等待完成后再取消接诊。'
+    toast('当前操作正在处理中，请等待完成后再取消接诊。', 'error')
     return
   }
   if (recordingState.value !== 'idle' || recorder) {
-    modalError.value = '请先结束当前网页录音，再取消接诊。'
+    toast('请先结束当前网页录音，再取消接诊。', 'error')
     return
   }
   busy.value = true
@@ -445,8 +566,7 @@ async function doCancel() {
     navigate('workbench')
     toast('本次接诊及其录音、转写、病历和导出文件已清空。')
   } catch (error) {
-    modalError.value = error instanceof Error ? error.message : '取消接诊失败'
-    toast(modalError.value)
+    toast(error instanceof Error ? error.message : '取消接诊失败', 'error')
   } finally {
     busy.value = false
   }
@@ -462,66 +582,50 @@ async function doFinish() {
     navigate('export')
     toast('本次接诊已完成，完整记录已保留。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '结束接诊失败')
+    toast(error instanceof Error ? error.message : '结束接诊失败', 'error')
   } finally {
     busy.value = false
   }
 }
 
-async function createNewVisit() {
+async function createNewPatient() {
   modalError.value = ''
-  if (newPatientMode.value === 'manual') {
-    const form = newPatientForm.value
-    const name = form.name.trim()
-    const gender = form.gender.trim()
-    const rawAge = form.age
-    const age = rawAge === null || rawAge === '' ? null : Number(rawAge)
-    if (!name) {
-      modalError.value = '请输入患者姓名。'
-      return
-    }
-    if (!gender) {
-      modalError.value = '请选择患者性别。'
-      return
-    }
-    if (age !== null && (!Number.isInteger(age) || age < 0 || age > 150)) {
-      modalError.value = '年龄请输入 0 到 150 之间的整数。'
-      return
-    }
-    busy.value = true
-    try {
-      const patient = await api.createPatient({ name, gender, age, phone: form.phone, idNo: form.idNo })
-      selectedPatientId.value = patient.id
-      newPatientId.value = patient.id
-      await createAndStart(patient.id)
-      modal.value = null
-    } catch (error) {
-      modalError.value = error instanceof Error ? error.message : '创建患者失败'
-    } finally {
-      busy.value = false
-    }
+  const form = newPatientForm.value
+  const name = form.name.trim()
+  const gender = form.gender.trim()
+  const rawAge = form.age
+  const age = rawAge === null || rawAge === '' ? null : Number(rawAge)
+  if (!name) {
+    modalError.value = '请输入患者姓名。'
     return
   }
-  if (!newPatientId.value) {
-    modalError.value = '请选择一位患者。'
+  if (!gender) {
+    modalError.value = '请选择患者性别。'
     return
   }
-  if (!canCreateVisit(newPatientId.value)) {
-    modalError.value = '该患者已有接诊，完成接诊后不支持重复接诊。'
+  if (age !== null && (!Number.isInteger(age) || age < 0 || age > 150)) {
+    modalError.value = '年龄请输入 0 到 150 之间的整数。'
     return
   }
-  modal.value = null
-  await createAndStart(newPatientId.value)
+  busy.value = true
+  try {
+    const patient = await api.createPatient({ name, gender, age, phone: form.phone, idNo: form.idNo })
+    patients.value = [patient, ...patients.value.filter(item => item.id !== patient.id)]
+    selectedPatientId.value = patient.id
+    modal.value = null
+    await refreshVisitState()
+    toast(`患者 ${patient.name} 已新增，可在准备就绪后开始接诊。`, 'success')
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '创建患者失败', 'error')
+  } finally {
+    busy.value = false
+  }
 }
 
-function openNewVisitModal() {
+function openNewPatientModal() {
   modalError.value = ''
-  newPatientMode.value = 'existing'
-  newPatientId.value = canCreateVisit(selectedPatientId.value)
-    ? selectedPatientId.value
-    : patients.value.find(patient => canCreateVisit(patient.id))?.id || ''
   newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
-  modal.value = 'new-visit'
+  modal.value = 'new-patient'
 }
 
 function triggerUpload() {
@@ -548,12 +652,12 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
   if (!currentVisit.value || locked.value) return
   for (const file of Array.from(files || [])) {
     if (!/\.(wav|mp3|m4a|webm)$/i.test(file.name)) {
-      toast('仅支持 MP3、WAV、M4A 或 WEBM 格式。')
+      toast('仅支持 MP3、WAV、M4A 或 WEBM 格式。', 'error')
       continue
     }
     const duration = await audioDuration(file, fallbackDuration)
     if (duration <= 0) {
-      toast(`无法读取「${file.name}」，请选用有效音频。`)
+      toast(`无法读取「${file.name}」，请选用有效音频。`, 'error')
       continue
     }
     actionBusy.value = 'upload'
@@ -561,7 +665,7 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
       await api.uploadRecording(currentVisit.value.id, file, duration)
       addLog(`上传录音：${file.name}`)
     } catch (error) {
-      toast(error instanceof Error ? error.message : '上传失败')
+      toast(error instanceof Error ? error.message : '上传失败', 'error')
     }
   }
   actionBusy.value = ''
@@ -605,7 +709,7 @@ async function startTranscription() {
   // 服务器可能在拒绝本次提交前恢复了过期 PROCESSING 记录（例如缺少存储凭据时），
   // 重新加载可让卡片立即恢复为可重试状态。
     await loadAll(true)
-    toast(error instanceof Error ? error.message : '转写失败')
+    toast(error instanceof Error ? error.message : '转写失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -614,7 +718,7 @@ async function startTranscription() {
 async function saveTranscript() {
   if (!currentVisit.value || locked.value) return
   if (!transcriptDraft.value.trim()) {
-    toast('采用的转写文本不能为空。')
+    toast('采用的转写文本不能为空。', 'error')
     return
   }
   actionBusy.value = 'save'
@@ -625,7 +729,7 @@ async function saveTranscript() {
     navigate('transcript')
     toast('转写文本已保存，可生成病历。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '保存转写失败')
+    toast(error instanceof Error ? error.message : '保存转写失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -642,7 +746,16 @@ function roleStatus(turn: Utterance | undefined) {
 }
 
 async function updateUtteranceRole(turn: Utterance | undefined, event: Event) {
-  const role = (event.target as HTMLSelectElement).value as 'DOCTOR' | 'PATIENT' | 'OTHER'
+  const role = editableUtteranceRole((event.target as HTMLSelectElement).value)
+  if (!role) return
+  await saveUtteranceRole(turn, role)
+}
+
+function editableUtteranceRole(value: string): EditableUtteranceRole | null {
+  return ['DOCTOR', 'PATIENT', 'OTHER'].includes(value) ? value as EditableUtteranceRole : null
+}
+
+async function saveUtteranceRole(turn: Utterance | undefined, role: EditableUtteranceRole) {
   if (!currentVisit.value || !turn?.id || locked.value || actionBusy.value) return
   actionBusy.value = 'role'
   try {
@@ -652,7 +765,7 @@ async function updateUtteranceRole(turn: Utterance | undefined, event: Event) {
     addLog('人工修订句段说话角色')
     toast('角色已人工确认，请重新生成并确认病历。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '角色更新失败')
+    toast(error instanceof Error ? error.message : '角色更新失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -660,7 +773,8 @@ async function updateUtteranceRole(turn: Utterance | undefined, event: Event) {
 
 async function confirmCurrentUtteranceRole(turn: Utterance | undefined) {
   if (!turn) return
-  await updateUtteranceRole(turn, { target: { value: turn.role } } as Event)
+  const role = editableUtteranceRole(turn.role)
+  if (role) await saveUtteranceRole(turn, role)
 }
 
 async function reclassifyTranscriptRoles() {
@@ -675,7 +789,7 @@ async function reclassifyTranscriptRoles() {
     addLog('使用 AI 重新判断未人工确认的句段角色')
     toast('AI 角色判断已更新，请继续核对待人工确认的句段。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : 'AI 角色判断失败')
+    toast(error instanceof Error ? error.message : 'AI 角色判断失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -729,7 +843,7 @@ function resetRecordingTimer() {
 async function startRecording() {
   if (!currentVisit.value || locked.value) return
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-    toast('当前浏览器不支持录音功能。')
+    toast('当前浏览器不支持录音功能。', 'error')
     return
   }
   try {
@@ -764,7 +878,7 @@ async function startRecording() {
     recorderStream = null
     recorder = null
     resetRecordingTimer()
-    toast('无法访问麦克风，请检查浏览器权限。')
+    toast('无法访问麦克风，请检查浏览器权限。', 'error')
   }
 }
 
@@ -805,10 +919,10 @@ async function generateClinicalExtraction() {
       addLog('生成可追溯信息提取结果')
       toast('信息提取已生成，请核对原文证据后整体确认。')
     } else {
-      toast(extraction.value?.quality_issues[0] || '请先在全文编辑中修正转写。')
+      toast(extraction.value?.quality_issues[0] || '请先在全文编辑中修正转写。', 'error')
     }
   } catch (error) {
-    toast(error instanceof Error ? error.message : '信息提取失败')
+    toast(error instanceof Error ? error.message : '信息提取失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -823,7 +937,7 @@ async function confirmClinicalExtraction() {
     await loadAll(true)
     toast('信息提取已确认，可生成病历草稿。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '信息提取确认失败')
+    toast(error instanceof Error ? error.message : '信息提取确认失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -834,7 +948,7 @@ async function generateRecord() {
   if (!extractionConfirmed.value) {
     transcriptTab.value = 'facts'
     navigate('transcript')
-    toast('请先生成并整体确认当前转写的信息提取结果。')
+    toast('请先生成并整体确认当前转写的信息提取结果。', 'error')
     return
   }
   actionBusy.value = 'generate'
@@ -846,7 +960,7 @@ async function generateRecord() {
     navigate('record')
     toast('病历草稿已生成，请医生核对。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '病历生成失败')
+    toast(error instanceof Error ? error.message : '病历生成失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -862,7 +976,7 @@ async function saveDraft() {
     navigate('record')
     toast('病历草稿已保存。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '保存病历失败')
+    toast(error instanceof Error ? error.message : '保存病历失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -876,27 +990,42 @@ async function editRecord() {
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
     await loadAll(true)
     navigate('record')
-    toast('已进入修改状态，修改完成后请重新确认。')
+    toast('已创建病历修订版，请完成核对并重新签署。')
   } catch (error) {
-    toast(error instanceof Error ? error.message : '进入修改失败')
+    toast(error instanceof Error ? error.message : '进入修改失败', 'error')
   } finally {
     busy.value = false
   }
 }
 
-function requestConfirm() {
+async function requestConfirm() {
+  if (view.value !== 'record') {
+    navigate('record')
+    return
+  }
+  if (!currentVisit.value || !recordForm.value || locked.value) return
+  if (sourceDirty.value) {
+    navigate('transcript')
+    toast('录音或转写已更新，请重新生成病历后再签署。', 'error')
+    return
+  }
   if (missingFields.value.length) {
     navigate('record')
-    toast('请完善：' + missingFields.value.join('、'))
+    toast('请完善：' + missingFields.value.join('、'), 'error')
     return
   }
-  if (view.value !== 'confirm') {
-    navigate('confirm')
-    return
+  actionBusy.value = 'save'
+  try {
+    record.value = await api.saveMedicalRecord(currentVisit.value.id, recordForm.value)
+    recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
+    modalError.value = ''
+    confirmChecked.value = false
+    modal.value = 'confirm'
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '保存病历失败', 'error')
+  } finally {
+    actionBusy.value = ''
   }
-  modalError.value = ''
-  confirmChecked.value = false
-  modal.value = 'confirm'
 }
 
 async function doConfirm() {
@@ -907,13 +1036,13 @@ async function doConfirm() {
   actionBusy.value = 'confirm'
   try {
     record.value = await api.confirmMedicalRecord(currentVisit.value.id, true)
-    addLog(`${props.doctor.display_name}医生确认病历 v${record.value.version_no}`)
+    addLog(`${props.doctor.display_name}医生签署病历 v${record.value.version_no}`)
     modal.value = null
     await loadAll(true)
-    navigate('export')
-    toast('医生确认已保存，现在可以导出当前版本。')
+    navigate('record')
+    toast('病历已签署，当前版本现可导出。')
   } catch (error) {
-    modalError.value = error instanceof Error ? error.message : '确认失败'
+    toast(error instanceof Error ? error.message : '确认失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -982,7 +1111,7 @@ async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
         throw error
       }
     }
-  } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`) }
+  } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`, 'error') }
   finally { busy.value = false }
 }
 
@@ -1035,7 +1164,7 @@ async function playRecording(item: Recording) {
         blobSize: blob.size
       })
       stopAudio()
-      toast('音频无法播放，请检查录音格式或后端音频接口。')
+      toast('音频无法播放，请检查录音格式或后端音频接口。', 'error')
     }
     await player.play()
   } catch (error) {
@@ -1043,7 +1172,7 @@ async function playRecording(item: Recording) {
     console.warn('[audio] audio request failed', { recordingId: item.id, error })
     if (playingId.value === item.id) {
       stopAudio()
-      toast(error instanceof Error ? error.message : '音频无法播放。')
+      toast(error instanceof Error ? error.message : '音频无法播放。', 'error')
     }
   } finally {
     if (audioLoadAbort === controller) audioLoadAbort = null
@@ -1090,7 +1219,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  window.clearTimeout(toastTimer)
   stopAudio()
   stopRecorder()
   resetRecordingTimer()
@@ -1112,15 +1240,20 @@ defineExpose({ selectPatient })
         <button class="nav-item" :class="{ active: view === 'workbench' }" @click="showWorkflowStep()">
           <Icon name="users" /><span>患者 / 接诊</span><span class="nav-count">{{ String(openVisitCount).padStart(2, '0') }}</span>
         </button>
-        <button class="nav-item" :class="{ active: view === 'audit' }" @click="navigate('audit')"><Icon name="list" />日志审计</button>
-        <button class="nav-item" :class="{ active: view === 'config' }" @click="navigate('config')"><Icon name="gear" />系统配置</button>
+        <button v-if="canViewAudit" class="nav-item" :class="{ active: view === 'audit' }" @click="navigate('audit')"><Icon name="list" />日志审计</button>
       </nav>
       <div class="recent">
         <div class="nav-label">最近接诊</div>
-        <button v-for="patient in patients.slice(0, 3)" :key="patient.id" class="recent-item" @click="selectPatient(patient.id)">
-          <span class="avatar" :class="avatarClass(patient)">{{ patient.name[0] }}</span><span>{{ patient.name }}</span>
-          <span class="dot" :class="{ green: patientStatus(patient.id) === 'ACTIVE' }"></span>
-        </button>
+        <template v-if="recentVisits.length">
+          <button v-for="item in recentVisits" :key="item.visit.id" class="recent-item" :class="{ selected: item.patient.id === selectedPatientId }"
+                  :title="`${item.patient.name} · ${recentVisitStatus(item.visit)} · ${formatDateTime(item.visit.last_activity_at || item.visit.created_at)}`"
+                  @click="selectPatient(item.patient.id)">
+            <span class="avatar" :class="avatarClass(item.patient)">{{ item.patient.name[0] }}</span>
+            <span class="recent-copy"><span class="recent-name">{{ item.patient.name }}</span><span class="recent-meta">{{ recentVisitStatus(item.visit) }} · {{ formatDateTime(item.visit.last_activity_at || item.visit.created_at) }}</span></span>
+            <span class="dot" :class="{ green: item.visit.status === 'ACTIVE' }"></span>
+          </button>
+        </template>
+        <div v-else class="small-muted recent-empty">暂无接诊记录</div>
       </div>
       <div class="sidebar-bottom">
         <div class="care-note"><strong>让记录回归简单</strong><p>多一点时间，留给患者。</p><Icon name="pulse" /></div>
@@ -1134,7 +1267,7 @@ defineExpose({ selectPatient })
         <span class="header-date">{{ new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' }) }}</span>
         <div class="doctor-profile">
           <span class="avatar">{{ doctor.display_name.slice(0, 1) }}</span>
-          <div><b>{{ doctor.display_name }} 医生</b><span>{{ doctor.department_name }} · 主治医师</span></div>
+          <div><b>{{ doctor.display_name }} {{ doctorRoleLabel(doctor.role) }}</b><span>{{ doctor.department_name }} · {{ doctorRoleLabel(doctor.role) }}</span></div>
         </div>
         <button class="text-btn" @click="emit('logout')">退出</button>
       </div>
@@ -1150,16 +1283,17 @@ defineExpose({ selectPatient })
         <div class="heading-actions" aria-hidden="true"></div>
       </div>
 
+      <template v-if="view !== 'audit'">
       <section class="card queue">
         <div class="queue-head">
           <div class="queue-title"><Icon name="users" />今日接诊 <span class="badge">{{ patients.length }} 位</span>
             <div class="queue-stats"><span>待接诊 <b>{{ String(waitingCount).padStart(2, '0') }}</b></span><i></i><span>接诊中 <b>{{ String(activeCount).padStart(2, '0') }}</b></span><i></i><span>已完成 <b>{{ String(completedCount).padStart(2, '0') }}</b></span></div>
           </div>
           <div class="queue-search-wrap">
-            <input v-model="queueSearch" class="queue-search" placeholder="搜索姓名或编号" />
-            <button class="btn small" @click="queueSearch=queueSearch">搜索</button>
+            <input v-model="queueSearch" class="queue-search" placeholder="搜索姓名或编号" @keydown.enter.prevent="searchPatients" />
+            <button type="button" class="btn small" :disabled="searchBusy" @click="searchPatients">{{ searchBusy ? '搜索中' : '搜索' }}</button>
           </div>
-          <button class="queue-add" :disabled="busy" @click="openNewVisitModal"><Icon name="plus" />新增接诊</button>
+          <button class="queue-add" :disabled="busy" @click="openNewPatientModal"><Icon name="plus" />新增患者</button>
         </div>
         <div class="queue-cards">
           <button v-for="patient in queuePatients" :key="patient.id" class="patient-tile" :class="{ selected: patient.id === selectedPatientId }" @click="selectPatient(patient.id)">
@@ -1168,6 +1302,10 @@ defineExpose({ selectPatient })
               <span class="patient-name"><b>{{ patient.name }}</b><span>{{ patient.gender }} · {{ patient.age ?? '—' }} 岁</span></span>
               <span class="patient-meta">患者编号 <strong>{{ patient.patient_no || '—' }}</strong></span>
               <span class="patient-visit-no" :title="patientVisit(patient.id)?.visit_no || '暂无接诊记录'">接诊 {{ patientVisitNo(patient.id) }}</span>
+              <template v-if="canViewAudit">
+                <span class="patient-owner">创建：{{ patient.created_by_name || '历史数据未标记' }}</span>
+                <span v-if="patientVisit(patient.id)" class="patient-owner">接诊：{{ patientVisit(patient.id)?.doctor_name || '—' }} · {{ formatDateTime(patientVisit(patient.id)?.last_activity_at || patientVisit(patient.id)?.created_at) }}</span>
+              </template>
             </span>
             <span class="tile-status" :class="statusClass(patientVisit(patient.id))">
               {{ statusText(patientVisit(patient.id)) }}
@@ -1188,11 +1326,16 @@ defineExpose({ selectPatient })
             <div class="patient-details">
               <span><Icon name="id" />身份证号 <b>{{ currentPatient?.id_no_masked || '—' }}</b></span>
               <span><Icon name="phone" /><b>{{ currentPatient?.phone_masked || '—' }}</b></span>
+              <span><Icon name="user" />患者创建人 <b>{{ currentPatient?.created_by_name || '历史数据未标记' }}</b></span>
+              <span v-if="currentVisit"><Icon name="user" />接诊医生 <b>{{ currentVisit.doctor_name || '—' }}</b></span>
               <span><Icon name="calendar" />接诊日期 <b>{{ visitDate }}</b></span>
             </div>
           </div>
         </div>
-        <div class="patient-actions">
+        <div v-if="readOnlyCurrentPatient" class="patient-actions read-only-actions">
+          <span class="read-only-note"><Icon name="lock" />当前为只读状态，该患者由其他医生负责接诊</span>
+        </div>
+        <div v-else class="patient-actions">
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
           <template v-else-if="!closed">
             <button class="btn" :disabled="!exported || busy" title="当前版本确认并完成导出后可结束接诊" @click="modal='finish'"><Icon name="stop" />结束接诊</button>
@@ -1202,28 +1345,31 @@ defineExpose({ selectPatient })
         </div>
       </section>
 
-      <nav class="steps" aria-label="接诊流程">
-        <button v-for="(label, index) in ['患者 / 接诊', '录音上传', '转写结果', '病历生成', '医生确认', '病历导出']" :key="label"
+      <nav v-if="!readOnlyCurrentPatient" class="steps" aria-label="接诊流程">
+        <button v-for="(label, index) in ['患者 / 接诊', '录音上传', '转写结果', '病历审核与签署', '病历导出']" :key="label"
                 class="step" :class="{ done: index < stage || exported, current: index === stage }"
                 :disabled="completed && index === 0"
-                @click="navigate((['workbench','audio','transcript','record','confirm','export'] as MainView[])[index])">
+                @click="navigate((['workbench','audio','transcript','record','export'] as MainView[])[index])">
           <span class="step-number"><Icon v-if="index < stage || exported" name="check" /><template v-else>{{ String(index + 1).padStart(2, '0') }}</template></span>
-          <span class="step-label">{{ label }}<small>{{ ['CONSULTATION','UPLOAD','TRANSCRIPTION','MEDICAL RECORD','CONFIRMATION','EXPORT'][index] }}</small></span>
+          <span class="step-label">{{ label }}<small>{{ ['CONSULTATION','UPLOAD','TRANSCRIPTION','REVIEW & SIGN','EXPORT'][index] }}</small></span>
         </button>
       </nav>
 
       <div v-if="sourceDirty && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，请重新生成病历后再确认。</span></div>
+      <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读状态，该患者由其他医生负责接诊，仅展示患者信息和接诊状态。</span></div>
+      </template>
 
       <div v-if="view === 'workbench'" class="consultation-start-view">
         <section class="card consultation-start-card" :class="{ 'is-active': active, 'is-closed': closed }">
           <div class="consultation-step-chip"><span class="step-chip-number">01</span><span>患者 / 接诊</span><small>CONSULTATION</small></div>
           <div class="consultation-start-content">
             <div class="consultation-start-icon"><Icon :name="waiting ? 'play' : closed ? 'check' : 'mic'" /></div>
-            <span class="consultation-state-kicker">{{ waiting ? 'READY TO START' : closed ? 'VISIT CLOSED' : 'VISIT IN PROGRESS' }}</span>
-            <h2>{{ waiting ? '准备开始本次接诊' : closed ? `本次接诊${statusText(currentVisit)}` : '本次接诊进行中' }}</h2>
-            <p>{{ waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。已完成接诊的患者不支持重复接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
-            <button v-if="waiting" class="btn primary start-consultation-btn" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
-            <button v-else-if="active" class="btn primary start-consultation-btn" :disabled="busy" @click="navigate('audio')"><Icon name="mic" />进入录音上传</button>
+            <span class="consultation-state-kicker">{{ readOnlyCurrentPatient ? 'READ ONLY' : waiting ? 'READY TO START' : closed ? 'VISIT CLOSED' : 'VISIT IN PROGRESS' }}</span>
+            <h2>{{ readOnlyCurrentPatient ? `接诊状态：${statusText(currentVisit)}` : waiting ? '准备开始本次接诊' : closed ? `本次接诊${statusText(currentVisit)}` : '本次接诊进行中' }}</h2>
+            <p>{{ readOnlyCurrentPatient ? '当前患者由其他医生负责接诊，科室长仅可查看患者信息、接诊医生和接诊状态。' : waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。已完成接诊的患者不支持重复接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
+            <button v-if="!readOnlyCurrentPatient && waiting" class="btn primary start-consultation-btn" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
+            <button v-else-if="!readOnlyCurrentPatient && active" class="btn primary start-consultation-btn" :disabled="busy" @click="navigate('audio')"><Icon name="mic" />进入录音上传</button>
+            <span v-else-if="readOnlyCurrentPatient" class="small-muted">仅可查看状态</span>
             <span v-else class="small-muted">该患者接诊已完成，不支持重复接诊</span>
           </div>
           <div class="consultation-start-meta">
@@ -1234,7 +1380,7 @@ defineExpose({ selectPatient })
         </section>
       </div>
 
-      <div v-else-if="view === 'workbench' && false" class="workspace">
+      <div v-else-if="showLegacyWorkspace" class="workspace">
         <div class="source-column">
           <section class="card">
             <div class="card-head"><h2><Icon name="mic" />问诊录音</h2><span class="small-muted">{{ String(recordings.length).padStart(2, '0') }} 段录音</span></div>
@@ -1537,15 +1683,22 @@ defineExpose({ selectPatient })
 
       <div v-else-if="view === 'record'" class="full-view">
         <section class="card record-card">
-          <div class="card-head"><h2><Icon name="file" />门诊病历 <span v-if="record?.record_id" class="badge" :class="confirmed ? 'teal' : 'amber'">{{ confirmed ? '医生已确认' : '待医生确认' }}</span></h2>
+          <div class="card-head"><h2><Icon name="file" />门诊病历 <span v-if="record?.record_id" class="badge" :class="confirmed ? 'teal' : 'amber'">{{ confirmed ? '已签署' : '待签署' }}</span></h2>
             <div class="record-header-actions"><span v-if="record?.record_id" class="record-version">v{{ record.version_no }}.0</span>
-              <button v-if="record?.record_id && confirmed && !closed" class="btn small" @click="editRecord"><Icon name="edit" />修改病历</button>
-              <button v-else-if="record?.record_id && !closed" class="btn small" :disabled="busy || !allTranscribed" @click="modal='regenerate'"><Icon name="refresh" />重新生成</button>
+              <button v-if="record?.record_id && !confirmed && !closed" class="btn small" :disabled="busy || !allTranscribed" @click="modal='regenerate'"><Icon name="refresh" />重新生成</button>
             </div>
           </div>
           <div class="record-subbar"><span class="template-label"><Icon name="list" />标准门诊病历模板</span><span>{{ doctor.department_name }} · v0.1</span></div>
           <div v-if="!record?.record_id" class="empty-state"><div class="empty-icon"><Icon name="file" /></div><h3>让对话成为清晰的病历</h3><p>完成全部录音转写后，按标准模板生成一份病历草稿。</p><button class="btn primary" :disabled="!allTranscribed || busy || closed" @click="generateRecord"><Icon name="sparkle" />生成病历草稿</button></div>
-          <form v-else class="record-form" autocomplete="off" @submit.prevent="saveDraft">
+          <template v-else>
+            <div class="record-signing-status" :class="{ signed: confirmed }">
+              <Icon :name="confirmed ? 'shield' : 'check'" />
+              <div>
+                <strong>{{ confirmed ? `已签署 v${record?.version_no}.0` : `待医生签署 · v${record?.version_no}.0` }}</strong>
+                <span>{{ confirmed ? `${record?.confirmed_by_name || doctor.display_name}医生 · ${formatDateTime(record?.confirmed_at)}` : missingFields.length ? `待完善：${missingFields.join('、')}` : '请核对内容后确认并签署当前版本。' }}</span>
+              </div>
+            </div>
+          <form class="record-form" autocomplete="off" @submit.prevent="saveDraft">
             <section class="form-section"><div class="section-label"><h3>基本信息</h3><span><span class="required">*</span> 为必填项</span></div>
               <div class="basic-grid">
                 <div v-for="field in recordFields.slice(0, 4)" :key="field.key" class="field">
@@ -1568,83 +1721,15 @@ defineExpose({ selectPatient })
                 <div v-for="field in recordFields.slice(10)" :key="field.key"><div class="field"><label :for="`field-${field.key}`">{{ field.label }}<span class="auto-tag">自动填入</span></label><input :id="`field-${field.key}`" :value="recordForm?.[field.key] ?? ''" :type="field.key === 'date' ? 'date' : 'text'" readonly :disabled="locked" @input="updateField(field.key, $event)" /></div></div>
               </div>
             </section>
-            <p class="auto-note"><Icon name="info" />非必填项未提及则留空。内容仅为病历草稿，最终以医生确认版本为准。</p>
+            <p class="auto-note"><Icon name="info" />非必填项未提及则留空。签署后将锁定当前病历版本，后续修改会创建新修订版。</p>
           </form>
-          <div v-if="record?.record_id" class="record-footer">
-            <span><Icon name="shield" />{{ confirmed ? `${record?.confirmed_by_name || doctor.display_name}医生已确认 · v${record?.version_no}.0` : '记录已保存到后端' }}</span>
-            <span>{{ confirmed ? formatDateTime(record?.confirmed_at) : '草稿可自动保存' }}</span>
-          </div>
-        </section>
-      </div>
-
-      <div v-else-if="view === 'confirm'" class="full-view">
-        <section class="card review-card">
-          <div class="review-icon"><Icon :name="confirmed ? 'shield' : 'check'" /></div>
-          <h2>{{ confirmed ? '当前病历已确认' : '请完成本次病历核对' }}</h2>
-          <p>{{ confirmed ? '当前确认版本可以导出。再次修改后，需要重新确认。' : '请核对患者陈述、病历内容与必填信息。即使未修改，也需医生主动确认。' }}</p>
-          <div class="review-meta"><span>接诊编号 {{ currentVisit?.visit_no || '—' }}</span><span>接诊医生 {{ record?.content?.doctor || doctor.display_name }}</span><span>病历版本 {{ record?.record_id ? `v${record.version_no}.0` : '尚未生成' }}</span></div>
-          <div class="checklist">
-            <div :class="{ missing: !record?.record_id }"><Icon :name="record?.record_id ? 'check' : 'info'" />模板固定字段已完整保留</div>
-            <div :class="{ missing: missingFields.length }"><Icon :name="!missingFields.length ? 'check' : 'info'" />患者及接诊必填信息已填写</div>
-            <div :class="{ missing: !allTranscribed }"><Icon :name="allTranscribed ? 'check' : 'info'" />全部录音已转写并采用</div>
-            <div :class="{ missing: !confirmed }"><Icon :name="confirmed ? 'check' : 'info'" />当前病历版本已由医生确认</div>
-          </div>
-          <p v-if="missingFields.length" class="issue-hint">待完善：{{ missingFields.join('、') }}</p>
-          <button v-if="confirmed" class="btn primary" @click="navigate('export')"><Icon name="download" />前往导出</button>
-          <button v-else class="btn primary" :disabled="!record?.record_id || busy || closed" @click="requestConfirm"><Icon name="shield" />核对并确认病历</button>
-        </section>
-
-        <section class="card record-card">
-          <div class="card-head"><h2><Icon name="file" />门诊病历 <span v-if="record?.record_id" class="badge" :class="confirmed ? 'teal' : 'amber'">{{ confirmed ? '医生已确认' : '待医生确认' }}</span></h2>
-            <div class="record-header-actions"><span v-if="record?.record_id" class="record-version">v{{ record.version_no }}.0</span>
-              <button v-if="record?.record_id && confirmed && !closed" class="btn small" @click="editRecord"><Icon name="edit" />修改病历</button>
-              <button v-else-if="record?.record_id && !closed" class="btn small" :disabled="busy || !allTranscribed" @click="modal='regenerate'"><Icon name="refresh" />重新生成</button>
-            </div>
-          </div>
-          <div class="record-subbar"><span class="template-label"><Icon name="list" />标准门诊病历模板</span><span>{{ doctor.department_name }} · v0.1</span></div>
-          <div v-if="!record?.record_id" class="empty-state"><div class="empty-icon"><Icon name="file" /></div><h3>让对话成为清晰的病历</h3><p>完成全部录音转写后，按标准模板生成一份病历草稿。</p><button class="btn primary" :disabled="!allTranscribed || busy || closed" @click="generateRecord"><Icon name="sparkle" />生成病历草稿</button></div>
-          <form v-else class="record-form" autocomplete="off" @submit.prevent="saveDraft">
-            <section class="form-section"><div class="section-label"><h3>基本信息</h3><span><span class="required">*</span> 为必填项</span></div>
-              <div class="basic-grid">
-                <div v-for="field in recordFields.slice(0, 4)" :key="field.key" class="field">
-                  <label :for="`field-${field.key}`">{{ field.label }}<span v-if="field.required" class="required">*</span></label>
-                  <input :id="`field-${field.key}`" :value="recordForm?.[field.key] ?? ''" :type="field.key === 'age' ? 'number' : 'text'" :readonly="locked" @input="updateField(field.key, $event)" />
-                </div>
-              </div>
-            </section>
-            <section class="form-section"><div class="section-label"><h3>就诊内容</h3><span>根据医患对话整理</span></div>
-              <div class="fields-stack">
-                <div v-for="field in recordFields.slice(4, 7)" :key="field.key" class="field">
-                  <label :for="`field-${field.key}`">{{ field.label }}<span v-if="field.required" class="required">*</span></label>
-                  <textarea :id="`field-${field.key}`" :value="recordForm?.[field.key] ?? ''" :rows="field.key === 'present' ? 3 : 2" :disabled="locked" @input="updateField(field.key, $event)"></textarea>
-                </div>
-              </div>
-            </section>
-            <section class="form-section"><div class="section-label"><h3>诊疗记录</h3><span>由医生核对及补充</span></div>
-              <div class="diagnosis-grid">
-                <div class="wide" v-for="field in recordFields.slice(7, 10)" :key="field.key"><div class="field"><label :for="`field-${field.key}`">{{ field.label }}</label><textarea :id="`field-${field.key}`" :value="recordForm?.[field.key] ?? ''" rows="1" :disabled="locked" @input="updateField(field.key, $event)"></textarea></div></div>
-                <div v-for="field in recordFields.slice(10)" :key="field.key"><div class="field"><label :for="`field-${field.key}`">{{ field.label }}<span class="auto-tag">自动填入</span></label><input :id="`field-${field.key}`" :value="recordForm?.[field.key] ?? ''" :type="field.key === 'date' ? 'date' : 'text'" readonly :disabled="locked" @input="updateField(field.key, $event)" /></div></div>
-              </div>
-            </section>
-            <p class="auto-note"><Icon name="info" />非必填项未提及则留空。内容仅为病历草稿，最终以医生确认版本为准。</p>
-          </form>
-          <div v-if="record?.record_id" class="record-footer">
-            <span><Icon name="shield" />{{ confirmed ? `${record?.confirmed_by_name || doctor.display_name}医生已确认 · v${record?.version_no}.0` : '记录已保存到后端' }}</span>
-            <span>{{ confirmed ? formatDateTime(record?.confirmed_at) : '草稿可自动保存' }}</span>
-          </div>
-        </section>
-
-        <section v-if="confirmations.length" class="card">
-          <div class="card-head"><h2><Icon name="clock" />确认记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
-          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>确认医生</th><th>操作时间</th></tr></thead><tbody>
-            <tr v-for="item in confirmations.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.doctor_name }}</td><td>{{ formatDateTime(item.confirmed_at) }}</td></tr>
-          </tbody></table></div>
+          </template>
         </section>
       </div>
 
       <div v-else-if="view === 'export'" class="full-view">
         <div class="info-banner"><Icon :name="confirmed ? 'shield' : 'lock'" />
-          <span>{{ confirmed ? `当前可导出版本：v${record?.version_no}.0 · 确认医生：${record?.confirmed_by_name || doctor.display_name} · 确认时间：${formatDateTime(record?.confirmed_at)}` : '请先完成医生确认，确认后的版本才可以导出。' }}</span>
+          <span>{{ confirmed ? `当前可导出版本：v${record?.version_no}.0 · 签署医生：${record?.confirmed_by_name || doctor.display_name} · 签署时间：${formatDateTime(record?.confirmed_at)}` : '请先完成医生签署，签署后的版本才可以导出。' }}</span>
         </div>
         <section class="card">
           <div class="card-head"><h2><Icon name="download" />选择导出格式</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
@@ -1664,100 +1749,81 @@ defineExpose({ selectPatient })
         </section>
       </div>
 
-      <div v-else-if="view === 'audit'" class="full-view">
-        <section class="card"><div class="card-head"><h2><Icon name="shield" />确认记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
-          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>确认医生</th><th>操作时间</th></tr></thead><tbody>
-            <tr v-if="!confirmations.length"><td colspan="3">暂无确认记录</td></tr>
-            <tr v-for="item in confirmations" :key="item.id"><td>v{{ item.version_no }}</td><td>{{ item.doctor_name }}</td><td>{{ formatDateTime(item.confirmed_at) }}</td></tr>
-          </tbody></table></div>
-        </section>
-        <section class="card"><div class="card-head"><h2><Icon name="download" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
-          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
-            <tr v-if="!exports.length"><td colspan="3">暂无导出记录</td></tr>
-            <tr v-for="item in exports" :key="item.id"><td>v{{ item.version_no }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
-          </tbody></table></div>
-        </section>
-      </div>
-
-      <div v-else-if="view === 'config'" class="full-view">
-        <section class="card"><div class="card-head"><h2><Icon name="gear" />接入状态</h2><span class="small-muted">生产环境配置由后端注入</span></div>
-          <div class="card-body">
-            <div class="info-banner"><Icon name="check" />后端 API、录音对象存储与 DashScope ASR 已接入；病历生成服务仍待替换为真实模型。</div>
-            <div class="info-banner"><Icon name="info" />病历导出由后端异步生成并保存，生成完成后通过受保护的下载接口获取文件。</div>
+      <div v-else-if="view === 'audit'" class="full-view audit-view">
+        <section class="card audit-filter-card">
+          <div class="card-head"><h2><Icon name="shield" />筛选日志</h2><span class="small-muted">默认显示近 30 天记录</span></div>
+          <div class="audit-filters">
+            <label>开始日期<input v-model="auditFrom" type="date" :max="auditTo || undefined"></label>
+            <label>结束日期<input v-model="auditTo" type="date" :min="auditFrom || undefined"></label>
+            <label>操作医生<select v-model="auditDoctorId"><option value="">全部医生</option><option v-for="operator in auditOperators" :key="operator.id" :value="operator.id">{{ operator.display_name }}</option></select></label>
+            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="RECORDING_UPLOADED">上传录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
+            <button class="btn primary audit-search" :disabled="auditBusy" @click="loadAudit(1)"><Icon name="search" />查询</button>
           </div>
+        </section>
+        <section class="card audit-table-card">
+          <div class="card-head"><h2><Icon name="list" />操作记录</h2><span class="small-muted">共 {{ auditTotal }} 条</span></div>
+          <div class="table-wrap"><table class="log-table audit-log-table"><thead><tr><th>时间</th><th>操作人</th><th>操作类型</th><th>患者 / 接诊</th><th>操作详情</th><th>结果</th><th>IP</th></tr></thead><tbody>
+            <tr v-if="auditBusy"><td colspan="7">正在加载日志…</td></tr>
+            <tr v-else-if="!auditLogs.length"><td colspan="7">暂无符合条件的日志记录</td></tr>
+            <tr v-for="item in auditLogs" :key="item.id"><td>{{ formatDateTime(item.created_at) }}</td><td>{{ item.operator_name || '系统' }}</td><td>{{ auditActionLabel(item.action) }}</td><td><template v-if="item.visit_no || item.patient_name">{{ item.patient_name || '未记录患者' }}<br><span class="small-muted">{{ item.visit_no || '—' }}</span></template><template v-else>—</template></td><td>{{ item.detail || '—' }}</td><td><span class="badge" :class="item.result === 'SUCCESS' ? 'teal' : 'red'">{{ auditResultLabel(item.result) }}</span></td><td>{{ item.client_ip || '—' }}</td></tr>
+          </tbody></table></div>
+          <div class="audit-pagination"><span>第 {{ auditPage }} 页</span><div><button class="btn small" :disabled="auditBusy || auditPage <= 1" @click="loadAudit(auditPage - 1)">上一页</button><button class="btn small" :disabled="auditBusy || auditPage * 20 >= auditTotal" @click="loadAudit(auditPage + 1)">下一页</button></div></div>
         </section>
       </div>
     </main>
 
-    <footer class="bottom-bar">
+    <footer v-if="view !== 'audit'" class="bottom-bar">
       <div class="bottom-status">
         <span class="status-emblem"><Icon :name="confirmed ? 'shield' : 'save'" /></span>
         <div>
-          <div>{{ closed ? `本次接诊${statusText(currentVisit)}` : confirmed ? `病历 v${record?.version_no}.0 已由${record?.confirmed_by_name || doctor.display_name}医生确认` : record?.record_id ? '病历草稿已就绪，请医生核对' : waiting ? '患者待接诊' : '正在准备本次接诊的病历' }}</div>
-          <small>{{ confirmed ? `确认时间：${formatDateTime(record?.confirmed_at)}` : '系统仅整理问诊内容，不生成自动诊断或自动医嘱。' }}</small>
+          <div>{{ closed ? `本次接诊${statusText(currentVisit)}` : confirmed ? `病历 v${record?.version_no}.0 已由${record?.confirmed_by_name || doctor.display_name}医生签署` : record?.record_id ? '病历草稿已就绪，请审核并签署' : waiting ? '患者待接诊' : '正在准备本次接诊的病历' }}</div>
+          <small>{{ confirmed ? `签署时间：${formatDateTime(record?.confirmed_at)}` : '系统仅整理问诊内容，不生成自动诊断或自动医嘱。' }}</small>
         </div>
       </div>
       <div class="bottom-actions">
-        <button v-if="record?.record_id && !closed && !confirmed" class="btn" :disabled="busy" @click="saveDraft"><Icon name="save" />保存草稿</button>
-        <button v-if="!closed" class="btn" :class="{ primary: confirmed }" :disabled="busy || (!confirmed && !record?.record_id)" @click="confirmed ? editRecord() : requestConfirm()"><Icon name="check" />{{ confirmed ? '修改病历' : '医生确认' }}</button>
-        <span class="separator"></span>
-        <button class="btn" :class="{ primary: confirmed }" :disabled="!confirmed || busy" @click="exportFromBottom"><Icon name="download" />导出病历</button>
+        <button v-if="record?.record_id && !closed && !confirmed" class="btn" :disabled="busy || !!actionBusy" @click="saveDraft"><Icon name="save" />保存草稿</button>
+        <button v-if="record?.record_id && !closed && confirmed" class="btn" :disabled="busy || !!actionBusy" @click="editRecord"><Icon name="edit" />创建修订版</button>
+        <button v-else-if="record?.record_id && !closed" class="btn primary" :disabled="busy || !!actionBusy" @click="requestConfirm"><Icon name="shield" />确认并签署 v{{ record.version_no }}.0</button>
+        <button v-if="confirmed" class="btn primary" :disabled="busy" @click="exportFromBottom"><Icon name="download" />前往导出</button>
       </div>
     </footer>
-
-    <div class="toast" :class="{ show: toastVisible }" role="status" aria-live="polite">{{ toastText }}</div>
 
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-visit':'新增接诊','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认本次病历','help':'使用帮助','activity':'当前接诊动态' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','help':'使用帮助','activity':'当前接诊动态' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
-          <template v-if="modal === 'new-visit'">
-            <div class="modal-switch" role="tablist" aria-label="患者来源">
-              <button type="button" class="modal-switch-btn" :class="{ active: newPatientMode === 'existing' }" @click="newPatientMode='existing'; modalError=''">选择已有患者</button>
-              <button type="button" class="modal-switch-btn" :class="{ active: newPatientMode === 'manual' }" @click="newPatientMode='manual'; modalError=''">手动录入患者</button>
+          <template v-if="modal === 'new-patient'">
+            <div class="manual-patient-grid">
+              <div class="modal-field"><label for="manual-patient-name">患者姓名 <span class="required">*</span></label><input id="manual-patient-name" v-model="newPatientForm.name" maxlength="128" placeholder="请输入真实姓名" /></div>
+              <div class="modal-field"><label for="manual-patient-gender">性别 <span class="required">*</span></label><select id="manual-patient-gender" v-model="newPatientForm.gender"><option value="">请选择</option><option value="男">男</option><option value="女">女</option><option value="其他">其他</option><option value="未知">未知</option></select></div>
+              <div class="modal-field"><label for="manual-patient-age">年龄</label><input id="manual-patient-age" v-model.number="newPatientForm.age" type="number" min="0" max="150" step="1" placeholder="选填" /></div>
+              <div class="modal-field"><label for="manual-patient-phone">联系方式</label><input id="manual-patient-phone" v-model="newPatientForm.phone" type="tel" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
+              <div class="modal-field manual-patient-wide"><label for="manual-patient-id">证件号</label><input id="manual-patient-id" v-model="newPatientForm.idNo" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
             </div>
-            <template v-if="newPatientMode === 'existing'">
-              <div class="modal-field"><label for="new-patient">选择患者</label>
-                <select id="new-patient" v-model="newPatientId" :disabled="!patients.length">
-                  <option v-if="!patients.length" value="">暂无已有患者</option>
-                  <option v-for="patient in patients" :key="patient.id" :value="patient.id" :disabled="!canCreateVisit(patient.id)">{{ patient.name }} · {{ patient.gender }} · {{ patient.age ?? '—' }} 岁 · {{ patient.patient_no }}{{ canCreateVisit(patient.id) ? '' : ' · 已有接诊' }}</option>
-                </select>
-              </div>
-               <div class="modal-note">系统将分配新的唯一接诊编号；已完成接诊的患者不支持重复接诊，取消的接诊可重新开始。</div>
-            </template>
-            <template v-else>
-              <div class="manual-patient-grid">
-                <div class="modal-field"><label for="manual-patient-name">患者姓名 <span class="required">*</span></label><input id="manual-patient-name" v-model="newPatientForm.name" maxlength="128" placeholder="请输入真实姓名" /></div>
-                <div class="modal-field"><label for="manual-patient-gender">性别 <span class="required">*</span></label><select id="manual-patient-gender" v-model="newPatientForm.gender"><option value="">请选择</option><option value="男">男</option><option value="女">女</option><option value="其他">其他</option><option value="未知">未知</option></select></div>
-                <div class="modal-field"><label for="manual-patient-age">年龄</label><input id="manual-patient-age" v-model.number="newPatientForm.age" type="number" min="0" max="150" step="1" placeholder="选填" /></div>
-                <div class="modal-field"><label for="manual-patient-phone">联系方式</label><input id="manual-patient-phone" v-model="newPatientForm.phone" type="tel" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
-                <div class="modal-field manual-patient-wide"><label for="manual-patient-id">证件号</label><input id="manual-patient-id" v-model="newPatientForm.idNo" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
-              </div>
-              <div class="modal-note">手动录入的患者会保存到本地患者库，并自动生成患者编号；联系方式和证件号在列表中以脱敏形式展示。</div>
-              <div v-if="modalError" class="modal-error">{{ modalError }}</div>
-            </template>
+            <div class="modal-note">仅新增患者资料，不会创建或开始接诊。患者会保存到本地患者库并自动生成患者编号；联系方式和证件号在列表中以脱敏形式展示。</div>
+            <div v-if="modalError" class="modal-error">{{ modalError }}</div>
           </template>
           <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>取消后将清空本次接诊的录音、转写、病历和导出文件；该患者之后可以重新开始接诊。</p><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
-          <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已确认并导出。</p><p>结束后本次接诊将归档。</p></template>
+          <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已签署并导出。</p><p>结束后本次接诊将归档。</p></template>
           <template v-else-if="modal === 'regenerate'"><p>将使用当前已采用的转写文本，覆盖 <b>接诊 {{ currentVisit?.visit_no }}</b> 的当前草稿内容，并创建新版本。</p><p>医生手动编辑的内容也会被替换，请确认已保存所需内容。</p></template>
           <template v-else-if="modal === 'confirm'">
             <p>患者 <b>{{ recordForm?.name }}</b> · 接诊 <b>{{ currentVisit?.visit_no }}</b> · 病历 <b>v{{ record?.version_no }}.0</b></p>
-            <p>确认后将记录确认医生、时间及版本，并开放病历导出。</p>
+            <p>签署后将记录签署医生、时间及版本，并锁定当前病历；后续修改会创建新修订版并需重新签署。</p>
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
           </template>
-          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 核对编辑 → 医生确认 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
+          <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 审核并签署病历 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
         <div class="modal-actions">
-          <template v-if="modal === 'new-visit'"><button class="btn" @click="modal=null">取消</button><button class="btn primary" :disabled="busy || (newPatientMode === 'existing' && !newPatientId)" @click="createNewVisit"><Icon name="plus" />创建接诊</button></template>
+          <template v-if="modal === 'new-patient'"><button class="btn" @click="modal=null">取消</button><button class="btn primary" :disabled="busy" @click="createNewPatient"><Icon name="save" />保存患者</button></template>
           <template v-else-if="modal === 'cancel'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="busy" @click="doCancel">确认取消接诊</button></template>
           <template v-else-if="modal === 'finish'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="doFinish"><Icon name="check" />完成本次接诊</button></template>
           <template v-else-if="modal === 'regenerate'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="modal=null;generateRecord()"><Icon name="refresh" />重新生成</button></template>
-          <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy" @click="doConfirm"><Icon name="shield" />确认病历</button></template>
+          <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>
         </div>
       </div>
