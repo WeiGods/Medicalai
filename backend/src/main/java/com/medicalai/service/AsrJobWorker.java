@@ -44,7 +44,7 @@ public class AsrJobWorker {
     public AsrJobWorker(AsrJobStore store, AudioStorageService storage, DashScopeAsrClient cloud,
             LocalAsrClient local, DashScopeRoleClient cloudRoles,
             @Qualifier("asrLeaseHeartbeat") ScheduledExecutorService heartbeat, long publicTimeoutMs) {
-        this(store, storage, cloud, local, new LlmRoleRouter(cloudRoles, null), heartbeat, publicTimeoutMs);
+        this(store, storage, cloud, local, new LlmRoleRouter(cloudRoles), heartbeat, publicTimeoutMs);
     }
 
     @Scheduled(scheduler="publicAsrScheduler", fixedDelayString="${medicalai.dashscope.poll-delay-ms:3000}")
@@ -79,6 +79,9 @@ public class AsrJobWorker {
                 // 步骤 5（续）：将任务和一条录音切换为处理中，并获得本次录音的受控引用。
                 var recording = store.begin(job, token);
                 if ("LOCAL".equals(provider)) {
+                    if (!roleRouter.isConfigured()) {
+                        throw new IllegalStateException("公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理");
+                    }
                     // 步骤 6（本地）：同步调用本地 ASR，获得原始文本、时间戳和 speaker_id。
                     long asrStartedAt = System.nanoTime();
                     var result = local.transcribeDetailed(storage.load(recording.objectKey()), recording.fileName(), recording.mimeType());
@@ -154,13 +157,11 @@ public class AsrJobWorker {
             turn.put("text", result.get(i).text());
             return turn;
         }).toList();
-        LlmRoute route = LlmRoute.fromAsrRoute(job.providerRoute());
-        if (!route.isCallable()) {
-            throw new IllegalStateException("ASR 任务缺少可用的角色判断路由：" + job.providerRoute());
-        }
+        // 步骤 8：角色识别与 ASR 路由汇合；本地或公网 ASR 的文本都统一交给公网 LLM 判断。
+        LlmRoute route = roleRouter.roleRoute();
         long roleStartedAt = System.nanoTime();
         // 角色判断必须与产生文本的 ASR 路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
-        var assignedRoles = roleRouter.assignRoles(route, input);
+        var assignedRoles = roleRouter.assignRoles(input);
         Map<Integer, DashScopeRoleClient.RoleAssignment> roles = assignedRoles == null
                 ? Map.of() : assignedRoles;
         List<RecordingMapper.Turn> turns = IntStream.range(0,result.size()).mapToObj(i -> {
@@ -170,8 +171,8 @@ public class AsrJobWorker {
                     assignment.source(), assignment.confidence(), route.name());
         }).toList();
         long fallback = turns.stream().filter(turn -> "FALLBACK".equals(turn.roleSource())).count();
-        LOG.info("ASR角色判断完成：任务ID={}，路由={}，句段数={}，降级句段数={}，耗时毫秒={}",
-                job.id(), job.providerRoute(), turns.size(), fallback, elapsedMs(roleStartedAt));
+        LOG.info("ASR角色判断完成：任务ID={}，ASR路由={}，角色LLM路由={}，句段数={}，降级句段数={}，耗时毫秒={}",
+                job.id(), job.providerRoute(), route, turns.size(), fallback, elapsedMs(roleStartedAt));
         return turns;
     }
 

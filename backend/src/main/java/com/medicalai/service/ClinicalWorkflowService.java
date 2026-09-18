@@ -59,7 +59,7 @@ public class ClinicalWorkflowService {
                                    AudioStorageService storage, ObjectMapper objectMapper, Clock clock, DashScopeRoleClient roleClient,
                                    TranscriptRoleReclassificationStore roleReclassificationStore) {
         this(visits, patients, doctors, recordings, records, extractions, ai, storage, objectMapper, clock,
-                roleReclassificationStore, new LlmRouteResolver(recordings), new LlmRoleRouter(roleClient, ai));
+                roleReclassificationStore, new LlmRouteResolver(recordings), new LlmRoleRouter(roleClient));
     }
 
     @org.springframework.beans.factory.annotation.Autowired
@@ -288,7 +288,11 @@ public class ClinicalWorkflowService {
         }
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
-        LlmRoute route = routes.resolve(snapshot, requestedProvider);
+        if (requestedProvider != null && !requestedProvider.isBlank()
+                && LlmRoute.fromRequested(requestedProvider) != LlmRoute.DASHSCOPE) {
+            throw BusinessException.conflict("INTERNAL_LLM_UNAVAILABLE", "内网 LLM 未部署，角色识别请使用公网路由");
+        }
+        LlmRoute route = roleRouter.roleRoute();
 
         List<Utterance> candidates = currentUtterances(visit.id()).stream()
                 .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
@@ -307,7 +311,7 @@ public class ClinicalWorkflowService {
             inputs.add(input);
         }
 
-        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleRouter.assignRoles(route, inputs);
+        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleRouter.assignRoles(inputs);
         List<RecordingMapper.RoleUpdate> updates = new ArrayList<>();
         for (int index = 0; index < candidates.size(); index++) {
             DashScopeRoleClient.RoleAssignment assignment = assignments.get(index);

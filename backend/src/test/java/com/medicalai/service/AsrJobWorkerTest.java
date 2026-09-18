@@ -19,10 +19,11 @@ class AsrJobWorkerTest {
     AiServiceClient internal=mock(AiServiceClient.class);
     LocalAsrClient local=mock(LocalAsrClient.class);
     ScheduledExecutorService heartbeat=Executors.newSingleThreadScheduledExecutor();
-    LlmRoleRouter roleRouter=new LlmRoleRouter(roles,internal);
+    LlmRoleRouter roleRouter=new LlmRoleRouter(roles);
     AsrJobWorker worker=new AsrJobWorker(store,storage,cloud,local,roleRouter,heartbeat,600000);
     UUID id=UUID.randomUUID(),visit=UUID.randomUUID(),recordingId=UUID.randomUUID();
     Recording recording=new Recording(recordingId,visit,"R1","UPLOAD","key","a.wav","audio/wav",1L,100L,"UPLOADED",null,Instant.now());
+    @BeforeEach void configurePublicRoleLlm(){ lenient().when(roles.isConfigured()).thenReturn(true); }
     @AfterEach void stop(){heartbeat.shutdownNow();}
     RecordingMapper.AsrJob pending(String route){
         var job=new RecordingMapper.AsrJob(id,visit,null,null,"PENDING",0,null,null,route);
@@ -30,22 +31,29 @@ class AsrJobWorkerTest {
         when(store.begin(eq(job),any())).thenReturn(recording);
         return job;
     }
-    @Test void localCompletionAssignsRolesAfterAsrWithoutCallingPublicAsr(){
+    @Test void localCompletionAssignsRolesByPublicLlm(){
         var job=pending("LOCAL");
         var audio=new ByteArrayResource(new byte[]{1});
         when(storage.load("key")).thenReturn(audio);
         when(local.transcribeDetailed(audio,"a.wav","audio/wav")).thenReturn(new AsrResult(
                 List.of(new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null)), null));
-        when(internal.assignRoleAssignments(any())).thenReturn(Map.of(
+        when(roles.assignRoles(any())).thenReturn(Map.of(
                 0,new DashScopeRoleClient.RoleAssignment("PATIENT",88,"LLM"),
                 1,new DashScopeRoleClient.RoleAssignment("OTHER",null,"FALLBACK")));
         worker.processLocal();
         verifyNoInteractions(cloud);
-        verifyNoInteractions(roles);
+        verifyNoInteractions(internal);
         verify(storage,never()).presignedUrl(any());
         verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
-                new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88,"LOCAL"),
-                new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null,"LOCAL"))), isNull());
+                new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88,"DASHSCOPE"),
+                new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null,"DASHSCOPE"))), isNull());
+    }
+    @Test void localJobFailsBeforeInferenceWhenPublicRoleLlmIsMissing(){
+        var job=pending("LOCAL");
+        when(roles.isConfigured()).thenReturn(false);
+        worker.processLocal();
+        verifyNoInteractions(local,cloud,internal);
+        verify(store).fail(eq(job),any(),contains("未配置 DASHSCOPE_API_KEY"));
     }
     @Test void publicCompletionNeverCallsLocalService(){
         var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);

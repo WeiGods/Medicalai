@@ -43,6 +43,7 @@ medicalai:
     presign-expiry-seconds: ${MINIO_PRESIGN_EXPIRY_SECONDS:900}
   local-asr:
     base-url: ${LOCAL_ASR_BASE_URL:${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}}
+    mode: ${LOCAL_ASR_MODE:offline}
     poll-delay-ms: ${LOCAL_ASR_POLL_DELAY_MS:3000}
     connect-timeout-ms: ${LOCAL_ASR_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${LOCAL_ASR_READ_TIMEOUT_MS:600000}

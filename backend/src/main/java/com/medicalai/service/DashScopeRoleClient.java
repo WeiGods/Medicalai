@@ -142,6 +142,10 @@ public class DashScopeRoleClient {
         return assignments;
     }
 
+    public boolean isConfigured() {
+        return !apiKey.isBlank();
+    }
+
     private Map<Integer, RoleAssignment> assignBatch(
             List<Map<String, Object>> turns, Set<Integer> indexes, int batchNumber, int batchCount) {
         Exception failure = null;

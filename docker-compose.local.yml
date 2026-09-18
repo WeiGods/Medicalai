@@ -4,10 +4,12 @@ services:
   api:
     environment:
       MINIO_API_ENDPOINT: http://minio:9000
-      DASHSCOPE_API_KEY: ""
+      # 本地 ASR 只负责转写；角色识别统一汇入公网 LLM，因此公网凭据仍需通过环境变量提供。
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
   ai:
     environment:
       ASR_OFFLINE: "1"
+      ASR_MODE: "offline"
       ASR_MODEL: ${ASR_MODEL:-/models/Fun-ASR-Nano-2512}
       ASR_VAD_MODEL: ${ASR_VAD_MODEL:-/models/fsmn-vad}
       ASR_SPK_MODEL: ${ASR_SPK_MODEL:-/models/eres2netv2}

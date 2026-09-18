@@ -16,6 +16,7 @@ import logging
 import os
 import time
 import argparse
+from bisect import bisect_left
 from pathlib import Path
 import numpy as np
 import torch
@@ -75,6 +76,8 @@ def _clean_asr_text(text):
 
 _FILLER_CHARS = set("嗯啊哦噢喔呃唉诶嘿呀嘛吧呢吗哈")
 _FILLER_PUNCT = "，。,.？?！!~…、；;：:"
+_SENTENCE_END_CHARS = set("。！？!?；;")
+_NON_CONTENT_RE = regex.compile(r"[\p{P}\p{Z}\s]+")
 
 
 def _is_filler_text(text):
@@ -108,6 +111,168 @@ def _is_sparse_text(text, duration_ms, min_cps=1.0):
     if not text or duration_ms <= 0:
         return False
     return len(text) * 1000.0 / duration_ms < min_cps
+
+
+def _content_only(text):
+    """Remove punctuation/separators so post-processing can be validated."""
+    return _NON_CONTENT_RE.sub("", text or "")
+
+
+def _punctuate_text(punc_model, text):
+    """Add punctuation without allowing the model to rewrite ASR content."""
+    raw = (text or "").strip()
+    if not raw or punc_model is None:
+        return raw
+    try:
+        results = punc_model.generate(input=raw, cache={})
+        candidate = ((results or [{}])[0].get("text") or "").strip()
+    except Exception as error:
+        logger.warning("Punctuation inference failed; keeping raw text: %s", error)
+        return raw
+    if not candidate or _content_only(candidate) != _content_only(raw):
+        logger.warning("Punctuation model changed ASR content; keeping raw text")
+        return raw
+    return candidate
+
+
+def _split_punctuated_sentences(text):
+    """Split on sentence-ending punctuation while retaining commas in a turn."""
+    value = (text or "").strip()
+    if not value:
+        return []
+    sentences = []
+    start = 0
+    for index, char in enumerate(value):
+        if char not in _SENTENCE_END_CHARS:
+            continue
+        sentence = value[start:index + 1].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _timestamped_sentence_spans(
+    raw_text,
+    punctuated_text,
+    timestamps,
+    segment_start_ms,
+    segment_end_ms,
+):
+    """Split punctuated text and map each sentence to CTC character times."""
+    raw = (raw_text or "").strip()
+    punctuated = (punctuated_text or "").strip()
+    sentences = _split_punctuated_sentences(punctuated)
+    if not sentences:
+        return []
+    if _content_only(punctuated) != _content_only(raw):
+        sentences = [raw]
+
+    char_times = []
+    for item in timestamps or []:
+        token = str(item.get("token") or "")
+        if not token:
+            continue
+        start_ms = int(segment_start_ms + round(float(item.get("start_time", 0.0)) * 1000))
+        end_ms = int(segment_start_ms + round(float(item.get("end_time", 0.0)) * 1000))
+        start_ms = max(int(segment_start_ms), min(int(segment_end_ms), start_ms))
+        end_ms = max(start_ms, min(int(segment_end_ms), end_ms))
+        chars = list(token)
+        for offset, char in enumerate(chars):
+            if len(chars) == 1:
+                char_start, char_end = start_ms, end_ms
+            else:
+                char_start = start_ms + round((end_ms - start_ms) * offset / len(chars))
+                char_end = start_ms + round((end_ms - start_ms) * (offset + 1) / len(chars))
+            char_times.append((char, char_start, char_end))
+
+    spans = []
+    cursor = 0
+    total_content = sum(len(_content_only(sentence)) for sentence in sentences)
+    for index, sentence in enumerate(sentences):
+        content_length = len(_content_only(sentence))
+        if content_length <= 0:
+            continue
+        if len(char_times) == len(raw):
+            first = cursor
+            last = min(len(char_times) - 1, cursor + content_length - 1)
+            start_ms = char_times[first][1]
+            end_ms = char_times[last][2]
+            cursor += content_length
+        else:
+            start_ms = int(
+                segment_start_ms
+                + (segment_end_ms - segment_start_ms) * cursor / max(1, total_content)
+            )
+            cursor += content_length
+            end_ms = int(
+                segment_start_ms
+                + (segment_end_ms - segment_start_ms) * cursor / max(1, total_content)
+            )
+        char_start = first if len(char_times) == len(raw) else None
+        char_end = last if len(char_times) == len(raw) else None
+        spans.append({
+            "text": sentence,
+            "start": start_ms,
+            "end": end_ms,
+            "_char_times": (
+                char_times[char_start:char_end + 1]
+                if char_start is not None and char_end is not None
+                else []
+            ),
+        })
+    return spans
+
+
+def _split_text_by_char_times(text, char_times, boundaries_ms):
+    """Split text at speaker boundaries using CTC character centers."""
+    value = (text or "").strip()
+    content_positions = [
+        index
+        for index, char in enumerate(value)
+        if not _NON_CONTENT_RE.fullmatch(char)
+    ]
+    if not value or not content_positions or len(content_positions) != len(char_times or []):
+        return None
+
+    centers = [
+        (float(start_ms) + float(end_ms)) / 2.0
+        for _char, start_ms, end_ms in char_times
+    ]
+    cuts = [0]
+    entry_ranges = [0]
+    previous_entry = 0
+    for boundary_ms in sorted(float(value) for value in boundaries_ms):
+        entry_index = bisect_left(centers, boundary_ms, lo=previous_entry)
+        if entry_index <= previous_entry:
+            continue
+        if entry_index >= len(content_positions):
+            continue
+        cuts.append(content_positions[entry_index])
+        entry_ranges.append(entry_index)
+        previous_entry = entry_index
+    cuts.append(len(value))
+    entry_ranges.append(len(content_positions))
+
+    if len(cuts) <= 2:
+        return None
+
+    parts = []
+    for index in range(len(cuts) - 1):
+        part_text = value[cuts[index]:cuts[index + 1]].strip()
+        entry_start = entry_ranges[index]
+        entry_end = entry_ranges[index + 1]
+        if not part_text or entry_start >= entry_end:
+            return None
+        parts.append({
+            "text": part_text,
+            "start": int(char_times[entry_start][1]),
+            "end": int(char_times[entry_end - 1][2]),
+        })
+    return parts
 
 
 def merge_turn_sentences(sentences, gap_ms=500, filler_gap_ms=1500):
@@ -497,6 +662,22 @@ class HybridSpeakerTracker:
         if len(merged) <= 1:
             return [sentence]
 
+        timestamp_parts = _split_text_by_char_times(
+            text,
+            sentence.get("_char_times") or [],
+            [m_start * 1000 for m_start, _m_end, _m_spk in merged[1:]],
+        )
+        if timestamp_parts is not None and len(timestamp_parts) == len(merged):
+            timestamped = []
+            for part, (_m_start, _m_end, m_spk) in zip(timestamp_parts, merged):
+                timestamped.append({
+                    "text": part["text"],
+                    "start": part["start"],
+                    "end": part["end"],
+                    "spk": m_spk,
+                })
+            return timestamped
+
         total_dur = sum(m[1] - m[0] for m in merged)
         sub_sentences = []
         char_pos = 0
@@ -508,7 +689,12 @@ class HybridSpeakerTracker:
                 sub_text = text[char_pos:char_pos + n_chars]
                 char_pos += n_chars
             if sub_text.strip():
-                sub_sentences.append({"text": sub_text.strip(), "start": int(m_start*1000), "end": int(m_end*1000), "spk": m_spk})
+                sub_sentences.append({
+                    "text": sub_text.strip(),
+                    "start": int(m_start * 1000),
+                    "end": int(m_end * 1000),
+                    "spk": m_spk,
+                })
 
         return sub_sentences if sub_sentences else [sentence]
 
@@ -537,7 +723,7 @@ class RealtimeASRSession:
         merge_enabled=True,
         use_context=True,
         min_rms=0.004,
-        drop_filler_ms=1500,
+        drop_filler_ms=0,
     ):
         self.vllm_engine = vllm_engine
         self.asr_kwargs = asr_kwargs
@@ -798,10 +984,11 @@ _vllm_engine = None
 _asr_kwargs = None
 _vad_model = None
 _spk_model = None
+_punc_model = None
 
 
 def load_models(args):
-    global _vllm_engine, _asr_kwargs, _vad_model, _spk_model
+    global _vllm_engine, _asr_kwargs, _vad_model, _spk_model, _punc_model
     if _vllm_engine is None:
         if getattr(args, "offline", False):
             paths = [args.model, args.vad_model]
@@ -866,6 +1053,31 @@ def load_models(args):
                                      "speech_eres2netv2_sv_zh-cn_16k-common"),
             )
 
+        punc_model_path = getattr(args, "punc_model", None)
+        if getattr(args, "disable_punc", False) or not punc_model_path:
+            logger.info("Punctuation post-processing disabled")
+            _punc_model = None
+        elif os.path.isdir(punc_model_path) or not getattr(args, "offline", False):
+            logger.info("Loading punctuation model: %s", punc_model_path)
+            try:
+                _punc_model = AutoModel(
+                    model=punc_model_path,
+                    device=getattr(args, "punc_device", "cpu"),
+                    disable_update=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Punctuation model unavailable; raw ASR text will be used",
+                    exc_info=True,
+                )
+                _punc_model = None
+        else:
+            logger.warning(
+                "Punctuation model directory not found in offline mode: %s",
+                punc_model_path,
+            )
+            _punc_model = None
+
         logger.info("All models ready!")
     return _vllm_engine, _asr_kwargs, _vad_model, _spk_model
 
@@ -900,7 +1112,7 @@ async def handle_client(websocket, args):
         merge_enabled=not getattr(args, "no_merge_turns", False),
         use_context=getattr(args, "use_context", False),
         min_rms=float(getattr(args, "min_rms", 0.004)),
-        drop_filler_ms=int(getattr(args, "drop_filler_ms", 1500)),
+        drop_filler_ms=int(getattr(args, "drop_filler_ms", 0)),
     )
     logger.info(f"Client connected: {websocket.remote_address}")
 
@@ -1013,6 +1225,25 @@ if __name__ == "__main__":
         help="Force-cut a VAD segment once it reaches this duration; 0 keeps the model default",
     )
     parser.add_argument(
+        "--punc-model",
+        type=str,
+        default="/workspace/models/asr_models/"
+        "punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
+        help="CT-Transformer punctuation model path or hub id",
+    )
+    parser.add_argument(
+        "--punc-device",
+        type=str,
+        default="cpu",
+        help="Device for punctuation post-processing",
+    )
+    parser.add_argument(
+        "--disable-punc",
+        action="store_true",
+        default=False,
+        help="Disable punctuation post-processing",
+    )
+    parser.add_argument(
         "--merge-gap-ms",
         type=int,
         default=500,
@@ -1028,7 +1259,7 @@ if __name__ == "__main__":
                         help="Skip embeddings for speaker segments shorter than this")
     parser.add_argument("--min-rms", type=float, default=0.004,
                         help="Skip segments quieter than this RMS (0 disables the noise gate)")
-    parser.add_argument("--drop-filler-ms", type=int, default=1500,
+    parser.add_argument("--drop-filler-ms", type=int, default=0,
                         help="Drop segments shorter than this whose text is only interjections; 0 keeps them")
     parser.add_argument(
         "--partial-window-sec",

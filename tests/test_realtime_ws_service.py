@@ -466,6 +466,127 @@ def test_build_streaming_vad_accepts_full_schedule(monkeypatch):
     assert captured["silence_schedule"] == [(5000.0, 2000), (float("inf"), 1200)]
 
 
+def test_punctuation_only_changes_punctuation(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    class FakePuncModel:
+        def generate(self, input, cache):
+            return [{"text": "你好吗？我很好。"}]
+
+    assert module._punctuate_text(FakePuncModel(), "你好吗我很好") == "你好吗？我很好。"
+
+
+def test_punctuation_rewrite_is_rejected(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    class RewritingPuncModel:
+        def generate(self, input, cache):
+            return [{"text": "你好呀？我很好。"}]
+
+    assert module._punctuate_text(RewritingPuncModel(), "你好吗我很好") == "你好吗我很好"
+
+
+def test_timestamped_sentences_keep_question_and_pause(monkeypatch):
+    module = load_service_module(monkeypatch)
+    timestamps = [
+        {"token": "你", "start_time": 0.0, "end_time": 0.1},
+        {"token": "好", "start_time": 0.1, "end_time": 0.2},
+        {"token": "吗", "start_time": 0.2, "end_time": 0.3},
+        {"token": "我", "start_time": 0.4, "end_time": 0.5},
+        {"token": "很", "start_time": 0.5, "end_time": 0.6},
+        {"token": "好", "start_time": 0.6, "end_time": 0.7},
+    ]
+
+    spans = module._timestamped_sentence_spans(
+        "你好吗我很好",
+        "你好吗？我很好。",
+        timestamps,
+        1000,
+        2000,
+    )
+
+    assert spans == [
+        {
+            "text": "你好吗？",
+            "start": 1000,
+            "end": 1300,
+            "_char_times": [
+                ("你", 1000, 1100),
+                ("好", 1100, 1200),
+                ("吗", 1200, 1300),
+            ],
+        },
+        {
+            "text": "我很好。",
+            "start": 1400,
+            "end": 1700,
+            "_char_times": [
+                ("我", 1400, 1500),
+                ("很", 1500, 1600),
+                ("好", 1600, 1700),
+            ],
+        },
+    ]
+
+
+def test_split_text_by_char_times_uses_real_boundary(monkeypatch):
+    module = load_service_module(monkeypatch)
+    char_times = [
+        ("甲", 0, 100),
+        ("乙", 100, 200),
+        ("丙", 200, 300),
+        ("丁", 300, 400),
+        ("戊", 400, 500),
+        ("己", 500, 600),
+    ]
+
+    assert module._split_text_by_char_times(
+        "甲乙，丙丁。戊己",
+        char_times,
+        [300],
+    ) == [
+        {"text": "甲乙，丙", "start": 0, "end": 300},
+        {"text": "丁。戊己", "start": 300, "end": 600},
+    ]
+
+
+def test_try_split_uses_ctc_timestamps_for_speaker_change(monkeypatch):
+    module = load_service_module(monkeypatch)
+    tracker = object.__new__(module.HybridSpeakerTracker)
+    sentence = {
+        "text": "甲乙，丙丁。",
+        "start": 0,
+        "end": 500,
+        "_char_times": [
+            ("甲", 0, 100),
+            ("乙", 100, 200),
+            ("丙", 200, 300),
+            ("丁", 300, 400),
+        ],
+    }
+
+    assert tracker._try_split(
+        sentence,
+        [(0.0, 0.25, 0), (0.25, 0.5, 1)],
+        {},
+        min_split_s=0.2,
+    ) == [
+        {"text": "甲乙，", "start": 0, "end": 200, "spk": 0},
+        {"text": "丙丁。", "start": 200, "end": 400, "spk": 1},
+    ]
+
+
+def test_punctuation_split_prefers_sentence_end_over_commas(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    assert module._split_punctuated_sentences(
+        "上上一年12月份吧，然后有一次过度。过了5天，就不行了？"
+    ) == [
+        "上上一年12月份吧，然后有一次过度。",
+        "过了5天，就不行了？",
+    ]
+
+
 def test_filler_only_text_detection(monkeypatch):
     module = load_service_module(monkeypatch)
 
@@ -522,10 +643,25 @@ def test_decode_segment_drops_silent_audio_and_short_fillers(monkeypatch):
         sample_rate=sample_rate,
         chunk_ms=1000,
         audio_lookback_sec=5,
+        drop_filler_ms=1500,
     )
     filler_session.add_audio(loud_second)
     filler_session.decode(is_final=False)
     assert filler_session.locked_sentences == []
+
+    # The public filetranscript keeps short interjections, so the default
+    # realtime path preserves them as dialogue context.
+    filler_kept_session = module.RealtimeASRSession(
+        vllm_engine=TextEngine("嗯。嗯。嗯。"),
+        asr_kwargs={},
+        vad=SegmentVad(sample_rate=sample_rate, segment_end_sample=sample_rate),
+        sample_rate=sample_rate,
+        chunk_ms=1000,
+        audio_lookback_sec=5,
+    )
+    filler_kept_session.add_audio(loud_second)
+    filler_kept_session.decode(is_final=False)
+    assert [s["text"] for s in filler_kept_session.locked_sentences] == ["嗯。嗯。嗯。"]
 
     # Real speech survives the filters.
     speech_session = module.RealtimeASRSession(

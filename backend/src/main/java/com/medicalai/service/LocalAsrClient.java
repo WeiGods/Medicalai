@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.Resource;
@@ -21,15 +22,23 @@ import org.springframework.web.client.RestClient;
 public class LocalAsrClient {
     private static final Logger LOG = LoggerFactory.getLogger(LocalAsrClient.class);
     private final RestClient client;
+    private final String mode;
 
+    @Autowired
     public LocalAsrClient(@Value("${medicalai.local-asr.base-url:${medicalai.ai.base-url:http://127.0.0.1:8000}}") String baseUrl,
                           @Value("${medicalai.local-asr.connect-timeout-ms:5000}") long connectTimeout,
-                          @Value("${medicalai.local-asr.read-timeout-ms:600000}") long readTimeout) {
+                          @Value("${medicalai.local-asr.read-timeout-ms:600000}") long readTimeout,
+                          @Value("${medicalai.local-asr.mode:offline}") String mode) {
         var http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofMillis(Math.max(1, connectTimeout))).build();
         var factory = new JdkClientHttpRequestFactory(http);
         factory.setReadTimeout(Duration.ofMillis(Math.max(1, readTimeout)));
         client = RestClient.builder().baseUrl(baseUrl).requestFactory(factory).build();
+        this.mode = mode == null || mode.isBlank() ? "offline" : mode.strip().toLowerCase();
+    }
+
+    public LocalAsrClient(String baseUrl, long connectTimeout, long readTimeout) {
+        this(baseUrl, connectTimeout, readTimeout, "offline");
     }
 
     public List<AsrSegment> transcribe(Resource audio, String filename, String mimeType) {
@@ -49,7 +58,10 @@ public class LocalAsrClient {
             catch (IllegalArgumentException e) { headers.setContentType(MediaType.APPLICATION_OCTET_STREAM); }
             var body = new LinkedMultiValueMap<String, Object>();
             body.add("file", new HttpEntity<>(resource, headers));
-            JsonNode response = client.post().uri("/internal/asr/transcribe")
+            JsonNode response = client.post().uri(uriBuilder -> uriBuilder
+                            .path("/internal/asr/transcribe")
+                            .queryParam("mode", mode)
+                            .build())
                     .contentType(MediaType.MULTIPART_FORM_DATA).body(body).retrieve().body(JsonNode.class);
             if (response == null || !"SUCCEEDED".equals(response.path("status").asText())) {
                 throw new IllegalStateException("本地 ASR 未返回成功状态");
