@@ -33,7 +33,7 @@ def resolve_audio_path(audio: str | None, model_path: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio", nargs="?", help="Audio file. Defaults to model example/zh.mp3")
-    parser.add_argument("--model", default="/workspace/Fun-ASR-Nano-2512")
+    parser.add_argument("--model", default="FunAudioLLM/Fun-ASR-Nano-2512")
     parser.add_argument("--hub", default="ms", choices=["hf", "ms"])
     parser.add_argument(
         "--device",
@@ -64,7 +64,7 @@ def main() -> None:
         hub=args.hub,
     )
 
-    wav_path = "/workspace/Test ASR.mp3"
+    wav_path = resolve_audio_path(args.audio, model.model_path)
     res = model.generate(
         input=[wav_path],
         cache={},

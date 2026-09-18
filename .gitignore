@@ -24,3 +24,23 @@ Fun-ASR-Nano-2512/
 **/node_modules/
 backend/.tools/
 push-medicalai.*
+/docker-models
+
+# ASR validation outputs and local recordings
+/asr_test_results/
+/asr_test_*.json
+/asr_test_*.log
+/asr_validation/**/results/
+/asr_validation/**/run.*
+/asr_validation/**/diagnostic_*.json
+/asr_validation/turn_tracker_*.json
+/asr_validation/turn_tracker_*.log
+/data/recordings/
+
+# Keep the reusable ASR validator; ignore one-off experiments and reports.
+/asr_benchmark_report.md
+/batch_asr_test.py
+/test_speaker_verify.py
+/asr_validation/*.py
+!/asr_validation/validate_speaker_turns.py
+/asr_validation/*_round*/

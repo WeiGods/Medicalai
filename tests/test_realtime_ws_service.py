@@ -101,7 +101,7 @@ def test_two_hour_session_keeps_audio_bounded_and_duration_absolute(monkeypatch)
         chunk_ms=1000,
         audio_lookback_sec=5,
     )
-    one_second = np.zeros(sample_rate, dtype=np.int16).tobytes()
+    one_second = (np.full(sample_rate, 2000, dtype=np.int16)).tobytes()
 
     for _ in range(2 * 60 * 60):
         session.add_audio(one_second)
@@ -125,10 +125,16 @@ def test_completed_segment_uses_absolute_offsets_after_audio_compaction(monkeypa
         chunk_ms=1000,
         audio_lookback_sec=2,
     )
-    one_second = np.zeros(sample_rate, dtype=np.int16).tobytes()
+    one_second = (np.full(sample_rate, 2000, dtype=np.int16)).tobytes()
 
     for _ in range(11):
         session.add_audio(one_second)
+
+    # VAD-confirmed segments are deferred to the next decode() cycle.
+    assert engine.input_lengths == []
+    assert session.locked_sentences == []
+
+    session.decode(is_final=False)
 
     assert engine.input_lengths == [sample_rate]
     assert session.locked_sentences == [{"text": "hello", "start": 10000, "end": 11000}]
@@ -256,6 +262,50 @@ def test_speaker_history_and_identity_state_have_hard_limits(monkeypatch):
     ]
 
 
+def test_finalize_uses_direct_cosine_for_short_speaker_history(monkeypatch):
+    utils_stub = types.ModuleType("funasr.models.campplus.utils")
+    utils_stub.sv_chunk = lambda segments: segments
+    utils_stub.distribute_spk = lambda sentences, speaker_segments: sentences
+
+    def postprocess(segments, vad_segments, labels, embeddings, return_spk_center=False):
+        output = [[segment[0], segment[1], int(label)] for segment, label in zip(segments, labels)]
+        centers = torch.stack(
+            [embeddings[labels == label].mean(0) for label in sorted(set(labels.tolist()))]
+        )
+        return (output, centers) if return_spk_center else output
+
+    utils_stub.postprocess = postprocess
+    cluster_stub = types.ModuleType("funasr.models.campplus.cluster_backend")
+    cluster_stub.ClusterBackend = lambda merge_thr: types.SimpleNamespace(
+        to=lambda device: None,
+        __call__=lambda embeddings, oracle_num=None: (_ for _ in ()).throw(AssertionError("short history must not cluster")),
+    )
+    monkeypatch.setitem(sys.modules, "funasr.models.campplus.utils", utils_stub)
+    monkeypatch.setitem(sys.modules, "funasr.models.campplus.cluster_backend", cluster_stub)
+    module = load_service_module(monkeypatch)
+
+    class FakeSpeakerModel:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, input, **kwargs):
+            center = [1.0, 0.0] if self.calls in (0, 2) else [0.0, 1.0]
+            self.calls += len(input)
+            return [{"spk_embedding": torch.tensor([center])} for _ in input]
+
+    tracker = module.HybridSpeakerTracker(FakeSpeakerModel(), "cpu", max_history_chunks=8)
+    tracker.sv_chunk = lambda segments: segments
+
+    for index, expected_speaker in enumerate((0, 1, 0)):
+        sentence = {"text": f"segment {index}", "start": index * 1000, "end": (index + 1) * 1000}
+        tracker.assign_streaming(
+            np.ones(16000, dtype=np.float32), index, index + 1, sentence
+        )
+        assert sentence["spk"] == expected_speaker
+
+    assert [row[2] for row in tracker._cluster_recent(update_centers=False)] == [0, 1, 0]
+
+
 def test_handler_is_responsive_and_serializes_shared_model_work(monkeypatch):
     module = load_service_module(monkeypatch)
 
@@ -306,7 +356,7 @@ def test_handler_is_responsive_and_serializes_shared_model_work(monkeypatch):
             self.sent.append(message)
 
     monkeypatch.setattr(module, "load_models", lambda args: (object(), {}, object(), None))
-    monkeypatch.setattr(module, "DynamicStreamingVAD", lambda model: object())
+    monkeypatch.setattr(module, "DynamicStreamingVAD", lambda model, **kwargs: object())
     monkeypatch.setattr(module, "RealtimeASRSession", BlockingSession)
 
     async def exercise_handler():
@@ -342,3 +392,223 @@ def test_handler_is_responsive_and_serializes_shared_model_work(monkeypatch):
     assert gaps
     assert max(gaps) < 0.08
     assert BlockingSession.max_active_workers == 1
+
+
+def test_merge_turn_sentences_joins_same_speaker_fragments(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    sentences = [
+        {"text": "今天先看报告", "start": 0, "end": 1200, "spk": 0},
+        {"text": "，染色体有一条异常", "start": 1500, "end": 3000, "spk": 0},
+        {"text": "嗯", "start": 3400, "end": 3600, "spk": 0},
+        {"text": "好的", "start": 4000, "end": 4600, "spk": 1},
+    ]
+
+    merged = module.merge_turn_sentences(sentences, gap_ms=500, filler_gap_ms=1500)
+
+    assert [item["text"] for item in merged] == [
+        "今天先看报告，染色体有一条异常嗯",
+        "好的",
+    ]
+    assert merged[0]["spk"] == 0
+    assert merged[0]["end"] == 3600
+
+
+def test_merge_turn_sentences_keeps_speaker_boundary(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    sentences = [
+        {"text": "做内膜检查", "start": 0, "end": 1000, "spk": 0},
+        {"text": "多少钱", "start": 1200, "end": 2000, "spk": 1},
+    ]
+
+    merged = module.merge_turn_sentences(sentences, gap_ms=500)
+
+    assert len(merged) == 2
+
+
+def test_build_streaming_vad_uses_fixed_silence_threshold(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    captured = {}
+
+    class CaptureVad:
+        def __init__(self, vad_model, speech_noise_thres=0.5, silence_schedule=None):
+            captured["speech_noise_thres"] = speech_noise_thres
+            captured["silence_schedule"] = silence_schedule
+
+    monkeypatch.setattr(module, "DynamicStreamingVAD", CaptureVad)
+    args = types.SimpleNamespace(vad_max_end_silence_ms=1200)
+
+    module.build_streaming_vad(object(), args)
+
+    assert captured["speech_noise_thres"] == 0.6
+    assert captured["silence_schedule"] == [(float("inf"), 1200)]
+
+
+def test_build_streaming_vad_accepts_full_schedule(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    captured = {}
+
+    class CaptureVad:
+        def __init__(self, vad_model, speech_noise_thres=0.5, silence_schedule=None):
+            captured["silence_schedule"] = silence_schedule
+
+    monkeypatch.setattr(module, "DynamicStreamingVAD", CaptureVad)
+    args = types.SimpleNamespace(
+        vad_max_end_silence_ms=0,
+        vad_silence_schedule='[[5000,2000],[Infinity,1200]]',
+    )
+
+    module.build_streaming_vad(object(), args)
+
+    assert captured["silence_schedule"] == [(5000.0, 2000), (float("inf"), 1200)]
+
+
+def test_filler_only_text_detection(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    assert module._is_filler_only("嗯。嗯。嗯。")
+    assert module._is_filler_only("啊")
+    assert not module._is_filler_only("黄素是嗯")
+    assert not module._is_filler_only("")
+
+
+def test_sparse_text_detection(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    # One char stretched over seconds of audio is a noise hallucination.
+    assert module._is_sparse_text("黄", 7800)
+    assert module._is_sparse_text("嗯", 4000)
+    # Natural speech survives: 3 chars in 800ms, or a quick 嗯.
+    assert not module._is_sparse_text("多少钱", 800)
+    assert not module._is_sparse_text("嗯", 500)
+    assert not module._is_sparse_text("", 5000)
+
+
+def test_decode_segment_drops_silent_audio_and_short_fillers(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    sample_rate = 16000
+
+    class TextEngine:
+        def __init__(self, text):
+            self.text = text
+
+        def generate(self, inputs, **kwargs):
+            return [{"text": self.text}]
+
+    loud_second = (np.full(sample_rate, 2000, dtype=np.int16)).tobytes()
+
+    # Near-silent audio is skipped before it reaches the model.
+    silent_session = module.RealtimeASRSession(
+        vllm_engine=TextEngine("嗯。嗯。嗯。"),
+        asr_kwargs={},
+        vad=SegmentVad(sample_rate=sample_rate, segment_end_sample=sample_rate),
+        sample_rate=sample_rate,
+        chunk_ms=1000,
+        audio_lookback_sec=5,
+    )
+    silent_session.add_audio(np.zeros(sample_rate, dtype=np.int16).tobytes())
+    silent_session.decode(is_final=False)
+    assert silent_session.locked_sentences == []
+
+    # Short segments that decode to nothing but interjections are dropped.
+    filler_session = module.RealtimeASRSession(
+        vllm_engine=TextEngine("嗯。嗯。嗯。"),
+        asr_kwargs={},
+        vad=SegmentVad(sample_rate=sample_rate, segment_end_sample=sample_rate),
+        sample_rate=sample_rate,
+        chunk_ms=1000,
+        audio_lookback_sec=5,
+    )
+    filler_session.add_audio(loud_second)
+    filler_session.decode(is_final=False)
+    assert filler_session.locked_sentences == []
+
+    # Real speech survives the filters.
+    speech_session = module.RealtimeASRSession(
+        vllm_engine=TextEngine("多西环素要吃两周"),
+        asr_kwargs={},
+        vad=SegmentVad(sample_rate=sample_rate, segment_end_sample=sample_rate),
+        sample_rate=sample_rate,
+        chunk_ms=1000,
+        audio_lookback_sec=5,
+    )
+    speech_session.add_audio(loud_second)
+    speech_session.decode(is_final=False)
+
+    assert [s["text"] for s in speech_session.locked_sentences] == ["多西环素要吃两周"]
+
+
+def test_merge_turn_sentences_joins_same_speaker_fragments(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    sentences = [
+        {"text": "今天先看报告", "start": 0, "end": 1200, "spk": 0},
+        {"text": "，染色体有一条异常", "start": 1500, "end": 3000, "spk": 0},
+        {"text": "嗯", "start": 3400, "end": 3600, "spk": 0},
+        {"text": "好的", "start": 4000, "end": 4600, "spk": 1},
+    ]
+
+    merged = module.merge_turn_sentences(sentences, gap_ms=500, filler_gap_ms=1500)
+
+    assert [item["text"] for item in merged] == [
+        "今天先看报告，染色体有一条异常嗯",
+        "好的",
+    ]
+    assert merged[0]["spk"] == 0
+    assert merged[0]["end"] == 3600
+
+
+def test_merge_turn_sentences_keeps_speaker_boundary(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    sentences = [
+        {"text": "做内膜检查", "start": 0, "end": 1000, "spk": 0},
+        {"text": "多少钱", "start": 1200, "end": 2000, "spk": 1},
+    ]
+
+    merged = module.merge_turn_sentences(sentences, gap_ms=500)
+
+    assert len(merged) == 2
+
+
+def test_build_streaming_vad_uses_fixed_silence_threshold(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    captured = {}
+
+    class CaptureVad:
+        def __init__(self, vad_model, speech_noise_thres=0.5, silence_schedule=None):
+            captured["speech_noise_thres"] = speech_noise_thres
+            captured["silence_schedule"] = silence_schedule
+
+    monkeypatch.setattr(module, "DynamicStreamingVAD", CaptureVad)
+    args = types.SimpleNamespace(vad_max_end_silence_ms=1200)
+
+    module.build_streaming_vad(object(), args)
+
+    assert captured["speech_noise_thres"] == 0.6
+    assert captured["silence_schedule"] == [(float("inf"), 1200)]
+
+
+def test_build_streaming_vad_accepts_full_schedule(monkeypatch):
+    module = load_service_module(monkeypatch)
+
+    captured = {}
+
+    class CaptureVad:
+        def __init__(self, vad_model, speech_noise_thres=0.5, silence_schedule=None):
+            captured["silence_schedule"] = silence_schedule
+
+    monkeypatch.setattr(module, "DynamicStreamingVAD", CaptureVad)
+    args = types.SimpleNamespace(
+        vad_max_end_silence_ms=0,
+        vad_silence_schedule='[[5000,2000],[Infinity,1200]]',
+    )
+
+    module.build_streaming_vad(object(), args)
+
+    assert captured["silence_schedule"] == [(5000.0, 2000), (float("inf"), 1200)]
