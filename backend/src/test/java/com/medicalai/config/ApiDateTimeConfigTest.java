@@ -28,7 +28,7 @@ class ApiDateTimeConfigTest {
         UUID id = UUID.randomUUID();
         String json = objectMapper.writeValueAsString(new Object[] {
                 new VisitVO(id, "V001", id, id, "ACTIVE", "内科", "患者", "M", 30,
-                        "医生", null, 1, TIMESTAMP),
+                        "医生", null, 1, TIMESTAMP, TIMESTAMP),
                 new RecordingVO(id, id, "R001", "UPLOAD", "recording.wav", "audio/wav", 1L,
                         1L, "DONE", null, null, TIMESTAMP),
                 new MedicalRecordVO(id, id, 1, "CONFIRMED", "SUCCEEDED", null, true,
@@ -38,6 +38,7 @@ class ApiDateTimeConfigTest {
         });
 
         assertThat(json).contains("\"created_at\":\"2026-09-15 15:55:32\"");
+        assertThat(json).contains("\"last_activity_at\":\"2026-09-15 15:55:32\"");
         assertThat(json).contains("\"confirmed_at\":\"2026-09-15 15:55:32\"");
         assertThat(json).doesNotContain("T07:55:32.029490Z");
         assertThat(json).doesNotContain("+08:00");

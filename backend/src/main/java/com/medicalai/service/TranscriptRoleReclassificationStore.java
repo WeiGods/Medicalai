@@ -69,7 +69,6 @@ public class TranscriptRoleReclassificationStore {
                 DialogueSnapshotHasher.hash(visitId, turns), doctorId);
         recordings.saveTranscript(visitId, snapshotId, transcriptText(turns), state != null && state.edited());
         if (extractions != null) extractions.markCurrentStale(visitId);
-        records.audit(doctorId, visitId, "TRANSCRIPT_ROLES_RECLASSIFIED_" + route.name(), snapshotId);
     }
 
     private List<RecordingMapper.Turn> currentTurns(UUID visitId) {

@@ -2,9 +2,9 @@ package com.medicalai.service;
 
 import com.medicalai.exception.BusinessException;
 import com.medicalai.domain.Doctor;
+import com.medicalai.domain.DoctorRole;
 import com.medicalai.dto.CreatePatientRequest;
 import com.medicalai.mapper.PatientMapper;
-import com.medicalai.provider.PatientDirectoryProvider;
 import com.medicalai.vo.PatientVO;
 import java.time.*;
 import java.util.*;
@@ -14,19 +14,20 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class PatientService {
     private final PatientMapper mapper;
-    private final PatientDirectoryProvider provider;
     private final Clock clock;
 
-    public PatientService(PatientMapper mapper, PatientDirectoryProvider provider, Clock clock) {
-        this.mapper=mapper; this.provider=provider; this.clock=clock;
+    public PatientService(PatientMapper mapper, Clock clock) {
+        this.mapper=mapper; this.clock=clock;
     }
 
-    public List<PatientVO> list(String keyword) {
-        return mapper.find(keyword.strip()).stream().map(p -> PatientVO.from(p, LocalDate.now(clock))).toList();
+    public List<PatientVO> list(String keyword, Doctor doctor) {
+        return mapper.find(keyword.strip(), doctor.id(), canReadAllPatientStatuses(doctor)).stream()
+                .map(p -> PatientVO.from(p, LocalDate.now(clock))).toList();
     }
 
-    public PatientVO get(UUID id) {
-        return PatientVO.from(mapper.findById(id).orElseThrow(BusinessException::notFound), LocalDate.now(clock));
+    public PatientVO get(UUID id, Doctor doctor) {
+        return PatientVO.from(mapper.findById(id, doctor.id(), canReadAllPatientStatuses(doctor))
+                .orElseThrow(BusinessException::notFound), LocalDate.now(clock));
     }
 
     @Transactional
@@ -46,13 +47,13 @@ public class PatientService {
                 birthDate,
                 maskPhone(request.phone()),
                 maskIdNo(request.idNo()),
-                doctor == null ? "" : doctor.departmentName()), today);
+                doctor.departmentName(), doctor.id()), today);
         return created;
     }
 
-    @Transactional
-    public void syncDemoPatients() { provider.listPatients().forEach(mapper::upsert); }
-
+    private boolean canReadAllPatientStatuses(Doctor doctor) {
+        return DoctorRole.from(doctor.role()).canReadAllPatientStatuses();
+    }
     private String maskPhone(String value) {
         return mask(value, 3, 4);
     }

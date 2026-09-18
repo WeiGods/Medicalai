@@ -23,15 +23,18 @@ public class VisitService {
         this.visits=visits; this.patients=patients; this.doctors=doctors; this.storage=storage; this.clock=clock;
     }
 
-    public List<VisitVO> list(UUID doctorId) {
-        return visits.findAll(doctorId).stream().map(VisitVO::from).toList();
+    public List<VisitVO> list(Doctor doctor) {
+        List<Visit> visibleVisits = DoctorRole.from(doctor.role()).canReadAllPatientStatuses()
+                ? visits.findAll() : visits.findAll(doctor.id());
+        return visibleVisits.stream().map(VisitVO::from).toList();
     }
 
     public VisitVO get(UUID id, UUID doctorId) { return VisitVO.from(owned(id,doctorId,false)); }
 
     @Transactional
     public VisitVO create(CreateVisitRequest request, Doctor doctor) {
-        Patient p=patients.findByIdForUpdate(request.patientId()).orElseThrow(BusinessException::notFound);
+        Patient p=patients.findOwnedByIdForUpdate(request.patientId(), doctor.id())
+                .orElseThrow(BusinessException::notFound);
         visits.blockingStatusForPatient(p.id(), doctor.id()).ifPresent(status -> {
             if ("COMPLETED".equals(status) || "ARCHIVED".equals(status)) {
                 throw BusinessException.conflict("PATIENT_VISIT_COMPLETED", "该患者接诊已完成，暂不支持重复接诊");

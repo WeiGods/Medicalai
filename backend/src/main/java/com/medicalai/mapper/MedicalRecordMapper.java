@@ -219,15 +219,17 @@ public class MedicalRecordMapper {
         return Optional.of(job);
     }
 
-    public void markExportSucceeded(UUID exportId, UUID jobId, String objectKey) {
-        jdbc.update("""
+    public boolean markExportSucceeded(UUID exportId, UUID jobId, String objectKey) {
+        int updated = jdbc.update("""
                 UPDATE record_export SET status='SUCCEEDED',object_key=?,error_message=NULL
                 WHERE id=? AND status='RUNNING'
                 """, objectKey, exportId);
+        if (updated == 0) return false;
         jdbc.update("""
                 UPDATE ai_job SET status='SUCCEEDED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=NULL
                 WHERE id=? AND result_ref=?
                 """, jobId, exportId);
+        return true;
     }
 
     /**
@@ -242,20 +244,35 @@ public class MedicalRecordMapper {
                 """, exportId);
     }
 
-    public void markExportFailed(UUID exportId, UUID jobId, int attempt, String error) {
+    public boolean markExportFailed(UUID exportId, UUID jobId, int attempt, String error) {
         if (attempt < 3) {
             jdbc.update("UPDATE record_export SET status='PENDING',error_message=? WHERE id=?", error, exportId);
             jdbc.update("""
                     UPDATE ai_job SET status='PENDING',last_error=?,locked_at=NULL,lease_token=NULL
                     WHERE id=? AND result_ref=?
                     """, error, jobId, exportId);
+            return false;
         } else {
-            jdbc.update("UPDATE record_export SET status='FAILED',error_message=? WHERE id=?", error, exportId);
+            int updated = jdbc.update("UPDATE record_export SET status='FAILED',error_message=? WHERE id=? AND status='RUNNING'",
+                    error, exportId);
+            if (updated == 0) return false;
             jdbc.update("""
                     UPDATE ai_job SET status='FAILED',finished_at=medicalai_local_now(),last_error=?,locked_at=NULL,lease_token=NULL
                     WHERE id=? AND result_ref=?
                     """, error, jobId, exportId);
+            return true;
         }
+    }
+
+    public Optional<ExportAuditContext> exportAuditContext(UUID exportId) {
+        return jdbc.query("""
+                SELECT e.created_by,r.visit_id,e.format
+                FROM record_export e
+                JOIN medical_record r ON r.id=e.record_id
+                WHERE e.id=?
+                """, (resultSet, rowNum) -> new ExportAuditContext(
+                resultSet.getObject("created_by", UUID.class), resultSet.getObject("visit_id", UUID.class),
+                resultSet.getString("format")), exportId).stream().findFirst();
     }
 
     public Optional<ExportPayload> exportPayload(UUID exportId) {
@@ -309,11 +326,6 @@ public class MedicalRecordMapper {
                         DatabaseDateTime.getInstant(rs, "created_at")), visitId);
     }
 
-    public void audit(UUID doctorId, UUID visitId, String action, UUID resourceId) {
-        jdbc.update("INSERT INTO audit_log(doctor_id,visit_id,action,resource_id) VALUES (?,?,?,?)",
-                doctorId, visitId, action, resourceId);
-    }
-
     private UUID visitIdOf(UUID recordId) {
         return jdbc.queryForObject("SELECT visit_id FROM medical_record WHERE id=?", UUID.class, recordId);
     }
@@ -322,6 +334,7 @@ public class MedicalRecordMapper {
     public record ExportRow(UUID id, int versionNo, String format, String status, String doctorName, Instant createdAt) {}
     public record ConfirmedVersion(UUID recordId, UUID versionId, int versionNo, UUID confirmationId) {}
     public record ExportJob(UUID jobId, UUID exportId, int attempt) {}
+    public record ExportAuditContext(UUID doctorId, UUID visitId, String format) {}
     public record ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
                                 int versionNo, String format, String contentJson, String editedContentJson,
                                 Instant confirmedAt) {}

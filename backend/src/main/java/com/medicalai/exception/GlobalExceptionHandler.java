@@ -12,6 +12,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.transaction.CannotCreateTransactionException;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.ConstraintViolationException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -30,6 +31,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorVO> validation(MethodArgumentNotValidException e) {
         String message = e.getBindingResult().getFieldErrors().stream()
                 .findFirst().map(x -> x.getDefaultMessage()).orElse("请求参数无效");
+        return ResponseEntity.badRequest().body(new ErrorVO("VALIDATION_ERROR", message));
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorVO> constraintViolation(ConstraintViolationException exception) {
+        String message = exception.getConstraintViolations().stream().findFirst()
+                .map(violation -> violation.getMessage()).orElse("请求参数无效");
         return ResponseEntity.badRequest().body(new ErrorVO("VALIDATION_ERROR", message));
     }
 

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS doctor (
     display_name varchar(128) NOT NULL,
     department_id varchar(128),
     department_name varchar(128),
-    role varchar(32) NOT NULL DEFAULT 'DOCTOR' CHECK (role IN ('DOCTOR','ADMIN')),
+    role varchar(32) NOT NULL DEFAULT 'DOCTOR' CHECK (role IN ('DOCTOR','DEPARTMENT_HEAD','ADMIN')),
     status varchar(32) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','DISABLED')),
     last_login_at timestamp(0) without time zone,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS patient (
     id_no_masked varchar(64),
     department_id varchar(128),
     department_name varchar(128),
+    created_by uuid REFERENCES doctor(id),
     source_updated_at timestamp(0) without time zone,
     status varchar(32) NOT NULL DEFAULT 'ACTIVE',
     raw_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -277,6 +278,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     visit_id uuid REFERENCES visit(id),
     action varchar(128) NOT NULL,
     resource_id uuid,
+    resource_type varchar(32),
+    result varchar(16) NOT NULL DEFAULT 'SUCCESS' CHECK (result IN ('SUCCESS','FAILED')),
+    detail varchar(512),
+    client_ip varchar(64),
     created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
@@ -326,6 +331,7 @@ ALTER TABLE visit ADD COLUMN IF NOT EXISTS updated_by uuid REFERENCES doctor(id)
 ALTER TABLE visit DROP CONSTRAINT IF EXISTS fk_current_record;
 ALTER TABLE visit DROP COLUMN IF EXISTS current_record_id;
 ALTER TABLE patient ADD COLUMN IF NOT EXISTS id_no_masked varchar(64);
+ALTER TABLE patient ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES doctor(id);
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS locked_at timestamp(0) without time zone;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS lease_token uuid;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS recording_id uuid REFERENCES recording(id);
@@ -454,6 +460,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_confirmation_version
 CREATE INDEX IF NOT EXISTS ix_login_doctor_expiry ON login_session(doctor_id, expires_at);
 CREATE INDEX IF NOT EXISTS ix_visit_doctor_date ON visit(doctor_id, visit_date DESC);
 CREATE INDEX IF NOT EXISTS ix_visit_patient ON visit(patient_id);
+CREATE INDEX IF NOT EXISTS ix_patient_created_by_time ON patient(created_by, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_recording_visit ON recording(visit_id);
 CREATE INDEX IF NOT EXISTS ix_recording_status ON recording(visit_id, status);
 CREATE INDEX IF NOT EXISTS ix_ai_job_pending ON ai_job(status, created_at);
@@ -464,6 +471,35 @@ CREATE INDEX IF NOT EXISTS ix_record_export_record ON record_export(record_id, c
 CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template
     ON record_export(version_id, format, template_version) WHERE template_version = 2;
 CREATE INDEX IF NOT EXISTS ix_audit_visit_time ON audit_log(visit_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_audit_created_time ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_audit_doctor_time ON audit_log(doctor_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_audit_action_time ON audit_log(action, created_at DESC);
+
+-- 兼容已初始化的数据库：CREATE TABLE IF NOT EXISTS 不会补充旧表的字段或约束。
+ALTER TABLE doctor DROP CONSTRAINT IF EXISTS doctor_role_check;
+ALTER TABLE doctor DROP CONSTRAINT IF EXISTS ck_doctor_role;
+ALTER TABLE doctor ADD CONSTRAINT ck_doctor_role
+    CHECK (role IN ('DOCTOR','DEPARTMENT_HEAD','ADMIN'));
+
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS resource_type varchar(32);
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS result varchar(16);
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS detail varchar(512);
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS client_ip varchar(64);
+UPDATE audit_log SET result='SUCCESS' WHERE result IS NULL;
+ALTER TABLE audit_log ALTER COLUMN result SET DEFAULT 'SUCCESS';
+ALTER TABLE audit_log ALTER COLUMN result SET NOT NULL;
+ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_result_check;
+ALTER TABLE audit_log ADD CONSTRAINT audit_log_result_check CHECK (result IN ('SUCCESS','FAILED'));
+
+-- 存量患者尚无创建人时，按最早接诊的负责医生回填；无接诊患者保持无归属，仅科室长可查看。
+UPDATE patient p
+SET created_by = first_visit.doctor_id
+FROM (
+    SELECT DISTINCT ON (patient_id) patient_id, doctor_id
+    FROM visit
+    ORDER BY patient_id, created_at, id
+) AS first_visit
+WHERE p.id = first_visit.patient_id AND p.created_by IS NULL;
 
 -- 当前病历通过 medical_record.visit_id（唯一）和 medical_record.current_version 定位。
 -- current_version 的复合外键必须在相关表全部创建后添加；先删除再添加保证幂等。
@@ -471,6 +507,58 @@ ALTER TABLE medical_record DROP CONSTRAINT IF EXISTS fk_current_version;
 ALTER TABLE medical_record ADD CONSTRAINT fk_current_version
     FOREIGN KEY (id, current_version) REFERENCES medical_record_version(record_id, version_no)
     DEFERRABLE INITIALLY DEFERRED;
+
+-- 清理历史版本内置的三名演示患者及其接诊产物。仅匹配固定的演示来源标识，
+-- 不会影响通过“手动录入患者”创建的 MANUAL 患者和后续真实接入的患者数据。
+-- Spring 的脚本初始化器按分号拆分 SQL，函数体使用单引号可保证清理过程作为一个数据库语句执行。
+CREATE OR REPLACE FUNCTION medicalai_remove_demo_patients()
+RETURNS void
+LANGUAGE plpgsql
+AS '
+DECLARE
+    demo_patient_ids uuid[];
+    demo_visit_ids uuid[];
+BEGIN
+    SELECT array_agg(id) INTO demo_patient_ids
+    FROM patient
+    WHERE source_system = ''LOCAL_DEMO'' AND source_patient_id IN (''001'', ''002'', ''003'');
+
+    IF coalesce(array_length(demo_patient_ids, 1), 0) = 0 THEN
+        RETURN;
+    END IF;
+
+    SELECT array_agg(id) INTO demo_visit_ids
+    FROM visit
+    WHERE patient_id = ANY (demo_patient_ids);
+
+    IF coalesce(array_length(demo_visit_ids, 1), 0) > 0 THEN
+        DELETE FROM audit_log WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM ai_job WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM record_export
+        WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id = ANY (demo_visit_ids));
+        DELETE FROM medical_record_confirmation
+        WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id = ANY (demo_visit_ids));
+        DELETE FROM medical_record_version
+        WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id = ANY (demo_visit_ids));
+        DELETE FROM medical_record WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM clinical_extraction_version
+        WHERE extraction_id IN (SELECT id FROM clinical_extraction WHERE visit_id = ANY (demo_visit_ids));
+        DELETE FROM clinical_extraction WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM visit_transcript WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM dialogue_snapshot_source
+        WHERE snapshot_id IN (SELECT id FROM dialogue_snapshot WHERE visit_id = ANY (demo_visit_ids));
+        DELETE FROM dialogue_snapshot WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM asr_utterance WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM recording_session WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM recording WHERE visit_id = ANY (demo_visit_ids);
+        DELETE FROM visit WHERE id = ANY (demo_visit_ids);
+    END IF;
+
+    DELETE FROM patient WHERE id = ANY (demo_patient_ids);
+END;
+';
+SELECT medicalai_remove_demo_patients();
+DROP FUNCTION medicalai_remove_demo_patients();
 
 -- 说明：旧版数据库中的命名约束由 V1～V4 已经建立；新数据库在 CREATE TABLE 时直接建立。
 -- 以下注释覆盖所有表和字段。
@@ -483,7 +571,7 @@ COMMENT ON COLUMN doctor.employee_no IS '医生工号';
 COMMENT ON COLUMN doctor.display_name IS '医生展示姓名';
 COMMENT ON COLUMN doctor.department_id IS '所属科室外部 ID';
 COMMENT ON COLUMN doctor.department_name IS '所属科室名称';
-COMMENT ON COLUMN doctor.role IS '系统角色：DOCTOR 医生、ADMIN 管理员';
+COMMENT ON COLUMN doctor.role IS '系统角色：DOCTOR 医生、DEPARTMENT_HEAD 科室长、ADMIN 管理员';
 COMMENT ON COLUMN doctor.status IS '账号状态：ACTIVE 启用、DISABLED 停用';
 COMMENT ON COLUMN doctor.last_login_at IS '最近一次成功登录时间';
 COMMENT ON COLUMN doctor.metadata IS '外部身份扩展属性 JSON';
@@ -515,6 +603,7 @@ COMMENT ON COLUMN patient.id_no_hash IS '身份证号不可逆哈希，用于安
 COMMENT ON COLUMN patient.id_no_masked IS '脱敏后的身份证号，用于展示';
 COMMENT ON COLUMN patient.department_id IS '患者来源科室外部 ID';
 COMMENT ON COLUMN patient.department_name IS '患者来源科室名称';
+COMMENT ON COLUMN patient.created_by IS '手动新增该患者的医生 ID；历史无接诊患者可为空';
 COMMENT ON COLUMN patient.source_updated_at IS '来源系统最后更新时间';
 COMMENT ON COLUMN patient.status IS '患者状态：ACTIVE 启用等';
 COMMENT ON COLUMN patient.raw_snapshot IS '来源系统原始数据快照 JSON，需按敏感数据策略管理';
@@ -703,4 +792,8 @@ COMMENT ON COLUMN audit_log.doctor_id IS '执行操作的医生 ID，可为空�
 COMMENT ON COLUMN audit_log.visit_id IS '关联接诊 ID';
 COMMENT ON COLUMN audit_log.action IS '操作动作编码，例如 RECORDING_UPLOADED、MEDICAL_RECORD_CONFIRMED';
 COMMENT ON COLUMN audit_log.resource_id IS '被操作资源 ID';
+COMMENT ON COLUMN audit_log.resource_type IS '被操作资源类型：LOGIN、RECORDING、MEDICAL_RECORD、RECORD_EXPORT';
+COMMENT ON COLUMN audit_log.result IS '审计操作结果：SUCCESS 成功、FAILED 失败';
+COMMENT ON COLUMN audit_log.detail IS '脱敏后的业务详情，不保存病历正文、音频内容或身份凭据';
+COMMENT ON COLUMN audit_log.client_ip IS '登录请求到达应用时的客户端来源地址';
 COMMENT ON COLUMN audit_log.created_at IS '审计事件发生时间';
