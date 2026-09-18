@@ -25,7 +25,7 @@ elif new not in s:
 p.write_text(s)
 PY
 
-COPY model.py serve_realtime_ws.py ./
+COPY model.py serve_realtime_ws.py streaming_speaker_turns.py offline_asr_structure.py ./
 COPY ai_service ./ai_service
 COPY 热词列表 ./
 

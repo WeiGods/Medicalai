@@ -39,6 +39,7 @@ rt = None
 # 结构化提取不依赖本地 ASR 运行时。仅文本模式延迟导入其重依赖，避免缺少 GPU/ASR 包时连提取网关也无法启动。
 if os.environ.get("MEDICALAI_TEXT_EXTRACTION_ONLY") != "1":
     import serve_realtime_ws as rt
+    import offline_asr_structure as offline_structure
     import numpy as np
     import torch
 
@@ -49,6 +50,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("ai_service")
 
 SAMPLE_RATE = 16000
+DEFAULT_PUNC_MODEL = (
+    "/workspace/models/asr_models/"
+    "punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
+)
 
 
 def _env(name, default=None):
@@ -73,6 +78,9 @@ class ServiceSettings:
             model=model,
             vad_model=_env("ASR_VAD_MODEL", "fsmn-vad"),
             spk_model=_env("ASR_SPK_MODEL", "iic/speech_eres2netv2_sv_zh-cn_16k-common"),
+            punc_model=_env("ASR_PUNC_MODEL", DEFAULT_PUNC_MODEL),
+            punc_device=_env("ASR_PUNC_DEVICE", "cpu"),
+            disable_punc=_env("ASR_DISABLE_PUNC", "0") == "1",
             offline=_env("ASR_OFFLINE", "0") == "1",
             hub=hub,
             device=_env("ASR_DEVICE", "cuda:0"),
@@ -95,9 +103,26 @@ class ServiceSettings:
             spk_threshold=float(_env("ASR_SPK_THRESHOLD", "0.6")),
             spk_merge_thr=float(_env("ASR_SPK_MERGE_THR", "0.78")),
             spk_min_seg_ms=int(_env("ASR_SPK_MIN_SEG_MS", "1000")),
+            offline_spk_window_ms=int(_env("ASR_OFFLINE_SPK_WINDOW_MS", "800")),
+            offline_spk_hop_ms=int(_env("ASR_OFFLINE_SPK_HOP_MS", "200")),
+            offline_spk_embedding_batch_size=int(
+                _env("ASR_OFFLINE_SPK_EMBEDDING_BATCH_SIZE", "32")
+            ),
+            offline_spk_min_speaker_island_ms=int(
+                _env("ASR_OFFLINE_SPK_MIN_SPEAKER_ISLAND_MS", "500")
+            ),
+            offline_turn_merge_gap_ms=int(
+                _env("ASR_OFFLINE_TURN_MERGE_GAP_MS", "800")
+            ),
+            offline_turn_min_split_run_ms=int(
+                _env("ASR_OFFLINE_TURN_MIN_SPLIT_RUN_MS", "240")
+            ),
+            offline_turn_min_split_run_chars=int(
+                _env("ASR_OFFLINE_TURN_MIN_SPLIT_RUN_CHARS", "3")
+            ),
             decode_interval=float(_env("ASR_DECODE_INTERVAL", "0.48")),
             min_rms=float(_env("ASR_MIN_RMS", "0.004")),
-            drop_filler_ms=int(_env("ASR_DROP_FILLER_MS", "1500")),
+            drop_filler_ms=int(_env("ASR_DROP_FILLER_MS", "0")),
             vad_max_single_segment_ms=int(_env("ASR_VAD_MAX_SINGLE_SEGMENT_MS", "30000")),
             preset_spk_num=int(_env("ASR_PRESET_SPK_NUM", "2")),
             mode=_env("ASR_MODE", "realtime"),
@@ -252,6 +277,147 @@ def _build_session():
     )
 
 
+def _extract_offline_speaker_embeddings(audio_float, windows):
+    embeddings = []
+    batch_size = max(1, int(settings.args.offline_spk_embedding_batch_size))
+    for offset in range(0, len(windows), batch_size):
+        batch = windows[offset:offset + batch_size]
+        speech = []
+        for window in batch:
+            start = int(window["start_ms"] * SAMPLE_RATE / 1000)
+            end = int(window["end_ms"] * SAMPLE_RATE / 1000)
+            speech.append(audio_float[start:end])
+        results = rt._spk_model.generate(
+            input=speech,
+            cache={},
+            is_final=True,
+        )
+        if len(results) != len(batch):
+            raise RuntimeError(
+                f"speaker model returned {len(results)} results for {len(batch)} windows"
+            )
+        for result in results:
+            embedding = (result or {}).get("spk_embedding")
+            if embedding is None:
+                raise RuntimeError("speaker model result is missing spk_embedding")
+            embeddings.append(
+                torch.as_tensor(embedding, dtype=torch.float32)
+                .detach()
+                .cpu()
+                .flatten()
+            )
+    return embeddings
+
+
+def _offline_diagnostics_dir():
+    value = _env("ASR_OFFLINE_DIAGNOSTICS_DIR")
+    return Path(value) if value else None
+
+
+def _diagnostic_turn(turn):
+    if isinstance(turn, dict):
+        return dict(turn)
+    return {
+        "start_ms": int(turn.start_ms),
+        "end_ms": int(turn.end_ms),
+        "duration_ms": int(turn.duration_ms),
+        "speaker_id": turn.speaker_id,
+        "state": turn.state,
+        "confidence": turn.confidence,
+        "window_count": turn.window_count,
+        "boundary_confidence": turn.boundary_confidence,
+    }
+
+
+def _write_offline_diagnostics(payload):
+    output_dir = _offline_diagnostics_dir()
+    if output_dir is None:
+        return
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / f"offline-{time.time_ns()}.json"
+        temporary = output.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(output)
+        logger.info("Offline diagnostics written: %s", output)
+    except Exception:
+        logger.warning("Failed to write offline diagnostics", exc_info=True)
+
+
+def _build_offline_speaker_turns(audio_float, speaking, diagnostics=None):
+    from streaming_speaker_turns import (
+        SpeakerTurnConfig,
+        StreamingSpeakerTurnTracker,
+    )
+
+    windows = offline_structure.build_speaker_windows(
+        speaking,
+        window_ms=settings.args.offline_spk_window_ms,
+        hop_ms=settings.args.offline_spk_hop_ms,
+    )
+    if not windows:
+        return [], {}
+
+    embeddings = _extract_offline_speaker_embeddings(audio_float, windows)
+    max_speakers = max(1, int(settings.args.preset_spk_num or 2))
+    tracker = StreamingSpeakerTurnTracker(
+        SpeakerTurnConfig(
+            window_ms=settings.args.offline_spk_window_ms,
+            hop_ms=settings.args.offline_spk_hop_ms,
+            confirm_windows=3,
+            speaker_confirm_windows=5,
+            speaker_min_span_ms=2000,
+            min_turn_ms=400,
+            max_speakers=max_speakers,
+            offline_global_max_speakers=max_speakers,
+            offline_global_min_speaker_island_ms=(
+                settings.args.offline_spk_min_speaker_island_ms
+            ),
+        )
+    )
+    for window, embedding in zip(windows, embeddings):
+        if window["start_ms"] == window["segment_start_ms"]:
+            tracker.begin_segment(window["segment_start_ms"])
+        tracker.update_embedding(
+            window["start_ms"],
+            window["end_ms"],
+            embedding,
+            segment_start_ms=window["segment_start_ms"],
+            segment_end_ms=window["segment_end_ms"],
+        )
+
+    raw_turns = tracker.finalize()
+    raw_switches = tracker.snapshot_switches()
+    raw_windows = tracker.snapshot_windows()
+    if diagnostics is not None:
+        diagnostics["tracker_before_global_reclassify"] = {
+            "turns": [_diagnostic_turn(turn) for turn in raw_turns],
+            "switches": raw_switches,
+            "windows": raw_windows,
+        }
+
+    reclassification = tracker.offline_global_reclassify()
+    turns = tracker.finalize()
+    if diagnostics is not None:
+        diagnostics["offline_global_reclassify"] = reclassification
+        diagnostics["tracker_after_global_reclassify"] = {
+            "turns": [_diagnostic_turn(turn) for turn in turns],
+            "switches": tracker.snapshot_switches(),
+            "windows": tracker.snapshot_windows(),
+        }
+    logger.info(
+        "Offline speaker turns: windows=%d turns=%d speakers=%s switches=%s",
+        len(windows),
+        len(turns),
+        reclassification.get("speaker_count"),
+        reclassification.get("switches"),
+    )
+    return turns, reclassification
+
+
 def _transcribe_sync_offline(pcm: np.ndarray) -> list[dict]:
     """Batch pipeline: full-file VAD, one batched vLLM call, then diarization.
 
@@ -261,6 +427,25 @@ def _transcribe_sync_offline(pcm: np.ndarray) -> list[dict]:
     require_models()
     audio_float = pcm.astype(np.float32) / 32768.0
     vad = rt.build_streaming_vad(rt._vad_model, settings.args)
+    diagnostics = {
+        "settings": {
+            "mode": settings.args.mode,
+            "sample_rate": SAMPLE_RATE,
+            "window_ms": settings.args.offline_spk_window_ms,
+            "hop_ms": settings.args.offline_spk_hop_ms,
+            "min_speaker_island_ms": (
+                settings.args.offline_spk_min_speaker_island_ms
+            ),
+            "turn_merge_gap_ms": settings.args.offline_turn_merge_gap_ms,
+            "turn_min_split_run_ms": (
+                settings.args.offline_turn_min_split_run_ms
+            ),
+            "turn_min_split_run_chars": (
+                settings.args.offline_turn_min_split_run_chars
+            ),
+        }
+    } if _offline_diagnostics_dir() is not None else None
+    asr_segment_diagnostics = [] if diagnostics is not None else None
 
     with settings.lock:
         speaking = []
@@ -271,7 +456,19 @@ def _transcribe_sync_offline(pcm: np.ndarray) -> list[dict]:
             ):
                 speaking.append((int(start_ms), int(end_ms), seg_audio))
         if not speaking:
+            if diagnostics is not None:
+                diagnostics["vad_segments"] = []
+                _write_offline_diagnostics(diagnostics)
             return []
+        if diagnostics is not None:
+            diagnostics["vad_segments"] = [
+                {
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "duration_ms": end_ms - start_ms,
+                }
+                for start_ms, end_ms, _seg_audio in speaking
+            ]
 
         results = rt._vllm_engine.generate(
             inputs=[torch.from_numpy(seg_audio) for _, _, seg_audio in speaking],
@@ -281,63 +478,110 @@ def _transcribe_sync_offline(pcm: np.ndarray) -> list[dict]:
         )
 
         sentences = []
-        for (start_ms, end_ms, _), result in zip(speaking, results):
-            text = rt._clean_asr_text((result or {}).get("text", ""))
-            text, _ = rt.detect_and_fix_hallucination(text)
+        for segment_index, ((start_ms, end_ms, _), result) in enumerate(
+            zip(speaking, results)
+        ):
+            result = result or {}
+            raw_text = rt._clean_asr_text((result or {}).get("text", ""))
+            # Offline segments contain complete conversational turns.  A
+            # threefold "对对对" or "嗯嗯嗯" is normal speech, not a loop.
+            raw_text, _ = rt.detect_and_fix_hallucination(
+                raw_text,
+                max_ngram_length=6,
+                max_occurrences=5,
+            )
+            text = offline_structure.prepare_offline_punctuation(
+                raw_text,
+                lambda value: rt._punctuate_text(rt._punc_model, value),
+            )
             short_filler = (
                 settings.args.drop_filler_ms > 0
                 and (end_ms - start_ms) < settings.args.drop_filler_ms
                 and rt._is_filler_only(text)
             )
+            timestamps = result.get("timestamps") or []
+            aligned_timestamps = offline_structure.align_timestamps_to_text(
+                raw_text,
+                timestamps,
+            )
+            segment_sentences = []
             if text.strip() and not short_filler:
-                sentences.append({"text": text.strip(), "start": start_ms, "end": end_ms})
+                segment_sentences = offline_structure.build_timestamped_sentence_spans(
+                    raw_text,
+                    text,
+                    aligned_timestamps,
+                    start_ms,
+                    end_ms,
+                )
+                sentences.extend(segment_sentences)
+            if asr_segment_diagnostics is not None:
+                asr_segment_diagnostics.append(
+                    {
+                        "segment_index": segment_index,
+                        "start_ms": int(start_ms),
+                        "end_ms": int(end_ms),
+                        "raw_text": raw_text,
+                        "punctuated_text": text,
+                        "timestamps": timestamps,
+                        "aligned_timestamp_count": len(aligned_timestamps),
+                        "sentences": [
+                            dict(sentence) for sentence in segment_sentences
+                        ],
+                        "short_filler": short_filler,
+                    }
+                )
+
+        if diagnostics is not None:
+            diagnostics["asr_segments"] = asr_segment_diagnostics
+            diagnostics["asr_sentences"] = [
+                dict(sentence) for sentence in sentences
+            ]
 
         if settings.args.disable_spk or not sentences:
-            return _sentences_to_utterances(sentences)
+            utterances = _sentences_to_utterances(sentences)
+            if diagnostics is not None:
+                diagnostics["utterances"] = utterances
+                _write_offline_diagnostics(diagnostics)
+            return utterances
 
-        tracker = rt.HybridSpeakerTracker(
-            rt._spk_model, settings.args.device,
-            threshold=settings.args.spk_threshold,
-            merge_thr=settings.args.spk_merge_thr,
-            min_segment_ms=settings.args.spk_min_seg_ms,
-        )
-
-        # Official FunASR diarization recipe: slide a fixed window over the
-        # VAD segments for embeddings, then cluster once, globally. The stock
-        # ClusterBackend returns a single cluster when fed fewer than 20
-        # embeddings, so shrink the window until we have enough to cluster.
-        chunks = _sliding_chunks(speaking, seg_dur=1.5, seg_shift=0.75)
-        for seg_dur, seg_shift in ((1.0, 0.25), (0.75, 0.25)):
-            if len(chunks) >= 20:
-                break
-            chunks = _sliding_chunks(speaking, seg_dur=seg_dur, seg_shift=seg_shift)
-        chunks = [ch for ch in chunks if (ch[1] - ch[0]) * 1000 >= 300]
-        if not chunks:
-            return _sentences_to_utterances(sentences)
-
-        speech_list = [ch[2] for ch in chunks]
-        spk_res = tracker.spk_model.generate(input=speech_list, cache={}, is_final=True)
-        embeddings = torch.cat([r["spk_embedding"] for r in spk_res], dim=0).detach().cpu()
-        preset_spk_num = settings.args.preset_spk_num or None
-        labels = tracker.cluster_backend(embeddings, oracle_num=preset_spk_num)
-        logger.info(
-            "Offline diarization: %d chunks (preset_spk_num=%s), cluster labels=%s",
-            len(chunks), preset_spk_num, np.asarray(labels).tolist(),
-        )
-        sv_output = tracker.postprocess(
-            [[ch[0], ch[1], None] for ch in chunks], None,
-            np.asarray(labels), embeddings.numpy(),
-        )
-        assigned = []
-        for sentence in sentences:
-            current = dict(sentence)
-            tracker.distribute_spk([current], sv_output)
-            assigned.extend(tracker._try_split(current, sv_output, {}, min_split_s=3.0))
-        sentences = [
-            s for s in assigned
-            if not rt._is_sparse_text(s["text"], s["end"] - s["start"])
-        ]
-        return _sentences_to_utterances(sentences)
+        try:
+            turns, _reclassification = _build_offline_speaker_turns(
+                audio_float,
+                speaking,
+                diagnostics=diagnostics,
+            )
+            if not turns:
+                utterances = _sentences_to_utterances(sentences)
+                if diagnostics is not None:
+                    diagnostics["utterances"] = utterances
+                    _write_offline_diagnostics(diagnostics)
+                return utterances
+            mapped_sentences = offline_structure.map_sentences_to_turns(
+                sentences,
+                turns,
+                merge_gap_ms=settings.args.offline_turn_merge_gap_ms,
+                min_split_run_ms=(
+                    settings.args.offline_turn_min_split_run_ms
+                ),
+                min_split_run_chars=(
+                    settings.args.offline_turn_min_split_run_chars
+                ),
+            )
+            utterances = _sentences_to_utterances(mapped_sentences)
+            if diagnostics is not None:
+                diagnostics["sentences_after_turn_mapping"] = mapped_sentences
+                diagnostics["utterances"] = utterances
+                _write_offline_diagnostics(diagnostics)
+            return utterances
+        except Exception as error:
+            # 声学聚类失败不应丢弃已有 ASR 文本；后续角色 LLM 仍可基于文本判断。
+            logger.warning("Offline diarization failed; continuing without speaker labels: %s", error)
+            utterances = _sentences_to_utterances(sentences)
+            if diagnostics is not None:
+                diagnostics["error"] = repr(error)
+                diagnostics["utterances"] = utterances
+                _write_offline_diagnostics(diagnostics)
+            return utterances
 
 
 def _sliding_chunks(speaking, seg_dur, seg_shift):
