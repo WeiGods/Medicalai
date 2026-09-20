@@ -16,6 +16,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.UUID;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.nio.charset.StandardCharsets;
+import org.springframework.web.multipart.MultipartFile;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -61,11 +63,57 @@ public class ExportFileService {
 
     private final Path root;
     private final ObjectMapper objectMapper;
+    private final long uploadMaxBytes;
 
     public ExportFileService(@Value("${medicalai.storage.root:./data/recordings}") String root,
-                             ObjectMapper objectMapper) {
+                             ObjectMapper objectMapper,
+                             @Value("${medicalai.export.upload-max-bytes:20971520}") long uploadMaxBytes) {
         this.root = Path.of(root).toAbsolutePath().normalize();
         this.objectMapper = objectMapper;
+        this.uploadMaxBytes = uploadMaxBytes;
+    }
+
+    /** Stores a browser-generated export file using the same safe local layout as backend generation. */
+    public String storeUploaded(UUID exportId, String format, MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "EXPORT_FILE_EMPTY", "导出文件不能为空");
+        }
+        if (file.getSize() > uploadMaxBytes) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "EXPORT_FILE_TOO_LARGE", "导出文件超过大小限制");
+        }
+        String extension = "DOCX".equalsIgnoreCase(format) ? "docx" : "pdf";
+        try {
+            Path dir = root.resolve("exports").normalize();
+            Path target = dir.resolve(exportId + "." + extension).normalize();
+            if (!target.startsWith(dir)) throw new IOException("invalid export path");
+            Files.createDirectories(dir);
+            Path temporary = Files.createTempFile(dir, exportId.toString(), ".tmp");
+            try (InputStream input = file.getInputStream()) {
+                Files.copy(input, temporary, StandardCopyOption.REPLACE_EXISTING);
+                validateSignature(temporary, extension);
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+            LOG.info("前端导出文件已归档: exportId={}, path={}, bytes={}", exportId, target, file.getSize());
+            return root.relativize(target).toString().replace('\\', '/');
+        } catch (IOException e) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "EXPORT_STORAGE_FAILED", "导出文件归档失败", e);
+        }
+    }
+
+    private void validateSignature(Path file, String extension) throws IOException {
+        byte[] header = new byte[4];
+        try (InputStream input = Files.newInputStream(file)) {
+            int read = input.readNBytes(header, 0, header.length);
+            if (read < 4) throw new IOException("export file is too small");
+        }
+        boolean valid = "pdf".equals(extension)
+                ? header[0] == '%' && header[1] == 'P' && header[2] == 'D' && header[3] == 'F'
+                : header[0] == 'P' && header[1] == 'K' && header[2] == 3 && header[3] == 4;
+        if (!valid) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "EXPORT_FILE_INVALID", "导出文件格式不正确");
+        }
     }
 
     public String generate(ExportPayload payload) {

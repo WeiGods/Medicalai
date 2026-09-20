@@ -344,6 +344,23 @@ ALTER TABLE clinical_extraction_version ADD COLUMN IF NOT EXISTS provider_route 
 CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_version smallint NOT NULL DEFAULT 1;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v3
+    ON record_export(version_id, format, template_version) WHERE template_version = 3;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v4
+    ON record_export(version_id, format, template_version) WHERE template_version = 4;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v5
+    ON record_export(version_id, format, template_version) WHERE template_version = 5;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v6
+    ON record_export(version_id, format, template_version) WHERE template_version = 6;
+-- 模板版本由前端注册表动态选择，统一用一条通用唯一索引覆盖所有版本。
+DROP INDEX IF EXISTS uq_record_export_current_template;
+DROP INDEX IF EXISTS uq_record_export_current_template_v2;
+DROP INDEX IF EXISTS uq_record_export_current_template_v3;
+DROP INDEX IF EXISTS uq_record_export_current_template_v4;
+DROP INDEX IF EXISTS uq_record_export_current_template_v5;
+DROP INDEX IF EXISTS uq_record_export_current_template_v6;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_version_format_template
+    ON record_export(version_id, format, template_version);
 
 -- 兼容旧版前端直接写入的伪成功导出：没有真实文件时必须回到可重试的 PENDING。
 UPDATE record_export
@@ -356,11 +373,20 @@ SELECT gen_random_uuid(),
 FROM record_export e
 JOIN medical_record r ON r.id=e.record_id
 WHERE e.status='PENDING'
+  AND e.template_version < 3
   AND NOT EXISTS (
       SELECT 1 FROM ai_job j
       WHERE j.idempotency_key='export:' || e.id
   )
 ON CONFLICT (idempotency_key) DO NOTHING;
+
+-- 新模板由前端生成并上传归档，不进入后端排版队列。
+DELETE FROM ai_job
+WHERE job_type IN ('EXPORT_DOCX', 'EXPORT_PDF')
+  AND result_ref IN (
+      SELECT e.id FROM record_export e
+      WHERE e.template_version >= 3 AND e.status = 'PENDING'
+  );
 
 ALTER TABLE medical_record ALTER COLUMN current_version DROP NOT NULL;
 ALTER TABLE medical_record ALTER COLUMN current_version DROP DEFAULT;
@@ -468,8 +494,6 @@ CREATE INDEX IF NOT EXISTS ix_record_version_record ON medical_record_version(re
 CREATE INDEX IF NOT EXISTS ix_clinical_extraction_version_source
     ON clinical_extraction_version(extraction_id, source_snapshot_id, version_no DESC);
 CREATE INDEX IF NOT EXISTS ix_record_export_record ON record_export(record_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template
-    ON record_export(version_id, format, template_version) WHERE template_version = 2;
 CREATE INDEX IF NOT EXISTS ix_audit_visit_time ON audit_log(visit_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_audit_created_time ON audit_log(created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_audit_doctor_time ON audit_log(doctor_id, created_at DESC);

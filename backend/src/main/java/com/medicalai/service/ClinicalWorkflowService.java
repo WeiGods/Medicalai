@@ -50,6 +50,8 @@ public class ClinicalWorkflowService {
     private final LlmRoleRouter roleRouter;
     private final TranscriptRoleReclassificationStore roleReclassificationStore;
     private final AuditLogService auditLogs;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExportFileService exportFiles;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
@@ -467,29 +469,68 @@ public class ClinicalWorkflowService {
         if (confirmedVersion == null || !confirmedVersion.versionId().equals(version.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_NOT_CONFIRMED", "请先确认当前病历版本");
         }
+        int templateVersion = request.templateVersion();
         RecordExport reusable = records.reusableExport(version.recordId(), version.id(),
-                confirmedVersion.confirmationId(), request.format()).orElse(null);
+                confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
         if (reusable != null) {
             return exports(visitId, doctorId);
         }
         RecordExport failed = records.failedCurrentTemplateExport(version.recordId(), version.id(),
-                confirmedVersion.confirmationId(), request.format()).orElse(null);
+                confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
         if (failed != null) {
             records.requeueFailedExport(visit.id(), failed.id(), request.format());
             return exports(visitId, doctorId);
         }
         RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
-                version.id(), request.format(), doctorId).orElse(null);
+                version.id(), request.format(), templateVersion, doctorId).orElse(null);
         if (export == null) {
             // A concurrent request inserted the current template first. Reuse that job after the unique-index race.
             RecordExport concurrent = records.reusableExport(version.recordId(), version.id(),
-                    confirmedVersion.confirmationId(), request.format()).orElse(null);
+                    confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
             if (concurrent == null) {
                 throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_IN_PROGRESS", "导出任务正在创建，请稍后重试");
             }
             return exports(visitId, doctorId);
         }
-        records.createExportJob(visit.id(), export.id(), request.format());
+        return exports(visitId, doctorId);
+    }
+
+    /**
+     * 接收前端模板生成的导出文件，保存到本地归档目录并把导出记录置为已完成。
+     */
+    @Transactional
+    public List<RecordExportVO> uploadExport(UUID visitId, UUID exportId, UUID doctorId, MultipartFile file) {
+        if (exportFiles == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "EXPORT_STORAGE_UNAVAILABLE", "导出归档服务不可用");
+        }
+        Visit visit = owned(visitId, doctorId, true);
+        RecordExport export = records.exportsByVisit(visit.id()).stream()
+                .filter(item -> item.id().equals(exportId))
+                .findFirst()
+                .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "EXPORT_NOT_FOUND", "导出任务不存在"));
+        if (!records.claimExportForUpload(export.id(), visit.id(), doctorId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_ALREADY_FINISHED", "导出任务已结束，不能重复上传");
+        }
+        String objectKey = exportFiles.storeUploaded(export.id(), export.format(), file);
+        if (!records.markUploadedExportSucceeded(export.id(), visit.id(), doctorId, objectKey)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_ALREADY_FINISHED", "导出任务已结束，不能重复上传");
+        }
+        records.exportAuditContext(export.id()).ifPresent(context -> {
+            Runnable writeAudit = () -> auditLogs.recordMedicalRecordExport(context.doctorId(), context.visitId(),
+                    export.id(), context.format(), AuditResult.SUCCESS);
+            if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()
+                    && org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()) {
+                org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                        new org.springframework.transaction.support.TransactionSynchronization() {
+                            @Override
+                            public void afterCommit() {
+                                writeAudit.run();
+                            }
+                        });
+                return;
+            }
+            writeAudit.run();
+        });
         return exports(visitId, doctorId);
     }
 
