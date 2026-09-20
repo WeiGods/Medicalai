@@ -110,10 +110,15 @@ export const api = {
     body: JSON.stringify({ declaration })
   }),
   confirmations: (visitId: string) => request<Confirmation[]>(`/api/v1/visits/${visitId}/confirmations`),
-  recordExport: (visitId: string, format: 'DOCX' | 'PDF') => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`, {
+  recordExport: (visitId: string, format: 'DOCX' | 'PDF', templateVersion: number) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`, {
     method: 'POST',
-    body: JSON.stringify({ format })
+    body: JSON.stringify({ format, template_version: templateVersion })
   }),
+  uploadExportFile: (visitId: string, exportId: string, format: 'DOCX' | 'PDF', file: Blob) => {
+    const body = new FormData()
+    body.append('file', file, `medical-record-${exportId}.${format === 'DOCX' ? 'docx' : 'pdf'}`)
+    return request<RecordExport[]>(`/api/v1/visits/${visitId}/exports/${exportId}/file`, { method: 'POST', body }, false)
+  },
   exports: (visitId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`),
   auditLogs: (query: { from?: string; to?: string; doctorId?: string; action?: AuditAction; page?: number; pageSize?: number }) => {
     const params = new URLSearchParams()

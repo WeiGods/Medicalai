@@ -1,67 +1,107 @@
 server:
+  # 后端 HTTP 服务端口
   port: 8189
 logging:
   level:
     com.medicalai: INFO
 spring:
   datasource:
+    # PostgreSQL 连接地址；保存患者、接诊、转写、病历和审计数据
     url: ${DB_URL:jdbc:postgresql://192.168.1.30:5432/medicalai}
+    # 数据库登录用户名
     username: ${DB_USERNAME:postgres}
+    # 数据库登录密码
     password: ${DB_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver
     hikari:
       connection-timeout: 5000
   sql:
     init:
+      # 启动时自动初始化或更新数据库表结构
       mode: always
       schema-locations: classpath:db/migration/schema.sql
   jackson:
     property-naming-strategy: SNAKE_CASE
   servlet:
     multipart:
+      # 单个录音文件和整个上传请求的大小上限
       max-file-size: 200MB
       max-request-size: 210MB
 medicalai:
   auth:
+    # 鉴权模式；DEMO 表示演示登录
     mode: ${AUTH_MODE:DEMO}
   storage:
+    # 本地录音文件的备用存储目录
     root: ${STORAGE_ROOT:./data/recordings}
+  export:
+    # 前端生成的导出文件上传归档大小上限，单位字节
+    upload-max-bytes: ${EXPORT_UPLOAD_MAX_BYTES:20971520}
   ai:
     # 旧属性仅为已有部署保留；新代码统一读取 internal-ai，公网快照不会使用此地址。
     base-url: ${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}
   internal-ai:
+    # 内网 AI 网关地址；用于本地 ASR/角色识别等本地推理服务
     base-url: ${INTERNAL_AI_SERVICE_BASE_URL:${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}}
   minio:
+    # MinIO 对象存储服务地址，用于保存录音文件
     api-endpoint: ${MINIO_API_ENDPOINT:http://106.55.225.222:9000}
+    # MinIO 访问 Access Key
     access-key: ${MINIO_ACCESS_KEY:Zerojy}
+    # MinIO 访问 Secret Key
     secret-key: ${MINIO_SECRET_KEY:minio_zerojy}
+    # 录音文件保存的存储桶名称
     bucket-name: ${MINIO_BUCKET_NAME:medicalai}
+    # 对象路径前缀
     folder-prefix: ${MINIO_FOLDER_PREFIX:medicalai}
+    # 是否允许匿名读取对象；生产环境建议关闭
     anonymous-read: ${MINIO_ANONYMOUS_READ:true}
+    # 预签名 URL 的有效期，单位秒
     presign-expiry-seconds: ${MINIO_PRESIGN_EXPIRY_SECONDS:900}
   local-asr:
+    # 本地 ASR 服务地址
     base-url: ${LOCAL_ASR_BASE_URL:${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}}
+    # 本地 ASR 运行模式；offline 表示使用独立内网服务
     mode: ${LOCAL_ASR_MODE:offline}
+    # 轮询本地 ASR 任务结果的间隔，单位毫秒
     poll-delay-ms: ${LOCAL_ASR_POLL_DELAY_MS:3000}
+    # 连接本地 ASR 服务的超时时间，单位毫秒
     connect-timeout-ms: ${LOCAL_ASR_CONNECT_TIMEOUT_MS:5000}
+    # 等待本地 ASR 结果的超时时间，单位毫秒
     read-timeout-ms: ${LOCAL_ASR_READ_TIMEOUT_MS:600000}
   dashscope:
+    # 公网 LLM 角色识别模型
     role-model: ${DASHSCOPE_ROLE_MODEL:qwen-plus}
+    # AI 判断的角色置信度低于该值时，要求医生人工复核
     role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:70}
+    # 每批发送给角色识别模型的句段数量
     role-batch-size: ${DASHSCOPE_ROLE_BATCH_SIZE:40}
     # 公网信息提取由后端直连 DashScope，不经过 internal-ai 或 127.0.0.1:8000。
     extraction-model: ${DASHSCOPE_EXTRACTION_MODEL:qwen-plus}
+    # 信息提取调用公网模型的超时时间，单位毫秒
     extraction-timeout-ms: ${DASHSCOPE_EXTRACTION_TIMEOUT_MS:${DASHSCOPE_READ_TIMEOUT_MS:60000}}
+    # 信息提取模型单次输出的最大 token 数
     extraction-max-tokens: ${DASHSCOPE_EXTRACTION_MAX_TOKENS:4096}
+    # 信息提取允许的单句段最大时长，单位毫秒；默认 2 分钟
     extraction-max-turn-duration-ms: ${EXTRACTION_MAX_TURN_DURATION_MS:120000}
+    # 信息提取允许的单句段最大字符数；默认 600 字
     extraction-max-turn-characters: ${EXTRACTION_MAX_TURN_CHARACTERS:600}
+    # 公网调用失败后的最大重试次数
     role-retry-max-attempts: ${DASHSCOPE_ROLE_RETRY_MAX_ATTEMPTS:2}
+    # 公网调用重试前的等待时间，单位毫秒
     role-retry-delay-ms: ${DASHSCOPE_ROLE_RETRY_DELAY_MS:200}
+    # DashScope API 密钥；公网转写、角色识别和信息提取都会使用
     api-key: ${DASHSCOPE_API_KEY:sk-ws-H.PDYIRDH.WTGk.MEQCIA1Cg2vaLpNLwHfiXquEK6FGX_pbkwclvF_JaaO2t7GkAiBEL0fBqwtkdCArw3wPbnt4JIVOOrVOKTWRwi1n4QSnMg}
     endpoint: ${DASHSCOPE_ENDPOINT:https://dashscope.aliyuncs.com}
+    # 连接 DashScope 的超时时间，单位毫秒
     connect-timeout-ms: ${DASHSCOPE_CONNECT_TIMEOUT_MS:5000}
+    # 等待 DashScope 普通响应的超时时间，单位毫秒
     read-timeout-ms: ${DASHSCOPE_READ_TIMEOUT_MS:60000}
+    # 公网录音转写模型
     asr-model: ${DASHSCOPE_ASR_MODEL:qwen-audio-3.0-asr-flash-filetrans}
+    # 公网转写是否启用说话人分离
     diarization-enabled: ${DASHSCOPE_DIARIZATION_ENABLED:true}
+    # 轮询公网转写任务结果的间隔，单位毫秒
     poll-delay-ms: ${DASHSCOPE_POLL_DELAY_MS:3000}
+    # 公网转写任务的总体等待上限，单位毫秒
     timeout-ms: ${DASHSCOPE_TIMEOUT_MS:600000}
