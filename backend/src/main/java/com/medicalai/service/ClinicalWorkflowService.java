@@ -213,8 +213,9 @@ public class ClinicalWorkflowService {
         requireRecordEditable(visit.id());
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
                 new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
-        // 先在写入提取版本之前校验路由。混合来源未选择时必须返回 409，不能伪装成模型失败。
-        return extractionService().generate(visit.id(), doctorId, snapshot, routes.resolve(snapshot, requestedProvider));
+        // 提取路由已固定为公网；转写可以来自内网，但分析必须使用可配置的公网模型。
+        return extractionService().generate(visit.id(), doctorId, snapshot,
+                routes.resolveAnalysis(snapshot, requestedProvider));
     }
 
     @Transactional

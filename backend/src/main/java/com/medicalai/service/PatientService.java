@@ -39,14 +39,16 @@ public class PatientService {
         if (gender.isBlank()) throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST,
                 "PATIENT_GENDER_REQUIRED", "请选择患者性别");
         LocalDate today = LocalDate.now(clock);
+        String phone = PatientFieldValidator.normalizePhone(request.phone());
+        String idNo = PatientFieldValidator.normalizeIdNumber(request.idNo(), today);
         LocalDate birthDate = request.age() == null ? null : today.minusYears(request.age());
         PatientVO created = PatientVO.from(mapper.insertManual(
                 UUID.randomUUID(),
                 name,
                 gender,
                 birthDate,
-                maskPhone(request.phone()),
-                maskIdNo(request.idNo()),
+                maskPhone(phone),
+                maskIdNo(idNo),
                 doctor.departmentName(), doctor.id()), today);
         return created;
     }
@@ -59,6 +61,10 @@ public class PatientService {
     }
 
     private String maskIdNo(String value) {
+        String normalized = value == null ? "" : value.strip();
+        // A complete ID ending in X must be masked; the generic mask cannot distinguish it
+        // from a value that an upstream system has already desensitized.
+        if (normalized.matches("\\d{17}X")) return mask(normalized, 3, 4);
         return mask(value, 3, 4);
     }
 

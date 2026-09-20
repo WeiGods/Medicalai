@@ -46,9 +46,6 @@ public class ClinicalExtractionService {
     private static final Set<String> DOCTOR_FIELDS = Set.of(
             "doctor_diagnosis", "doctor_medication", "doctor_followup");
     private static final int MIN_FACT_CONFIDENCE = 80;
-    private static final long MAX_TURN_DURATION_MS = 45_000;
-    private static final int MAX_TURN_CHARACTERS = 400;
-
     private final ClinicalExtractionMapper extractions;
     private final RecordingMapper recordings;
     private final MedicalRecordMapper records;
@@ -56,11 +53,15 @@ public class ClinicalExtractionService {
     private final LlmRouteResolver routes;
     private final ObjectMapper objectMapper;
     private final int roleReviewThreshold;
+    private final long maxTurnDurationMs;
+    private final int maxTurnCharacters;
 
     public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
                                      MedicalRecordMapper records, ClinicalExtractionRouter clients,
                                      LlmRouteResolver routes, ObjectMapper objectMapper,
-                                     @Value("${medicalai.dashscope.role-review-threshold:70}") int roleReviewThreshold) {
+                                     @Value("${medicalai.dashscope.role-review-threshold:70}") int roleReviewThreshold,
+                                     @Value("${medicalai.dashscope.extraction-max-turn-duration-ms:120000}") long maxTurnDurationMs,
+                                     @Value("${medicalai.dashscope.extraction-max-turn-characters:600}") int maxTurnCharacters) {
         this.extractions = extractions;
         this.recordings = recordings;
         this.records = records;
@@ -68,11 +69,13 @@ public class ClinicalExtractionService {
         this.routes = routes;
         this.objectMapper = objectMapper;
         this.roleReviewThreshold = roleReviewThreshold;
+        this.maxTurnDurationMs = Math.max(1, maxTurnDurationMs);
+        this.maxTurnCharacters = Math.max(1, maxTurnCharacters);
     }
 
     @Transactional(readOnly = true)
     public ClinicalExtractionVO current(UUID visitId, DialogueSnapshot snapshot) {
-        LlmRouting routing = routes.routing(snapshot);
+        LlmRouting routing = routes.analysisRouting(snapshot);
         return extractions.current(visitId)
                 .map(version -> toVO(version, snapshot, routing))
                 .orElseGet(() -> empty(snapshot, routing));
@@ -80,13 +83,13 @@ public class ClinicalExtractionService {
 
     @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot) {
-        return generate(visitId, doctorId, snapshot, routes.resolve(snapshot, null));
+        return generate(visitId, doctorId, snapshot, routes.resolveAnalysis(snapshot, null));
     }
 
     @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, LlmRoute route) {
         long startedAt = System.nanoTime();
-        LlmRouting routing = routes.routing(snapshot);
+        LlmRouting routing = routes.analysisRouting(snapshot);
         LOG.info("信息提取开始: visitId={}, snapshotHash={}, route={}", visitId, shortHash(snapshot.snapshotHash()), route);
         List<SnapshotTurn> turns;
         try {
@@ -153,7 +156,7 @@ public class ClinicalExtractionService {
         }
         ClinicalExtractionMapper.Version confirmed = extractions.confirm(visitId, snapshot.id(), snapshot.snapshotHash(), doctorId)
                 .orElseThrow(() -> BusinessException.conflict("CLINICAL_EXTRACTION_NOT_CONFIRMABLE", "当前提取结果不可确认，请重新生成"));
-        return toVO(confirmed, snapshot, routes.routing(snapshot));
+        return toVO(confirmed, snapshot, routes.analysisRouting(snapshot));
     }
 
     /** 病历生成前的硬门禁：快照哈希必须完全一致，不能复用旧提取。 */
@@ -215,8 +218,8 @@ public class ClinicalExtractionService {
             if (blank(turn.text())) issues.add(prefix + "转写文本为空。");
             if (turn.startMs() == null || turn.endMs() == null || turn.startMs() < 0 || turn.endMs() < turn.startMs()) {
                 issues.add(prefix + "时间戳缺失或无效。");
-            } else if (turn.endMs() - turn.startMs() > MAX_TURN_DURATION_MS
-                    || turn.text().codePointCount(0, turn.text().length()) > MAX_TURN_CHARACTERS) {
+            } else if (turn.endMs() - turn.startMs() > maxTurnDurationMs
+                    || turn.text().codePointCount(0, turn.text().length()) > maxTurnCharacters) {
                 issues.add(prefix + "句段过长，请在全文编辑中按说话人拆分后保存。");
             }
             if ("OTHER".equals(turn.role()) && !"MANUAL".equals(turn.roleSource())) {

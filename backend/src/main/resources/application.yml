@@ -53,6 +53,8 @@ medicalai:
     extraction-model: ${DASHSCOPE_EXTRACTION_MODEL:qwen-plus}
     extraction-timeout-ms: ${DASHSCOPE_EXTRACTION_TIMEOUT_MS:${DASHSCOPE_READ_TIMEOUT_MS:60000}}
     extraction-max-tokens: ${DASHSCOPE_EXTRACTION_MAX_TOKENS:4096}
+    extraction-max-turn-duration-ms: ${EXTRACTION_MAX_TURN_DURATION_MS:120000}
+    extraction-max-turn-characters: ${EXTRACTION_MAX_TURN_CHARACTERS:600}
     role-retry-max-attempts: ${DASHSCOPE_ROLE_RETRY_MAX_ATTEMPTS:2}
     role-retry-delay-ms: ${DASHSCOPE_ROLE_RETRY_DELAY_MS:200}
     api-key: ${DASHSCOPE_API_KEY:sk-ws-H.PDYIRDH.WTGk.MEQCIA1Cg2vaLpNLwHfiXquEK6FGX_pbkwclvF_JaaO2t7GkAiBEL0fBqwtkdCArw3wPbnt4JIVOOrVOKTWRwi1n4QSnMg}
