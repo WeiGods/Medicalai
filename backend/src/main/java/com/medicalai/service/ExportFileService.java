@@ -141,8 +141,6 @@ public class ExportFileService {
                     ParagraphAlignment.LEFT, 120, 60);
             addParagraph(document, "接诊日期：" + value(record.content().date()), 10, false,
                     ParagraphAlignment.LEFT, 0, 60);
-            addParagraph(document, "病历版本：v" + record.versionNo() + "    确认时间：" + confirmedAt(record.confirmedAt()),
-                    9, false, ParagraphAlignment.LEFT, 0, 0);
             document.write(out);
             return out.toByteArray();
         }
@@ -240,8 +238,6 @@ public class ExportFileService {
             layout.space(12);
             layout.wrapped("接诊医生：" + value(record.content().doctor()), 10, 0, 16);
             layout.wrapped("接诊日期：" + value(record.content().date()), 10, 0, 16);
-            layout.wrapped("病历版本：v" + record.versionNo() + "    确认时间：" + confirmedAt(record.confirmedAt()),
-                    9, 0, 14);
             String unicodeCMap = toUnicodeCMap(toUnicodeMappings(font, layout.drawnText()));
             document.save(out);
             return patchToUnicode(out.toByteArray(), unicodeCMap);

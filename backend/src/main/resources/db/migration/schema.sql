@@ -470,6 +470,8 @@ CREATE INDEX IF NOT EXISTS ix_clinical_extraction_version_source
 CREATE INDEX IF NOT EXISTS ix_record_export_record ON record_export(record_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template
     ON record_export(version_id, format, template_version) WHERE template_version = 2;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_template_v3
+    ON record_export(version_id, format, template_version) WHERE template_version = 3;
 CREATE INDEX IF NOT EXISTS ix_audit_visit_time ON audit_log(visit_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_audit_created_time ON audit_log(created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_audit_doctor_time ON audit_log(doctor_id, created_at DESC);

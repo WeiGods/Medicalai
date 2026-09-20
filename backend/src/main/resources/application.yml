@@ -28,9 +28,9 @@ medicalai:
     root: ${STORAGE_ROOT:./data/recordings}
   ai:
     # 旧属性仅为已有部署保留；新代码统一读取 internal-ai，公网快照不会使用此地址。
-    base-url: ${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}
+    base-url: ${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}
   internal-ai:
-    base-url: ${INTERNAL_AI_SERVICE_BASE_URL:${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}}
+    base-url: ${INTERNAL_AI_SERVICE_BASE_URL:${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}}
   minio:
     api-endpoint: ${MINIO_API_ENDPOINT:http://106.55.225.222:9000}
     access-key: ${MINIO_ACCESS_KEY:Zerojy}
@@ -40,7 +40,7 @@ medicalai:
     anonymous-read: ${MINIO_ANONYMOUS_READ:true}
     presign-expiry-seconds: ${MINIO_PRESIGN_EXPIRY_SECONDS:900}
   local-asr:
-    base-url: ${LOCAL_ASR_BASE_URL:${AI_SERVICE_BASE_URL:http://127.0.0.1:8000}}
+    base-url: ${LOCAL_ASR_BASE_URL:${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}}
     mode: ${LOCAL_ASR_MODE:offline}
     poll-delay-ms: ${LOCAL_ASR_POLL_DELAY_MS:3000}
     connect-timeout-ms: ${LOCAL_ASR_CONNECT_TIMEOUT_MS:5000}

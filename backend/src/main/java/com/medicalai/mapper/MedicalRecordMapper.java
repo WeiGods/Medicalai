@@ -11,7 +11,8 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class MedicalRecordMapper {
-    public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 2;
+    // v3 removes the duplicated confirmation metadata from DOCX and PDF exports.
+    public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 3;
     private static final RowMapper<MedicalRecordVersion> VERSION = (rs, n) -> new MedicalRecordVersion(
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
