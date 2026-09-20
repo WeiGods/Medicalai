@@ -10,7 +10,10 @@ import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtract
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
-const CURRENT_EXPORT_TEMPLATE_VERSION = 2
+// Keep this in sync with MedicalRecordMapper.CURRENT_EXPORT_TEMPLATE_VERSION.
+// The backend currently generates template v3; using v2 here makes a reused
+// successful export look like it was never created.
+const CURRENT_EXPORT_TEMPLATE_VERSION = 3
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
