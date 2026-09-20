@@ -13,8 +13,10 @@ import jakarta.validation.Valid;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 @RestController
 @RequestMapping("/api/v1/visits/{visitId}")
@@ -67,6 +69,14 @@ public class MedicalRecordController {
                                        @Valid @RequestBody ExportMedicalRecordRequest request,
                                        @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return service.recordExport(visitId, current.doctor().id(), request);
+    }
+
+    @PostMapping(value = "/exports/{exportId}/file", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public List<RecordExportVO> uploadExport(@PathVariable("visitId") UUID visitId,
+                                             @PathVariable("exportId") UUID exportId,
+                                             @RequestPart("file") MultipartFile file,
+                                             @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return service.uploadExport(visitId, exportId, current.doctor().id(), file);
     }
 
     @GetMapping("/exports")

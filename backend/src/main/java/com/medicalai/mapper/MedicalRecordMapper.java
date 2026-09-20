@@ -11,8 +11,6 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class MedicalRecordMapper {
-    // v3 removes the duplicated confirmation metadata from DOCX and PDF exports.
-    public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 3;
     private static final RowMapper<MedicalRecordVersion> VERSION = (rs, n) -> new MedicalRecordVersion(
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
@@ -126,7 +124,7 @@ public class MedicalRecordMapper {
                         rs.getObject("confirmation_id", UUID.class)), visitId).stream().findFirst();
     }
 
-    public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format) {
+    public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format, int templateVersion) {
         return jdbc.query("""
                 SELECT e.id,e.record_id,v.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
                 FROM record_export e
@@ -139,11 +137,11 @@ public class MedicalRecordMapper {
                 """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
                         rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"), rs.getString("status"),
                         rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at")),
-                recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION).stream().findFirst();
+                recordId, versionId, confirmationId, format, templateVersion).stream().findFirst();
     }
 
     public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
-                                                               String format) {
+                                                               String format, int templateVersion) {
         return jdbc.query("""
                 SELECT e.id,e.record_id,v.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
                 FROM record_export e
@@ -155,17 +153,17 @@ public class MedicalRecordMapper {
                 """, (rs, n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
                         rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"),
                         rs.getString("status"), rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at")),
-                recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION).stream().findFirst();
+                recordId, versionId, confirmationId, format, templateVersion).stream().findFirst();
     }
 
     public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
-                                               String format, UUID doctorId) {
+                                               String format, int templateVersion, UUID doctorId) {
         UUID id = UUID.randomUUID();
         int inserted = jdbc.update("""
                 INSERT INTO record_export(id,record_id,version_id,confirmation_id,format,template_version,status,object_key,created_by)
                 VALUES (?,?,?,?,?,?, 'PENDING', NULL,?)
                 ON CONFLICT DO NOTHING
-                """, id, recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION, doctorId);
+                """, id, recordId, versionId, confirmationId, format, templateVersion, doctorId);
         if (inserted == 0) return Optional.empty();
         return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst();
     }
@@ -187,11 +185,11 @@ public class MedicalRecordMapper {
                 """, exportId);
         if (reset == 0) return;
         int updated = jdbc.update("""
-                UPDATE ai_job SET status='PENDING',attempt_count=0,started_at=NULL,finished_at=NULL,
+                UPDATE ai_job SET status='FAILED',finished_at=medicalai_local_now(),
                     last_error=NULL,locked_at=NULL,lease_token=NULL
                 WHERE idempotency_key=?
                 """, "export:" + exportId);
-        if (updated == 0) createExportJob(visitId, exportId, format);
+        if (updated == 0) return;
     }
 
     public Optional<ExportJob> claimNextExportJob(UUID leaseToken) {
@@ -231,6 +229,43 @@ public class MedicalRecordMapper {
                 WHERE id=? AND result_ref=?
                 """, jobId, exportId);
         return true;
+    }
+
+    /**
+     * 前端模板生成完成后上传归档。只允许同一医生把当前接诊下的待处理导出标记为成功。
+     */
+    public boolean markUploadedExportSucceeded(UUID exportId, UUID visitId, UUID doctorId, String objectKey) {
+        int updated = jdbc.update("""
+                UPDATE record_export e
+                SET status='SUCCEEDED',object_key=?,error_message=NULL
+                FROM medical_record r
+                JOIN visit v ON v.id=r.visit_id
+                WHERE e.id=? AND e.record_id=r.id AND r.visit_id=? AND v.doctor_id=?
+                  AND e.status IN ('PENDING','RUNNING')
+                """, objectKey, exportId, visitId, doctorId);
+        if (updated == 0) return false;
+        jdbc.update("""
+                UPDATE ai_job
+                SET status='SUCCEEDED',finished_at=medicalai_local_now(),locked_at=NULL,lease_token=NULL,last_error=NULL
+                WHERE result_ref=?
+                """, exportId);
+        return true;
+    }
+
+    /**
+     * 原子占用待上传的导出任务；只有占用成功的请求才允许写归档文件，
+     * 防止并发或重复上传在状态校验前覆盖已归档内容。
+     */
+    public boolean claimExportForUpload(UUID exportId, UUID visitId, UUID doctorId) {
+        int claimed = jdbc.update("""
+                UPDATE record_export e
+                SET status='RUNNING',error_message=NULL
+                FROM medical_record r
+                JOIN visit v ON v.id=r.visit_id
+                WHERE e.id=? AND e.record_id=r.id AND r.visit_id=? AND v.doctor_id=?
+                  AND e.status IN ('PENDING','RUNNING')
+                """, exportId, visitId, doctorId);
+        return claimed > 0;
     }
 
     /**

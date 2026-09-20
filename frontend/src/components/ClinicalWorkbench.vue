@@ -6,14 +6,19 @@ import Icon from './Icon.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
+import { TEMPLATES, DEFAULT_TEMPLATE_VERSION, createTemplateDocxBlob, createTemplatePdfBlob, type RecordExportData } from '../exportTemplate'
+import { renderAsync } from 'docx-preview'
 import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
-// Keep this in sync with MedicalRecordMapper.CURRENT_EXPORT_TEMPLATE_VERSION.
-// The backend currently generates template v3; using v2 here makes a reused
-// successful export look like it was never created.
-const CURRENT_EXPORT_TEMPLATE_VERSION = 3
+const selectedTemplateVersion = ref(DEFAULT_TEMPLATE_VERSION)
+const selectedTemplate = computed(() => TEMPLATES.find(t => t.version === selectedTemplateVersion.value) ?? TEMPLATES[0])
+const previewOpen = ref(false)
+const previewUrl = ref('')
+const previewBusy = ref(false)
+const previewFormat = ref<'PDF' | 'DOCX'>('PDF')
+const previewDocContainer = ref<HTMLElement | null>(null)
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
@@ -1104,34 +1109,26 @@ async function doConfirm() {
 
 async function recordExportLog(format: 'DOCX' | 'PDF') {
   if (!currentVisit.value) return
-  exports.value = await api.recordExport(currentVisit.value.id, format)
+  exports.value = await api.recordExport(currentVisit.value.id, format, selectedTemplateVersion.value)
   addLog(format === 'DOCX' ? '发起 Word 导出' : '发起 PDF 导出')
 }
 
-async function waitForExport(format: 'DOCX' | 'PDF') {
+async function waitForExport(format: 'DOCX' | 'PDF'): Promise<RecordExport | null> {
   if (!currentVisit.value || !record.value) return null
   const versionNo = record.value.version_no
+  const templateVersion = selectedTemplateVersion.value
   let item = exports.value.find(e => e.format === format && e.version_no === versionNo
-    && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
-  // 复用已完成的导出任务（尤其是已完成接诊），避免用户每次打开导出页面都创建重复任务。
-  if (item?.status === 'SUCCEEDED') return item.id
+    && e.template_version === templateVersion)
+  // 复用当前模板记录；前端生成后上传归档，不再等待后端异步排版。
   if (!item || item.status === 'FAILED') {
     await recordExportLog(format)
     item = exports.value.find(e => e.format === format && e.version_no === versionNo
-      && e.template_version === CURRENT_EXPORT_TEMPLATE_VERSION)
+      && e.template_version === templateVersion)
   }
-  if (!item) return null
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const state = await api.exportStatus(item.id)
-    if (state.status === 'SUCCEEDED') return item.id
-    if (state.status === 'FAILED') throw new Error(state.error_message || '病历导出失败')
-    await new Promise(resolve => window.setTimeout(resolve, 500))
-  }
-  throw new Error('导出处理超时，请稍后重试')
+  return item ?? null
 }
 
-async function downloadExport(exportId: string, format: 'DOCX' | 'PDF') {
-  const blob = await api.exportBlob(exportId)
+function downloadBlob(blob: Blob, format: 'DOCX' | 'PDF', exportId: string) {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
@@ -1140,31 +1137,31 @@ async function downloadExport(exportId: string, format: 'DOCX' | 'PDF') {
   URL.revokeObjectURL(url)
 }
 
-function isMissingExportFile(error: unknown) {
-  return typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 404
-}
-
 async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
   if (busy.value || !record.value?.content || !confirmed.value) return
   busy.value = true
   try {
-    // 旧成功记录可能没有物理文件。下载接口会将其回退为 FAILED；刷新后本次点击自动重新提交一次。
-    for (let recoveryAttempt = 0; recoveryAttempt < 2; recoveryAttempt++) {
-      const exportId = await waitForExport(format)
-      if (!exportId) throw new Error(`${label} 导出任务未创建`)
-      try {
-        await downloadExport(exportId, format)
-        await loadAll(true)
-        toast(`${label} 病历已生成并下载。`)
-        return
-      } catch (error) {
-        if (recoveryAttempt === 0 && isMissingExportFile(error)) {
-          await loadAll(true)
-          continue
-        }
-        throw error
-      }
+    const item = await waitForExport(format)
+    if (!item || !currentVisit.value) throw new Error(`${label} 导出任务未创建`)
+    if (item.status === 'SUCCEEDED') {
+      const blob = await api.exportBlob(item.id)
+      downloadBlob(blob, format, item.id)
+      toast(`${label} 病历已下载。`)
+      return
     }
+    const data: RecordExportData = {
+      visitNo: currentVisit.value.visit_no,
+      versionNo: record.value!.version_no,
+      confirmedAt: record.value!.confirmed_at,
+      content: record.value!.content
+    }
+    const blob = format === 'DOCX'
+      ? await createTemplateDocxBlob(selectedTemplateVersion.value, data)
+      : await createTemplatePdfBlob(selectedTemplateVersion.value, data)
+    exports.value = await api.uploadExportFile(currentVisit.value.id, item.id, format, blob)
+    downloadBlob(blob, format, item.id)
+    await loadAll(true)
+    toast(`${label} 病历已生成并下载。`)
   } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`, 'error') }
   finally { busy.value = false }
 }
@@ -1173,6 +1170,46 @@ async function exportWord() { await exportRecord('DOCX', 'Word') }
 
 async function exportPdf() {
   await exportRecord('PDF', 'PDF')
+}
+
+async function showPreview(format: 'PDF' | 'DOCX') {
+  if (!record.value?.content || !currentVisit.value) return
+  previewBusy.value = true
+  try {
+    const data: RecordExportData = {
+      visitNo: currentVisit.value.visit_no,
+      versionNo: record.value.version_no,
+      confirmedAt: record.value.confirmed_at,
+      content: record.value.content
+    }
+    const blob = format === 'PDF'
+      ? await createTemplatePdfBlob(selectedTemplateVersion.value, data)
+      : await createTemplateDocxBlob(selectedTemplateVersion.value, data)
+    previewFormat.value = format
+    if (previewUrl.value) {
+      URL.revokeObjectURL(previewUrl.value)
+      previewUrl.value = ''
+    }
+    previewOpen.value = true
+    if (format === 'PDF') {
+      previewUrl.value = URL.createObjectURL(blob)
+    } else {
+      await nextTick()
+      if (previewDocContainer.value) {
+        previewDocContainer.value.innerHTML = ''
+        await renderAsync(blob, previewDocContainer.value, undefined, { inWrapper: false })
+      }
+    }
+  } catch (error) { toast(error instanceof Error ? error.message : '预览生成失败', 'error') }
+  finally { previewBusy.value = false }
+}
+
+function closePreview() {
+  previewOpen.value = false
+  if (previewUrl.value) {
+    URL.revokeObjectURL(previewUrl.value)
+    previewUrl.value = ''
+  }
 }
 
 async function exportFromBottom() {
@@ -1787,18 +1824,25 @@ defineExpose({ selectPatient })
         </div>
         <section class="card">
           <div class="card-head"><h2><Icon name="download" />选择导出格式</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
+          <div class="template-picker">
+            <label for="export-template">导出模板</label>
+            <select id="export-template" v-model.number="selectedTemplateVersion" :disabled="!confirmed || busy">
+              <option v-for="t in TEMPLATES" :key="t.version" :value="t.version">{{ t.name }}（v{{ t.version }}）· {{ t.description }}</option>
+            </select>
+            <button class="btn" :disabled="!confirmed || previewBusy || busy" @click="showPreview(previewFormat)"><Icon name="eye" />实时预览</button>
+          </div>
           <div class="export-options">
-            <div class="export-option"><Icon name="file" /><h3>Word 文档</h3><p>保留标准模板字段与确认信息。<br>下载 .docx 文件，便于存档及后续查阅。</p><button class="btn primary" :disabled="!confirmed || busy" @click="exportWord"><Icon name="download" />导出 Word</button></div>
-            <div class="export-option"><Icon name="file" /><h3>PDF 文档</h3><p>由后端生成标准 A4 PDF 文件。<br>生成完成后自动下载，便于打印和存档。</p><button class="btn" :disabled="!confirmed || busy" @click="exportPdf"><Icon name="download" />导出 PDF</button></div>
+            <div class="export-option"><Icon name="file" /><h3>Word 文档</h3><p>统一 A4 版式、章节编号与字段标签。<br>生成 .docx 并自动归档下载。</p><button class="btn primary" :disabled="!confirmed || busy" @click="exportWord"><Icon name="download" />导出 Word</button></div>
+            <div class="export-option"><Icon name="file" /><h3>PDF 文档</h3><p>统一 A4 版式、表格与页码。<br>生成 PDF 并自动归档下载。</p><button class="btn" :disabled="!confirmed || busy" @click="exportPdf"><Icon name="download" />导出 PDF</button></div>
           </div>
           <div class="readonly-note">导出任务完成后才允许下载；只有当前确认版本可以导出。</div>
         </section>
 
         <section class="card">
           <div class="card-head"><h2><Icon name="clock" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
-          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
-            <tr v-if="!exports.length"><td colspan="3">暂无导出记录</td></tr>
-            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
+          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>模板</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
+            <tr v-if="!exports.length"><td colspan="4">暂无导出记录</td></tr>
+            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>模板 v{{ item.template_version }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
           </tbody></table></div>
         </section>
       </div>
@@ -1890,6 +1934,20 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>
         </div>
+      </div>
+    </div>
+    <div v-if="previewOpen" class="preview-backdrop" role="presentation" @click.self="closePreview" @keydown.esc="closePreview">
+      <div class="preview-dialog" role="dialog" aria-modal="true" aria-label="导出模板预览">
+        <div class="preview-head">
+          <h2><Icon name="eye" />模板预览 · {{ selectedTemplate.name }}（v{{ selectedTemplate.version }}）</h2>
+          <div class="preview-format-toggle" role="group" aria-label="预览格式">
+            <button :class="{ active: previewFormat === 'PDF' }" :disabled="previewBusy" @click="showPreview('PDF')">PDF</button>
+            <button :class="{ active: previewFormat === 'DOCX' }" :disabled="previewBusy" @click="showPreview('DOCX')">Word</button>
+          </div>
+          <button class="icon-btn" aria-label="关闭预览" @click="closePreview"><Icon name="x" /></button>
+        </div>
+        <iframe v-if="previewUrl" :src="previewUrl" class="preview-frame" title="PDF 预览"></iframe>
+        <div v-if="previewFormat === 'DOCX'" ref="previewDocContainer" class="preview-docx"></div>
       </div>
     </div>
   </div>
