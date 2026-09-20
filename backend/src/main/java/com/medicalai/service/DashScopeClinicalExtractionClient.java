@@ -24,7 +24,7 @@ import org.springframework.web.client.RestClientResponseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** 仅用于公网快照的 DashScope 结构化事实提取客户端。 */
+/** 所有结构化事实提取均直连 DashScope 的客户端。 */
 @Service
 public class DashScopeClinicalExtractionClient {
     private static final Logger LOG = LoggerFactory.getLogger(DashScopeClinicalExtractionClient.class);

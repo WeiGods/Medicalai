@@ -4,6 +4,8 @@
 !requirements.txt
 !model.py
 !serve_realtime_ws.py
+!streaming_speaker_turns.py
+!offline_asr_structure.py
 !热词列表
 !ai_service
 !docker-models

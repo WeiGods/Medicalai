@@ -17,6 +17,12 @@ type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
 type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
+type ManualPatientField = keyof ManualPatientForm
+
+const PATIENT_PHONE_PATTERN = /^1[3-9]\d{9}$/
+const PATIENT_ID_PATTERN = /^\d{17}[\dX]$/
+const PATIENT_ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+const PATIENT_ID_CHECK_CODES = '10X98765432'
 
 const patients = ref<Patient[]>([])
 const visits = ref<Visit[]>([])
@@ -53,6 +59,7 @@ const modal = ref<ModalKind>(null)
 const modalError = ref('')
 const confirmChecked = ref(false)
 const newPatientForm = ref<ManualPatientForm>({ name: '', gender: '', age: null, phone: '', idNo: '' })
+const newPatientErrors = ref<Partial<Record<ManualPatientField, string>>>({})
 const dragging = ref(false)
 const playingId = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -78,6 +85,7 @@ watch(modal, async value => {
   if (value === 'new-patient') {
     modalError.value = ''
     newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
+    newPatientErrors.value = {}
   }
   if (value) {
     await nextTick()
@@ -248,10 +256,13 @@ const exported = computed(() => !!record.value && exports.value.some(item =>
 const sourceDirty = computed(() => !!record.value?.source_dirty)
 const locked = computed(() => closed.value || confirmed.value || !!actionBusy.value)
 const llmRouting = computed(() => extraction.value || transcript.value)
-const routeSelectionRequired = computed(() => !!llmRouting.value?.route_selection_required)
+const routeSelectionRequired = computed(() => false)
 const sourceRouteLabel = computed(() => {
   const route = llmRouting.value?.source_route
-  return route === 'DASHSCOPE' ? '公网 LLM（DashScope）' : route === 'LOCAL' ? '内网 LLM' : ''
+  return route === 'DASHSCOPE' ? '公网 LLM（DashScope）'
+    : route === 'LOCAL' ? '内网转写来源 · 分析走公网'
+    : route === 'MIXED' ? '混合转写来源 · 分析走公网'
+    : ''
 })
 const routeSelectionReady = computed(() => !routeSelectionRequired.value || !!selectedLlmRoute.value)
 const workflowView = computed<WorkflowView>(() => {
@@ -590,6 +601,7 @@ async function doFinish() {
 
 async function createNewPatient() {
   modalError.value = ''
+  newPatientErrors.value = {}
   const form = newPatientForm.value
   const name = form.name.trim()
   const gender = form.gender.trim()
@@ -607,9 +619,15 @@ async function createNewPatient() {
     modalError.value = '年龄请输入 0 到 150 之间的整数。'
     return
   }
+  const phoneValid = validateNewPatientField('phone')
+  const idValid = validateNewPatientField('idNo')
+  if (!phoneValid || !idValid) {
+    modalError.value = '请先修正联系方式或证件号的格式错误。'
+    return
+  }
   busy.value = true
   try {
-    const patient = await api.createPatient({ name, gender, age, phone: form.phone, idNo: form.idNo })
+    const patient = await api.createPatient({ name, gender, age, phone: form.phone, idNo: form.idNo.trim().toUpperCase() })
     patients.value = [patient, ...patients.value.filter(item => item.id !== patient.id)]
     selectedPatientId.value = patient.id
     modal.value = null
@@ -625,7 +643,42 @@ async function createNewPatient() {
 function openNewPatientModal() {
   modalError.value = ''
   newPatientForm.value = { name: '', gender: '', age: null, phone: '', idNo: '' }
+  newPatientErrors.value = {}
   modal.value = 'new-patient'
+}
+
+function patientPhoneError(value: string) {
+  return value.trim() && !PATIENT_PHONE_PATTERN.test(value.trim()) ? '请输入正确的11位手机号' : ''
+}
+
+function patientIdNumberError(value: string) {
+  const idNo = value.trim().toUpperCase()
+  if (!idNo) return ''
+  if (!PATIENT_ID_PATTERN.test(idNo)) return '请输入18位身份证号'
+  const year = Number(idNo.slice(6, 10))
+  const month = Number(idNo.slice(10, 12))
+  const day = Number(idNo.slice(12, 14))
+  const birth = new Date(Date.UTC(year, month - 1, day))
+  const now = new Date()
+  if (year < 1900 || month < 1 || month > 12 || birth.getUTCFullYear() !== year
+    || birth.getUTCMonth() !== month - 1 || birth.getUTCDate() !== day || birth > now) {
+    return '身份证中的出生日期无效'
+  }
+  const checksum = idNo.split('').slice(0, 17).reduce((sum, digit, index) =>
+    sum + Number(digit) * PATIENT_ID_WEIGHTS[index], 0)
+  return PATIENT_ID_CHECK_CODES[checksum % 11] === idNo[17] ? '' : '身份证校验码不正确'
+}
+
+function validateNewPatientField(field: 'phone' | 'idNo') {
+  const value = newPatientForm.value[field]
+  const error = field === 'phone' ? patientPhoneError(value) : patientIdNumberError(value)
+  if (error) newPatientErrors.value[field] = error
+  else delete newPatientErrors.value[field]
+  return !error
+}
+
+function clearNewPatientError(field: 'phone' | 'idNo') {
+  delete newPatientErrors.value[field]
 }
 
 function triggerUpload() {
@@ -910,9 +963,7 @@ async function generateClinicalExtraction() {
   if (!currentVisit.value || locked.value) return
   actionBusy.value = 'extract'
   try {
-    extraction.value = selectedLlmRoute.value
-      ? await api.generateClinicalExtraction(currentVisit.value.id, selectedLlmRoute.value)
-      : await api.generateClinicalExtraction(currentVisit.value.id)
+    extraction.value = await api.generateClinicalExtraction(currentVisit.value.id, 'DASHSCOPE')
     transcriptTab.value = 'facts'
     await loadAll(true)
     if (extraction.value?.status === 'GENERATED') {
@@ -1800,8 +1851,18 @@ defineExpose({ selectPatient })
               <div class="modal-field"><label for="manual-patient-name">患者姓名 <span class="required">*</span></label><input id="manual-patient-name" v-model="newPatientForm.name" maxlength="128" placeholder="请输入真实姓名" /></div>
               <div class="modal-field"><label for="manual-patient-gender">性别 <span class="required">*</span></label><select id="manual-patient-gender" v-model="newPatientForm.gender"><option value="">请选择</option><option value="男">男</option><option value="女">女</option><option value="其他">其他</option><option value="未知">未知</option></select></div>
               <div class="modal-field"><label for="manual-patient-age">年龄</label><input id="manual-patient-age" v-model.number="newPatientForm.age" type="number" min="0" max="150" step="1" placeholder="选填" /></div>
-              <div class="modal-field"><label for="manual-patient-phone">联系方式</label><input id="manual-patient-phone" v-model="newPatientForm.phone" type="tel" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
-              <div class="modal-field manual-patient-wide"><label for="manual-patient-id">证件号</label><input id="manual-patient-id" v-model="newPatientForm.idNo" maxlength="64" placeholder="选填，保存后脱敏显示" /></div>
+              <div class="modal-field" :class="{ invalid: newPatientErrors.phone }">
+                <label for="manual-patient-phone">联系方式</label>
+                <input id="manual-patient-phone" v-model="newPatientForm.phone" type="tel" inputmode="numeric" maxlength="11"
+                  placeholder="选填，保存后脱敏显示" @input="newPatientForm.phone = newPatientForm.phone.replace(/\D/g, '').slice(0, 11); clearNewPatientError('phone')" @blur="validateNewPatientField('phone')" />
+                <p v-if="newPatientErrors.phone" class="field-error">{{ newPatientErrors.phone }}</p>
+              </div>
+              <div class="modal-field manual-patient-wide" :class="{ invalid: newPatientErrors.idNo }">
+                <label for="manual-patient-id">证件号</label>
+                <input id="manual-patient-id" v-model="newPatientForm.idNo" type="text" maxlength="18"
+                  placeholder="选填，保存后脱敏显示" @input="newPatientForm.idNo = newPatientForm.idNo.toUpperCase(); clearNewPatientError('idNo')" @blur="validateNewPatientField('idNo')" />
+                <p v-if="newPatientErrors.idNo" class="field-error">{{ newPatientErrors.idNo }}</p>
+              </div>
             </div>
             <div class="modal-note">仅新增患者资料，不会创建或开始接诊。患者会保存到本地患者库并自动生成患者编号；联系方式和证件号在列表中以脱敏形式展示。</div>
             <div v-if="modalError" class="modal-error">{{ modalError }}</div>

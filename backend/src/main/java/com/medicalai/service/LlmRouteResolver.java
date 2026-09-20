@@ -27,6 +27,13 @@ public class LlmRouteResolver {
         return routing(snapshot.id());
     }
 
+    /**
+     * AI 分析不再继承录音转写路由：本地推理只产出转写与句段，提取固定使用公网 Qwen-Plus。
+     */
+    public LlmRouting analysisRouting(DialogueSnapshot snapshot) {
+        return new LlmRouting(LlmRoute.DASHSCOPE, List.of(LlmRoute.DASHSCOPE), false);
+    }
+
     public LlmRouting routing(UUID snapshotId) {
         Set<LlmRoute> routes = new LinkedHashSet<>();
         for (String value : recordings.snapshotAsrRoutes(snapshotId)) {
@@ -62,6 +69,15 @@ public class LlmRouteResolver {
                     "当前快照只能使用" + label(routing.sourceRoute()) + "，不能切换到其他路由");
         }
         return routing.sourceRoute();
+    }
+
+    public LlmRoute resolveAnalysis(DialogueSnapshot snapshot, String requestedProvider) {
+        LlmRoute requested = LlmRoute.fromRequested(requestedProvider);
+        if (requested == LlmRoute.LOCAL || requested == LlmRoute.UNKNOWN) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "LLM_ROUTE_MISMATCH",
+                    "信息提取已固定使用公网 Qwen-Plus，不能选择内网路由");
+        }
+        return LlmRoute.DASHSCOPE;
     }
 
     public static String label(LlmRoute route) {
