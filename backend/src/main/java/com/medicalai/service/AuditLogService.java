@@ -39,6 +39,11 @@ public class AuditLogService {
                 AuditResult.SUCCESS, "上传录音：" + safeFileName(fileName), null);
     }
 
+    public void recordRecordingDeleted(UUID doctorId, UUID visitId, UUID recordingId, String fileName) {
+        record(doctorId, visitId, AuditAction.RECORDING_DELETED, recordingId, AuditResourceType.RECORDING,
+                AuditResult.SUCCESS, "删除录音：" + safeFileName(fileName), null);
+    }
+
     public void recordMedicalRecordConfirmed(UUID doctorId, UUID visitId, UUID recordId, int versionNo) {
         record(doctorId, visitId, AuditAction.MEDICAL_RECORD_CONFIRMED, recordId, AuditResourceType.MEDICAL_RECORD,
                 AuditResult.SUCCESS, "确认病历版本 v" + versionNo, null);

@@ -76,6 +76,7 @@ export const api = {
   },
   transcribe: (visitId: string, provider: AsrProvider) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe`, { method: 'POST', body: JSON.stringify({ provider }) }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
+  deleteRecording: (visitId: string, recordingId: string) => request<void>(`/api/v1/visits/${visitId}/recordings/${recordingId}`, { method: 'DELETE' }),
   transcript: (visitId: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`),
   saveTranscript: (visitId: string, transcript: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`, {
     method: 'PUT',
@@ -114,9 +115,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ format, template_version: templateVersion })
   }),
-  uploadExportFile: (visitId: string, exportId: string, format: 'DOCX' | 'PDF', file: Blob) => {
+  uploadExportFile: (visitId: string, exportId: string, format: 'DOCX' | 'PDF', file: Blob, fileName?: string) => {
     const body = new FormData()
-    body.append('file', file, `medical-record-${exportId}.${format === 'DOCX' ? 'docx' : 'pdf'}`)
+    const ext = format === 'DOCX' ? 'docx' : 'pdf'
+    body.append('file', file, `${fileName || `medical-record-${exportId}`}.${ext}`)
     return request<RecordExport[]>(`/api/v1/visits/${visitId}/exports/${exportId}/file`, { method: 'POST', body }, false)
   },
   exports: (visitId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`),

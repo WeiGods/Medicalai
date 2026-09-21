@@ -176,7 +176,7 @@ export interface RecordExport {
   created_at: string
 }
 
-export type AuditAction = 'LOGIN' | 'RECORDING_UPLOADED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
+export type AuditAction = 'LOGIN' | 'RECORDING_UPLOADED' | 'RECORDING_DELETED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
 
 export interface AuditLog {
   id: string

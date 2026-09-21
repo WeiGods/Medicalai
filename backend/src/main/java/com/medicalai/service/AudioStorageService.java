@@ -109,6 +109,16 @@ public class AudioStorageService {
         }
     }
 
+    public void delete(String objectKey) {
+        if (objectKey == null || objectKey.isBlank()) return;
+        try {
+            requireCredentials();
+            client.removeObject(RemoveObjectArgs.builder().bucket(bucket).object(objectKey).build());
+        } catch (Exception e) {
+            throw storageFailure("录音文件删除失败", e);
+        }
+    }
+
     /** 在创建 ASR 任务前校验所需存储配置。 */
     public void assertAsrSubmissionReady() {
         if (!credentialsConfigured) {
