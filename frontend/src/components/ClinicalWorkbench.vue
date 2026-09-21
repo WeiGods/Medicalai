@@ -107,7 +107,7 @@ watch(() => transcript.value?.snapshot_id, () => {
 
 const titles: Record<MainView, [string, string]> = {
   workbench: ['接诊工作台', '从医患对话到结构化病历，让每一次接诊更从容。'],
-  audio: ['录音上传', '完整上传问诊录音，支持一次接诊关联多段录音。'],
+  audio: ['问诊过程/音频', '完整上传问诊录音，支持上传和实时录音。'],
   transcript: ['转写结果', '回看医患对话，核对并编辑本次接诊采用的转写文本。'],
   record: ['病历审核与签署', '核对并完善病历草稿，确认后锁定当前版本。'],
   export: ['病历导出', '将已确认的病历由后端生成 Word 或 PDF 文件。'],
@@ -1437,7 +1437,7 @@ defineExpose({ selectPatient })
       </section>
 
       <nav v-if="!readOnlyCurrentPatient" class="steps" aria-label="接诊流程">
-        <button v-for="(label, index) in ['患者 / 接诊', '录音上传', '转写结果', '病历审核与签署', '病历导出']" :key="label"
+        <button v-for="(label, index) in ['患者 / 接诊', '问诊音频', '转写结果', '病历审核与签署', '病历导出']" :key="label"
                 class="step" :class="{ done: index < stage || exported, current: index === stage }"
                 :disabled="completed && index === 0"
                 @click="navigate((['workbench','audio','transcript','record','export'] as MainView[])[index])">
