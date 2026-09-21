@@ -44,6 +44,13 @@ public class RecordingController {
         return workflow.upload(visitId, current.doctor().id(), file, durationMs);
     }
 
+    @DeleteMapping("/visits/{visitId}/recordings/{recordingId}")
+    public void delete(@PathVariable("visitId") UUID visitId,
+                       @PathVariable("recordingId") UUID recordingId,
+                       @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        workflow.deleteRecording(visitId, recordingId, current.doctor().id());
+    }
+
     @PostMapping("/visits/{visitId}/recordings/transcribe")
     public AsrJobVO transcribe(@PathVariable("visitId") UUID visitId,
                              @RequestBody(required = false) TranscribeRequest request,

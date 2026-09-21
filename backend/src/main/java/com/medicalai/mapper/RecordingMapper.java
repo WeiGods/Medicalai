@@ -53,6 +53,15 @@ public class RecordingMapper {
                 r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), "DASHSCOPE");
     }
 
+    public int delete(UUID id) {
+        return jdbc.update("DELETE FROM recording WHERE id=? AND status IN ('UPLOADED','FAILED')", id);
+    }
+
+    /** 剥离转写任务对录音的外键引用，允许删除转写失败的录音。 */
+    public void detachAsrJobs(UUID recordingId) {
+        jdbc.update("UPDATE ai_job SET recording_id=NULL WHERE recording_id=? AND job_type='ASR_TRANSCRIBE'", recordingId);
+    }
+
     public Recording updateStatus(UUID id, String status, String error) {
         return jdbc.queryForObject("""
                 UPDATE recording SET status=?,error_code=CASE WHEN ?::text IS NULL THEN NULL ELSE 'ASR_FAILED' END,

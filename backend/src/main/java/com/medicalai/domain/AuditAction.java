@@ -4,6 +4,7 @@ package com.medicalai.domain;
 public enum AuditAction {
     LOGIN,
     RECORDING_UPLOADED,
+    RECORDING_DELETED,
     MEDICAL_RECORD_CONFIRMED,
     MEDICAL_RECORD_EXPORT
 }

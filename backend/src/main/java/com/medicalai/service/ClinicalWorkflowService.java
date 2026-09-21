@@ -10,9 +10,12 @@ import java.time.*;
 import java.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 
 /**
@@ -134,6 +137,56 @@ public class ClinicalWorkflowService {
         invalidateClinicalExtraction(visit.id());
         auditRecordingUploaded(doctorId, visit.id(), id, name);
         return RecordingVO.from(recording);
+    }
+
+    @Transactional
+    public void deleteRecording(UUID visitId, UUID recordingId, UUID doctorId) {
+        Recording recording = recordings.find(recordingId, doctorId)
+                .orElseThrow(BusinessException::notFound);
+        if (!recording.visitId().equals(visitId)) {
+            throw BusinessException.notFound();
+        }
+        Visit visit = owned(recording.visitId(), doctorId, true);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        if ("PROCESSING".equals(recording.status())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "录音正在转写，暂不能删除");
+        }
+        if ("DONE".equals(recording.status())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_TRANSCRIBED", "已转写录音不能删除");
+        }
+        // 先剥离 ASR 任务外键再删库行；转写失败的录音在 ai_job 中仍持有 recording_id 引用。
+        recordings.detachAsrJobs(recording.id());
+        try {
+            if (recordings.delete(recording.id()) != 1) {
+                throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_STATE_CHANGED", "录音状态已变化，请刷新后重试");
+            }
+        } catch (DataIntegrityViolationException e) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_HAS_STREAM_DATA",
+                    "录音存在关联的转写会话数据，暂不能删除", e);
+        }
+        invalidateClinicalExtraction(visit.id());
+        if (auditLogs != null) {
+            auditLogs.recordRecordingDeleted(doctorId, visit.id(), recording.id(), recording.fileName());
+        }
+        Runnable deleteObject = () -> {
+            try {
+                storage.delete(recording.objectKey());
+            } catch (RuntimeException e) {
+                LOG.warn("录音对象删除失败，已保留孤儿文件: recordingId={}", recording.id(), e);
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()
+                && TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    deleteObject.run();
+                }
+            });
+        } else {
+            deleteObject.run();
+        }
     }
 
     @Transactional(noRollbackFor = BusinessException.class)

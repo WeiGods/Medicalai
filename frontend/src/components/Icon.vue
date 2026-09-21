@@ -26,6 +26,7 @@ const icons: Record<string, string> = {
   play: '<path d="m8 5 11 7-11 7V5Z"/>',
   pause: '<path d="M8 5v14M16 5v14"/>',
   sparkle: '<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Zm7 0v4m-2-2h4"/>',
+  trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m5 5v6m4-6v6"/>',
   refresh: '<path d="M3 10a9 9 0 0 1 15-6l3 3M21 2v5h-5m5 7a9 9 0 0 1-15 6l-3-3m0 5v-5h5"/>',
   save: '<path d="m17 3 4 4v14H3V3h14ZM7 3v6h10V3M7 21v-8h10v8"/>',
   edit: '<path d="m16 3 5 5-12 12-6 1 1-6L16 3ZM13 6 18 11"/>',

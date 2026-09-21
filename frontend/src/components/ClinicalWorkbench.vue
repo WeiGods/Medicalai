@@ -22,7 +22,7 @@ const previewDocContainer = ref<HTMLElement | null>(null)
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
-type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | null
+type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | 'delete-recording' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 type ManualPatientField = keyof ManualPatientForm
@@ -31,6 +31,8 @@ const PATIENT_PHONE_PATTERN = /^1[3-9]\d{9}$/
 const PATIENT_ID_PATTERN = /^\d{17}[\dX]$/
 const PATIENT_ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
 const PATIENT_ID_CHECK_CODES = '10X98765432'
+const MAX_RECORDING_BYTES = 200 * 1024 * 1024
+const RECORDING_EXTENSION_PATTERN = /\.(wav|mp3|m4a|webm)$/i
 
 const patients = ref<Patient[]>([])
 const visits = ref<Visit[]>([])
@@ -40,10 +42,11 @@ const queueSearch = ref('')
 const patientSearchResults = ref<Patient[] | null>(null)
 const searchBusy = ref(false)
 const busy = ref(false)
-const actionBusy = ref<'' | 'upload' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
+const actionBusy = ref<'' | 'upload' | 'delete' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
+const recordingToDelete = ref<Recording | null>(null)
 const transcript = ref<Transcript | null>(null)
 const extraction = ref<ClinicalExtraction | null>(null)
 const record = ref<MedicalRecord | null>(null)
@@ -194,6 +197,7 @@ function auditActionLabel(action: string) {
   return ({
     LOGIN: '登录系统',
     RECORDING_UPLOADED: '上传录音',
+    RECORDING_DELETED: '删除录音',
     MEDICAL_RECORD_CONFIRMED: '确认病历',
     MEDICAL_RECORD_EXPORT: '病历导出'
   } as Record<string, string>)[action] || action
@@ -656,7 +660,9 @@ function openNewPatientModal() {
 }
 
 function patientPhoneError(value: string) {
-  return value.trim() && !PATIENT_PHONE_PATTERN.test(value.trim()) ? '请输入正确的11位手机号' : ''
+  const phone = value.trim()
+  if (!phone) return '请输入联系方式'
+  return PATIENT_PHONE_PATTERN.test(phone) ? '' : '请输入正确的11位手机号'
 }
 
 function patientIdNumberError(value: string) {
@@ -709,13 +715,29 @@ async function audioDuration(file: File, fallbackDuration = 0) {
   })
 }
 
-async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0) {
+async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0, source: 'pick' | 'recorder' = 'pick') {
   if (!currentVisit.value || locked.value) return
+  const accepted = new Set<File>()
   for (const file of Array.from(files || [])) {
-    if (!/\.(wav|mp3|m4a|webm)$/i.test(file.name)) {
+    if (!RECORDING_EXTENSION_PATTERN.test(file.name)) {
       toast('仅支持 MP3、WAV、M4A 或 WEBM 格式。', 'error')
       continue
     }
+    if (file.size > MAX_RECORDING_BYTES) {
+      toast(`「${file.name}」超过 200MB，请拆分后上传。`, 'error')
+      continue
+    }
+    if (Array.from(accepted).some(picked => picked.name === file.name && picked.size === file.size)
+      || (source === 'pick' && recordings.value.some(item =>
+        item.file_name === file.name && item.size_bytes === file.size && item.status !== 'FAILED'))) {
+      toast(`「${file.name}」已上传，请勿重复添加。`, 'error')
+      continue
+    }
+    accepted.add(file)
+  }
+  if (!accepted.size) return
+  for (const file of Array.from(files || [])) {
+    if (!accepted.has(file)) continue
     const duration = await audioDuration(file, fallbackDuration)
     if (duration <= 0) {
       toast(`无法读取「${file.name}」，请选用有效音频。`, 'error')
@@ -732,6 +754,37 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
   actionBusy.value = ''
   await loadAll(true)
   if (view.value === 'workbench') toast('录音已上传，可开始转写。')
+}
+
+async function handlePickedFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  await uploadFiles(input.files)
+  input.value = ''
+}
+
+function requestDeleteRecording(item: Recording) {
+  recordingToDelete.value = item
+  modalError.value = ''
+  modal.value = 'delete-recording'
+}
+
+async function deleteSelectedRecording() {
+  const item = recordingToDelete.value
+  if (!item || !currentVisit.value) return
+  actionBusy.value = 'delete'
+  try {
+    await api.deleteRecording(item.visit_id, item.id)
+    if (playingId.value === item.id) stopAudio()
+    modal.value = null
+    recordingToDelete.value = null
+    addLog(`删除录音：${item.file_name}`)
+    await loadAll(true)
+    toast('录音已删除，可重新上传。', 'success')
+  } catch (error) {
+    modalError.value = error instanceof Error ? error.message : '删除录音失败'
+  } finally {
+    actionBusy.value = ''
+  }
 }
 
 watch(() => currentVisit.value?.id, () => {
@@ -784,9 +837,10 @@ async function saveTranscript() {
   }
   actionBusy.value = 'save'
   try {
-    transcript.value = await api.saveTranscript(currentVisit.value.id, transcriptDraft.value.trim())
+    const updated = await api.saveTranscript(currentVisit.value.id, transcriptDraft.value.trim())
+    transcript.value = updated
+    transcriptDraft.value = updated.transcript
     addLog('保存采用的转写文本')
-    await loadAll(true)
     navigate('transcript')
     toast('转写文本已保存，可生成病历。')
   } catch (error) {
@@ -928,7 +982,7 @@ async function startRecording() {
       const extension = type.includes('mp4') ? 'm4a' : 'webm'
       const file = new File([new Blob(recordChunks, { type })], `${currentPatient.value?.name || '问诊'}_浏览器录音.${extension}`, { type })
       recorder = null
-      if (file.size) uploadFiles([file], recordingElapsedMs.value)
+      if (file.size) uploadFiles([file], recordingElapsedMs.value, 'recorder')
     }
     recorder.start()
     recordingElapsedMs.value = 0
@@ -973,7 +1027,6 @@ async function generateClinicalExtraction() {
   try {
     extraction.value = await api.generateClinicalExtraction(currentVisit.value.id, 'DASHSCOPE')
     transcriptTab.value = 'facts'
-    await loadAll(true)
     if (extraction.value?.status === 'GENERATED') {
       addLog('生成可追溯信息提取结果')
       toast('信息提取已生成，请核对原文证据后整体确认。')
@@ -993,7 +1046,6 @@ async function confirmClinicalExtraction() {
   try {
     extraction.value = await api.confirmClinicalExtraction(currentVisit.value.id)
     addLog('整体确认信息提取结果')
-    await loadAll(true)
     toast('信息提取已确认，可生成病历草稿。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '信息提取确认失败', 'error')
@@ -1015,7 +1067,6 @@ async function generateRecord() {
     record.value = await api.generateMedicalRecord(currentVisit.value.id)
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
     addLog(`生成病历草稿 v${record.value.version_no}`)
-    await loadAll(true)
     navigate('record')
     toast('病历草稿已生成，请医生核对。')
   } catch (error) {
@@ -1031,7 +1082,6 @@ async function saveDraft() {
   try {
     record.value = await api.saveMedicalRecord(currentVisit.value.id, recordForm.value)
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
-    await loadAll(true)
     navigate('record')
     toast('病历草稿已保存。')
   } catch (error) {
@@ -1047,7 +1097,6 @@ async function editRecord() {
   try {
     record.value = await api.editMedicalRecord(currentVisit.value.id)
     recordForm.value = record.value.content ? JSON.parse(JSON.stringify(record.value.content)) : null
-    await loadAll(true)
     navigate('record')
     toast('已创建病历修订版，请完成核对并重新签署。')
   } catch (error) {
@@ -1097,7 +1146,6 @@ async function doConfirm() {
     record.value = await api.confirmMedicalRecord(currentVisit.value.id, true)
     addLog(`${props.doctor.display_name}医生签署病历 v${record.value.version_no}`)
     modal.value = null
-    await loadAll(true)
     navigate('record')
     toast('病历已签署，当前版本现可导出。')
   } catch (error) {
@@ -1128,11 +1176,19 @@ async function waitForExport(format: 'DOCX' | 'PDF'): Promise<RecordExport | nul
   return item ?? null
 }
 
-function downloadBlob(blob: Blob, format: 'DOCX' | 'PDF', exportId: string) {
+function exportFileBaseName(exportedAt: string) {
+  const date = formatDateTime(exportedAt).slice(0, 10).replace(/-/g, '')
+  const doctorName = (record.value?.confirmed_by_name || props.doctor.display_name).replace(/[\\/:*?"<>|]/g, '').trim()
+  const patientName = (currentPatient.value?.name || record.value?.content?.name || '').replace(/[\\/:*?"<>|]/g, '').trim()
+  const versionNo = record.value?.version_no || 1
+  return `【${date}】${doctorName || '医生'}_${patientName || '患者'}_V${versionNo}`
+}
+
+function downloadBlob(blob: Blob, format: 'DOCX' | 'PDF', fileName: string) {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `medical-record-${exportId}.${format === 'DOCX' ? 'docx' : 'pdf'}`
+  link.download = `${fileName}.${format === 'DOCX' ? 'docx' : 'pdf'}`
   link.click()
   URL.revokeObjectURL(url)
 }
@@ -1145,7 +1201,7 @@ async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
     if (!item || !currentVisit.value) throw new Error(`${label} 导出任务未创建`)
     if (item.status === 'SUCCEEDED') {
       const blob = await api.exportBlob(item.id)
-      downloadBlob(blob, format, item.id)
+      downloadBlob(blob, format, exportFileBaseName(item.created_at))
       toast(`${label} 病历已下载。`)
       return
     }
@@ -1158,9 +1214,9 @@ async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
     const blob = format === 'DOCX'
       ? await createTemplateDocxBlob(selectedTemplateVersion.value, data)
       : await createTemplatePdfBlob(selectedTemplateVersion.value, data)
-    exports.value = await api.uploadExportFile(currentVisit.value.id, item.id, format, blob)
-    downloadBlob(blob, format, item.id)
-    await loadAll(true)
+    const fileName = exportFileBaseName(item.created_at)
+    exports.value = await api.uploadExportFile(currentVisit.value.id, item.id, format, blob, fileName)
+    downloadBlob(blob, format, fileName)
     toast(`${label} 病历已生成并下载。`)
   } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`, 'error') }
   finally { busy.value = false }
@@ -1483,7 +1539,7 @@ defineExpose({ selectPatient })
                 <div class="dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files)">
                   <div class="upload-icon"><Icon name="upload" /></div>
                   <p><strong>点击上传</strong> 或拖拽录音文件到此处</p><small>支持 MP3、WAV、M4A · 时长与大小不限</small>
-                  <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="uploadFiles(($event.target as HTMLInputElement).files)" />
+                  <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="handlePickedFiles" />
                 </div>
                 <div class="record-controls">
                   <button class="btn small" :disabled="locked" @click="startRecording">开始录音</button>
@@ -1497,6 +1553,7 @@ defineExpose({ selectPatient })
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name" :title="item.file_name || ''">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
+                  <button v-if="!locked && ['UPLOADED', 'FAILED'].includes(item.status)" class="btn small danger" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
@@ -1655,7 +1712,7 @@ defineExpose({ selectPatient })
                   <div class="method-heading"><span class="method-icon"><Icon name="upload" /></span><div><h3>上传录音文件</h3><p>支持 MP3、WAV、M4A、WEBM</p></div></div>
                   <div class="dropzone compact-dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files)">
                     <div class="upload-icon"><Icon name="upload" /></div><p><strong>点击上传</strong> 或拖拽到此处</p><small>单个文件最大 200MB</small>
-                    <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="uploadFiles(($event.target as HTMLInputElement).files)" />
+                    <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="handlePickedFiles" />
                   </div>
                 </div>
                 <div class="recorder-card" :class="`is-${recordingState}`">
@@ -1677,6 +1734,7 @@ defineExpose({ selectPatient })
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
+                  <button v-if="!locked && ['UPLOADED', 'FAILED'].includes(item.status)" class="btn small danger" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
@@ -1854,7 +1912,7 @@ defineExpose({ selectPatient })
             <label>开始日期<input v-model="auditFrom" type="date" :max="auditTo || undefined"></label>
             <label>结束日期<input v-model="auditTo" type="date" :min="auditFrom || undefined"></label>
             <label>操作医生<select v-model="auditDoctorId"><option value="">全部医生</option><option v-for="operator in auditOperators" :key="operator.id" :value="operator.id">{{ operator.display_name }}</option></select></label>
-            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="RECORDING_UPLOADED">上传录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
+            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="RECORDING_UPLOADED">上传录音</option><option value="RECORDING_DELETED">删除录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
             <button class="btn primary audit-search" :disabled="auditBusy" @click="loadAudit(1)"><Icon name="search" />查询</button>
           </div>
         </section>
@@ -1889,19 +1947,19 @@ defineExpose({ selectPatient })
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','help':'使用帮助','activity':'当前接诊动态' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
           <template v-if="modal === 'new-patient'">
             <div class="manual-patient-grid">
               <div class="modal-field"><label for="manual-patient-name">患者姓名 <span class="required">*</span></label><input id="manual-patient-name" v-model="newPatientForm.name" maxlength="128" placeholder="请输入真实姓名" /></div>
-              <div class="modal-field"><label for="manual-patient-gender">性别 <span class="required">*</span></label><select id="manual-patient-gender" v-model="newPatientForm.gender"><option value="">请选择</option><option value="男">男</option><option value="女">女</option><option value="其他">其他</option><option value="未知">未知</option></select></div>
+              <div class="modal-field"><label for="manual-patient-gender">性别 <span class="required">*</span></label><select id="manual-patient-gender" v-model="newPatientForm.gender"><option value="">请选择</option><option value="男">男</option><option value="女">女</option></select></div>
               <div class="modal-field"><label for="manual-patient-age">年龄</label><input id="manual-patient-age" v-model.number="newPatientForm.age" type="number" min="0" max="150" step="1" placeholder="选填" /></div>
               <div class="modal-field" :class="{ invalid: newPatientErrors.phone }">
-                <label for="manual-patient-phone">联系方式</label>
+                <label for="manual-patient-phone">联系方式 <span class="required">*</span></label>
                 <input id="manual-patient-phone" v-model="newPatientForm.phone" type="tel" inputmode="numeric" maxlength="11"
-                  placeholder="选填，保存后脱敏显示" @input="newPatientForm.phone = newPatientForm.phone.replace(/\D/g, '').slice(0, 11); clearNewPatientError('phone')" @blur="validateNewPatientField('phone')" />
+                  placeholder="请输入11位手机号，保存后脱敏显示" @input="newPatientForm.phone = newPatientForm.phone.replace(/\D/g, '').slice(0, 11); clearNewPatientError('phone')" @blur="validateNewPatientField('phone')" />
                 <p v-if="newPatientErrors.phone" class="field-error">{{ newPatientErrors.phone }}</p>
               </div>
               <div class="modal-field manual-patient-wide" :class="{ invalid: newPatientErrors.idNo }">
@@ -1923,6 +1981,7 @@ defineExpose({ selectPatient })
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
           </template>
+          <template v-else-if="modal === 'delete-recording'"><p>确定删除录音 <b>{{ recordingToDelete?.file_name }}</b> 吗？</p><p>删除后录音对象和记录会立即清理，可重新上传正确录音。</p><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 审核并签署病历 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
@@ -1932,6 +1991,7 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'finish'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="doFinish"><Icon name="check" />完成本次接诊</button></template>
           <template v-else-if="modal === 'regenerate'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="modal=null;generateRecord()"><Icon name="refresh" />重新生成</button></template>
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
+          <template v-else-if="modal === 'delete-recording'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="actionBusy === 'delete'" @click="deleteSelectedRecording"><Icon name="trash" />确认删除</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>
         </div>
       </div>
