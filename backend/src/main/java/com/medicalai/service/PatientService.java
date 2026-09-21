@@ -38,6 +38,10 @@ public class PatientService {
                 "PATIENT_NAME_REQUIRED", "请输入患者姓名");
         if (gender.isBlank()) throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST,
                 "PATIENT_GENDER_REQUIRED", "请选择患者性别");
+        if (request.phone() == null || request.phone().isBlank()) {
+            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "PATIENT_PHONE_REQUIRED", "请输入联系方式");
+        }
         LocalDate today = LocalDate.now(clock);
         String phone = PatientFieldValidator.normalizePhone(request.phone());
         String idNo = PatientFieldValidator.normalizeIdNumber(request.idNo(), today);
