@@ -54,7 +54,60 @@ public class RecordingMapper {
     }
 
     public int delete(UUID id) {
-        return jdbc.update("DELETE FROM recording WHERE id=? AND status IN ('UPLOADED','FAILED')", id);
+        return jdbc.update("DELETE FROM recording WHERE id=? AND status IN ('UPLOADED','FAILED','DONE')", id);
+    }
+
+    /**
+     * 将已经完成的录音重新放回 ASR 队列。原始音频对象不变，只清理该录音产生的
+     * 句段和快照来源映射，新的任务完成后会重新汇总本次接诊的全部 DONE 录音。
+     */
+    public boolean requeueTranscribedRecording(UUID recordingId) {
+        int exists = jdbc.update("""
+                DELETE FROM dialogue_snapshot_source
+                WHERE utterance_id IN (SELECT id FROM asr_utterance WHERE recording_id=?)
+                """, recordingId);
+        jdbc.update("DELETE FROM asr_utterance WHERE recording_id=?", recordingId);
+        return jdbc.update("""
+                UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,
+                    asr_raw_response=NULL,asr_raw_response_hash=NULL,asr_segment_count=NULL,
+                    updated_at=medicalai_local_now()
+                WHERE id=? AND status='DONE'
+                """, recordingId) == 1;
+    }
+
+    /** 清除本次接诊所有尚未签署的转写/提取/病历草稿派生数据。 */
+    public void purgeVisitDerivedData(UUID visitId) {
+        jdbc.update("DELETE FROM dialogue_snapshot_source WHERE snapshot_id IN (SELECT id FROM dialogue_snapshot WHERE visit_id=?)", visitId);
+        jdbc.update("DELETE FROM clinical_extraction_version WHERE extraction_id IN (SELECT id FROM clinical_extraction WHERE visit_id=?)", visitId);
+        jdbc.update("DELETE FROM clinical_extraction WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM visit_transcript WHERE visit_id=?", visitId);
+        // 导出任务通过 result_ref 指向 record_export，不能在删除导出行后再回溯清理。
+        jdbc.update("DELETE FROM ai_job WHERE result_ref IN (SELECT e.id FROM record_export e JOIN medical_record r ON r.id=e.record_id WHERE r.visit_id=?)", visitId);
+        jdbc.update("DELETE FROM record_export WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id=?)", visitId);
+        jdbc.update("DELETE FROM medical_record_confirmation WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id=?)", visitId);
+        jdbc.update("DELETE FROM medical_record_version WHERE record_id IN (SELECT id FROM medical_record WHERE visit_id=?)", visitId);
+        jdbc.update("DELETE FROM medical_record WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM dialogue_snapshot WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM asr_utterance WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM recording_session WHERE visit_id=?", visitId);
+        jdbc.update("DELETE FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'", visitId);
+    }
+
+    /** 删除一段录音后，剩余音频必须重新合并转写。 */
+    public void requeueRemainingRecordings(UUID visitId) {
+        jdbc.update("""
+                UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,
+                    asr_raw_response=NULL,asr_raw_response_hash=NULL,asr_segment_count=NULL,
+                    updated_at=medicalai_local_now()
+                WHERE visit_id=?
+                """, visitId);
+    }
+
+    public boolean hasActiveAsrJob(UUID visitId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'
+                              AND status IN ('PENDING','RUNNING'))
+                """, Boolean.class, visitId));
     }
 
     /** 剥离转写任务对录音的外键引用，允许删除转写失败的录音。 */
@@ -85,9 +138,24 @@ public class RecordingMapper {
         UUID id = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,provider_route)
-                VALUES (?,?,?,?,'PENDING',?)
+                VALUES (?,?,?,?, 'PENDING',?)
                 """, id, "ASR_TRANSCRIBE", visitId, "asr:" + visitId + ":" + id, provider);
         return id;
+    }
+
+    /** 创建任务时可绑定指定录音；补充重转写不能被其它待转写录音抢占。 */
+    public UUID createAsrJob(UUID visitId, String provider, UUID recordingId) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO ai_job(id,job_type,visit_id,recording_id,idempotency_key,status,provider_route)
+                VALUES (?,?,?,?,?,'PENDING',?)
+                """, id, "ASR_TRANSCRIBE", visitId, recordingId, "asr:" + visitId + ":" + id, provider);
+        return id;
+    }
+
+    public Optional<Recording> findByVisitAndIdAndStatus(UUID visitId, UUID recordingId, String status) {
+        return jdbc.query("SELECT * FROM recording WHERE visit_id=? AND id=? AND status=?",
+                RECORDING, visitId, recordingId, status).stream().findFirst();
     }
 
     public Optional<AsrJob> claimNextAsrJob(UUID leaseToken, String provider) {

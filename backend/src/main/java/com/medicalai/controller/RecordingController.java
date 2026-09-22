@@ -62,6 +62,18 @@ public class RecordingController {
         return workflow.transcribe(visitId, current.doctor().id(), provider);
     }
 
+    @PostMapping("/visits/{visitId}/recordings/{recordingId}/retranscribe")
+    public AsrJobVO retranscribe(@PathVariable("visitId") UUID visitId,
+                                 @PathVariable("recordingId") UUID recordingId,
+                                 @RequestBody(required = false) TranscribeRequest request,
+                                 @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        String provider = request == null ? "DASHSCOPE" : request.provider();
+        if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
+            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
+        }
+        return workflow.retranscribeRecording(visitId, recordingId, current.doctor().id(), provider);
+    }
+
     public record TranscribeRequest(String provider) {}
 
     @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")

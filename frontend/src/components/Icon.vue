@@ -35,6 +35,7 @@ const icons: Record<string, string> = {
   copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
   list: '<path d="M9 5h12M9 12h12M9 19h12M3 5h1m-1 7h1m-1 7h1"/>',
   arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+  'arrow-left': '<path d="M20 12H4m6 6-6-6 6-6"/>',
   building: '<path d="M5 21V3h14v18M3 21h18M9 7h1m4 0h1m-6 4h1m4 0h1m-5 10v-5h4v5"/>',
   print: '<path d="M6 9V2h12v7M6 18H3V9h18v9h-3M6 14h12v8H6v-8Zm11-2h1"/>',
   search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',

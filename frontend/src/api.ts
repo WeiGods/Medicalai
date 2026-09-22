@@ -18,12 +18,25 @@ async function request<T>(path: string, options: RequestInit = {}, json = true):
   if (!response.ok) {
     let message = `请求失败（${response.status}）`
     try {
-      const body = await response.json()
-      message = body.message || message
+      const text = await response.text()
+      if (text.trim()) {
+        const body = JSON.parse(text) as { message?: string }
+        message = body.message || message
+      }
     } catch {}
     throw new Error(message)
   }
-  return response.status === 204 ? undefined as T : await response.json()
+  // Spring's `void` handlers may return HTTP 200 with no body (for example,
+  // deleting a recording). Reading JSON unconditionally makes that successful
+  // response fail with "Unexpected end of JSON input" after the server has
+  // already completed the mutation.
+  if (response.status === 204 || response.status === 205) return undefined as T
+  const text = await response.text()
+  if (!text.trim()) return undefined as T
+
+  const contentType = response.headers.get('content-type')?.toLowerCase() || ''
+  if (contentType.includes('json') || !contentType) return JSON.parse(text) as T
+  return text as unknown as T
 }
 
 export function clearSession() {
@@ -75,6 +88,10 @@ export const api = {
     return request<Recording>(`/api/v1/visits/${visitId}/recordings`, { method: 'POST', body }, false)
   },
   transcribe: (visitId: string, provider: AsrProvider) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe`, { method: 'POST', body: JSON.stringify({ provider }) }),
+  retranscribeRecording: (visitId: string, recordingId: string, provider: AsrProvider) => request<AsrJob>(
+    `/api/v1/visits/${visitId}/recordings/${recordingId}/retranscribe`, {
+      method: 'POST', body: JSON.stringify({ provider })
+    }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
   deleteRecording: (visitId: string, recordingId: string) => request<void>(`/api/v1/visits/${visitId}/recordings/${recordingId}`, { method: 'DELETE' }),
   transcript: (visitId: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`),

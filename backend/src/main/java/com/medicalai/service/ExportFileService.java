@@ -65,12 +65,18 @@ public class ExportFileService {
     private final ObjectMapper objectMapper;
     private final long uploadMaxBytes;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public ExportFileService(@Value("${medicalai.storage.root:./data/recordings}") String root,
                              ObjectMapper objectMapper,
                              @Value("${medicalai.export.upload-max-bytes:20971520}") long uploadMaxBytes) {
         this.root = Path.of(root).toAbsolutePath().normalize();
         this.objectMapper = objectMapper;
         this.uploadMaxBytes = uploadMaxBytes;
+    }
+
+    /** 兼容不需要前端上传大小覆盖值的旧组装代码。 */
+    public ExportFileService(String root, ObjectMapper objectMapper) {
+        this(root, objectMapper, 20L * 1024 * 1024);
     }
 
     /** Stores a browser-generated export file using the same safe local layout as backend generation. */

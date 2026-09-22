@@ -9,8 +9,14 @@ import org.springframework.stereotype.Service;
 public class LlmRoleRouter {
     private final DashScopeRoleClient dashscope;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public LlmRoleRouter(DashScopeRoleClient dashscope) {
         this.dashscope = dashscope;
+    }
+
+    /** 兼容旧调用方；角色识别已统一使用公网客户端。 */
+    public LlmRoleRouter(DashScopeRoleClient dashscope, AiServiceClient ignoredInternalClient) {
+        this(dashscope);
     }
 
     public LlmRoute roleRoute() {

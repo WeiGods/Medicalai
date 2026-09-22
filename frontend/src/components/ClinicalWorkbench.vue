@@ -22,7 +22,7 @@ const previewDocContainer = ref<HTMLElement | null>(null)
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
-type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'help' | 'activity' | 'delete-recording' | null
+type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'help' | 'activity' | 'delete-recording' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 type ManualPatientField = keyof ManualPatientForm
@@ -47,6 +47,7 @@ const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
 const recordingToDelete = ref<Recording | null>(null)
+const recordingToRetranscribe = ref<Recording | null>(null)
 const transcript = ref<Transcript | null>(null)
 const extraction = ref<ClinicalExtraction | null>(null)
 const record = ref<MedicalRecord | null>(null)
@@ -285,12 +286,26 @@ const workflowView = computed<WorkflowView>(() => {
   if (!confirmed.value) return 'record'
   return 'export'
 })
+const canReturnToAudio = computed(() => active.value && !locked.value
+  && view.value === 'transcript' && workflowView.value === 'transcript')
+const needsSupplementalTranscriptionConfirmation = computed(() => {
+  const hasPendingRecording = recordings.value.some(item => ['UPLOADED', 'FAILED'].includes(item.status))
+  const hasUnsavedTranscriptEdit = !!transcript.value
+    && transcriptDraft.value !== transcript.value.transcript
+  return !!transcript.value?.snapshot_id && hasPendingRecording
+    && (!!transcript.value.edited || hasUnsavedTranscriptEdit || !!record.value?.record_id)
+})
+const derivedDataInvalidated = computed(() => !!transcript.value?.source_dirty
+  || !!record.value?.source_dirty || extraction.value?.status === 'STALE')
 const stage = computed(() => {
   const stages: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'export']
   // 已完成接诊不可变更，但保留产物仍可查看；应高亮医生正在查看的页面，
   // 而不是始终将进度指示固定在最后一步。
   if ((completed.value || view.value === 'record') && view.value !== 'workbench' && stages.includes(view.value as WorkflowView)) {
     return stages.indexOf(view.value as WorkflowView)
+  }
+  if (active.value && view.value === 'audio' && workflowView.value === 'transcript') {
+    return stages.indexOf('audio')
   }
   return stages.indexOf(workflowView.value)
 })
@@ -518,7 +533,9 @@ function navigate(next: MainView) {
     } else {
     const sameStep = requested === current
     const reviewingSignedRecord = requested === 'record' && current === 'export' && !!record.value?.record_id
-    if (sameStep || reviewingSignedRecord) view.value = requested
+    const returningToAudio = requested === 'audio' && current === 'transcript'
+      && view.value === 'transcript' && active.value && !locked.value
+    if (sameStep || reviewingSignedRecord || returningToAudio) view.value = requested
     else {
       view.value = current
       toast('请按当前接诊流程完成本步骤后再继续。')
@@ -763,9 +780,17 @@ async function handlePickedFiles(event: Event) {
 }
 
 function requestDeleteRecording(item: Recording) {
+  if (locked.value || !active.value) return
   recordingToDelete.value = item
   modalError.value = ''
   modal.value = 'delete-recording'
+}
+
+function requestRetranscribeRecording(item: Recording) {
+  if (locked.value || !active.value || item.status !== 'DONE') return
+  recordingToRetranscribe.value = item
+  modalError.value = ''
+  modal.value = 'retranscribe-recording'
 }
 
 async function deleteSelectedRecording() {
@@ -779,9 +804,45 @@ async function deleteSelectedRecording() {
     recordingToDelete.value = null
     addLog(`删除录音：${item.file_name}`)
     await loadAll(true)
-    toast('录音已删除，可重新上传。', 'success')
+    navigate('audio')
+    toast('录音已删除；手工转写和病历草稿已失效，可重新上传并转写。', 'success')
   } catch (error) {
     modalError.value = error instanceof Error ? error.message : '删除录音失败'
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
+async function retranscribeSelectedRecording() {
+  const item = recordingToRetranscribe.value
+  if (!item || !currentVisit.value || locked.value) return
+  actionBusy.value = 'transcribe'
+  try {
+    const visitId = currentVisit.value.id
+    const job = await api.retranscribeRecording(visitId, item.id, asrProvider.value)
+    activeAsrProvider.value = job.provider_route
+    modal.value = null
+    recordingToRetranscribe.value = null
+    addLog(`重新提交${job.provider_route === 'LOCAL' ? '本地' : '公网'} ASR：${item.file_name}`)
+    await loadAll(true)
+    for (let attempt = 0; attempt < 240; attempt++) {
+      await new Promise(resolve => window.setTimeout(resolve, 3000))
+      if (currentVisit.value?.id !== visitId) return
+      const state = await api.transcribeStatus(visitId, job.job_id)
+      await loadAll(true)
+      if (state.status === 'SUCCEEDED') {
+        transcript.value = state.transcript
+        transcriptDraft.value = state.transcript?.transcript || ''
+        navigate('transcript')
+        toast('已使用新 ASR 完成转写，请重新核对文本并生成病历。')
+        return
+      }
+      if (state.status === 'FAILED') throw new Error(state.error_message || '转写失败')
+    }
+    throw new Error('转写等待超时，请稍后查看任务状态')
+  } catch (error) {
+    await loadAll(true)
+    toast(error instanceof Error ? error.message : '重新转写失败', 'error')
   } finally {
     actionBusy.value = ''
   }
@@ -791,6 +852,16 @@ watch(() => currentVisit.value?.id, () => {
   asrProvider.value = 'DASHSCOPE'
   activeAsrProvider.value = null
 })
+
+function requestTranscription() {
+  if (!currentVisit.value || locked.value) return
+  if (needsSupplementalTranscriptionConfirmation.value) {
+    modalError.value = ''
+    modal.value = 'supplemental-transcription'
+    return
+  }
+  void startTranscription()
+}
 
 async function startTranscription() {
   if (!currentVisit.value || locked.value) return
@@ -1502,7 +1573,7 @@ defineExpose({ selectPatient })
         </button>
       </nav>
 
-      <div v-if="sourceDirty && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，请重新生成病历后再确认。</span></div>
+      <div v-if="derivedDataInvalidated && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，手工转写、信息提取和病历草稿已失效，请重新核对并生成病历后再确认。</span></div>
       <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读状态，该患者由其他医生负责接诊，仅展示患者信息和接诊状态。</span></div>
       </template>
 
@@ -1536,7 +1607,7 @@ defineExpose({ selectPatient })
               <div v-else-if="closed" class="small-muted">本次接诊{{ statusText(currentVisit) }}，录音已归档。</div>
               <div v-else-if="confirmed" class="info-banner"><Icon name="lock" />病历已确认。如需追加录音，请先点击「修改病历」。</div>
               <template v-else>
-                <div class="dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files)">
+                <div class="dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files ?? null)">
                   <div class="upload-icon"><Icon name="upload" /></div>
                   <p><strong>点击上传</strong> 或拖拽录音文件到此处</p><small>支持 MP3、WAV、M4A · 时长与大小不限</small>
                   <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="handlePickedFiles" />
@@ -1553,7 +1624,8 @@ defineExpose({ selectPatient })
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name" :title="item.file_name || ''">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
-                  <button v-if="!locked && ['UPLOADED', 'FAILED'].includes(item.status)" class="btn small danger" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
+                  <button v-if="active && !locked && item.status === 'DONE'" class="btn small" :aria-label="`重新转写 ${item.file_name}`" @click="requestRetranscribeRecording(item)"><Icon name="refresh" />重新转写</button>
+                  <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
@@ -1572,7 +1644,7 @@ defineExpose({ selectPatient })
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
               </div>
               <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" style="margin-top:13px">
-                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
+                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
             </div>
           </section>
@@ -1710,7 +1782,7 @@ defineExpose({ selectPatient })
               <div class="audio-source-grid">
                 <div class="upload-method">
                   <div class="method-heading"><span class="method-icon"><Icon name="upload" /></span><div><h3>上传录音文件</h3><p>支持 MP3、WAV、M4A、WEBM</p></div></div>
-                  <div class="dropzone compact-dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files)">
+                  <div class="dropzone compact-dropzone" role="button" tabindex="0" :class="{ dragging }" @click="triggerUpload" @keydown.enter.prevent="triggerUpload" @keydown.space.prevent="triggerUpload" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop.prevent="dragging=false; uploadFiles($event.dataTransfer?.files ?? null)">
                     <div class="upload-icon"><Icon name="upload" /></div><p><strong>点击上传</strong> 或拖拽到此处</p><small>单个文件最大 200MB</small>
                     <input ref="fileInput" type="file" accept=".mp3,.wav,.m4a,.webm,audio/mpeg,audio/wav,audio/mp4,audio/webm" hidden @change="handlePickedFiles" />
                   </div>
@@ -1734,7 +1806,8 @@ defineExpose({ selectPatient })
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
-                  <button v-if="!locked && ['UPLOADED', 'FAILED'].includes(item.status)" class="btn small danger" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
+                  <button v-if="active && !locked && item.status === 'DONE'" class="btn small" :aria-label="`重新转写 ${item.file_name}`" @click="requestRetranscribeRecording(item)"><Icon name="refresh" />重新转写</button>
+                  <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <div v-if="item.status !== 'PROCESSING'" class="audio-player">
@@ -1753,7 +1826,7 @@ defineExpose({ selectPatient })
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
               </div>
               <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
-                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="startTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
+                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
             </template>
             <template v-else-if="completed">
@@ -1786,7 +1859,7 @@ defineExpose({ selectPatient })
 
       <div v-else-if="view === 'transcript'" class="full-view">
         <section class="card">
-          <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
+          <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button v-if="canReturnToAudio" class="btn small" aria-label="返回录音上传" @click="navigate('audio')"><Icon name="arrow-left" />返回录音上传</button><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
           <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
             <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
             <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
@@ -1947,7 +2020,7 @@ defineExpose({ selectPatient })
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','supplemental-transcription':'重新转写确认','retranscribe-recording':'重新转写录音','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
@@ -1975,13 +2048,15 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'cancel'"><p>确定取消 <b>{{ currentPatient?.name }} · 接诊 {{ currentVisit?.visit_no }}</b> 的本次接诊？</p><p>取消后将清空本次接诊的录音、转写、病历和导出文件；该患者之后可以重新开始接诊。</p><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已签署并导出。</p><p>结束后本次接诊将归档。</p></template>
           <template v-else-if="modal === 'regenerate'"><p>将使用当前已采用的转写文本，覆盖 <b>接诊 {{ currentVisit?.visit_no }}</b> 的当前草稿内容，并创建新版本。</p><p>医生手动编辑的内容也会被替换，请确认已保存所需内容。</p></template>
+          <template v-else-if="modal === 'supplemental-transcription'"><p>将把补传录音与已转写录音合并，重新生成本次接诊的完整转写文本。</p><p>当前手工编辑的转写文本和病历草稿将失效，需在新转写完成后重新生成并核对病历。</p></template>
+          <template v-else-if="modal === 'retranscribe-recording'"><p>将保留原录音文件，仅使用当前选择的 <b>{{ asrProvider === 'LOCAL' ? '本地' : '公网' }} ASR</b> 重新转写 <b>{{ recordingToRetranscribe?.file_name }}</b>。</p><p>当前手工编辑的转写文本、信息提取和病历草稿将失效，转写完成后必须重新核对并生成病历。</p><div class="modal-note">如需切换 ASR，请先返回录音上传页选择路由；该操作只允许在接诊进行中执行。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'confirm'">
             <p>患者 <b>{{ recordForm?.name }}</b> · 接诊 <b>{{ currentVisit?.visit_no }}</b> · 病历 <b>v{{ record?.version_no }}.0</b></p>
             <p>签署后将记录签署医生、时间及版本，并锁定当前病历；后续修改会创建新修订版并需重新签署。</p>
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
           </template>
-          <template v-else-if="modal === 'delete-recording'"><p>确定删除录音 <b>{{ recordingToDelete?.file_name }}</b> 吗？</p><p>删除后录音对象和记录会立即清理，可重新上传正确录音。</p><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
+          <template v-else-if="modal === 'delete-recording'"><p>确定删除录音 <b>{{ recordingToDelete?.file_name }}</b> 吗？</p><p>删除后录音对象和相关转写链路会物理清理，且不会写入删除审计，可重新上传正确录音。</p><p>当前手工编辑的转写文本、信息提取和病历草稿会失效，需重新转写、核对并生成病历。</p><div class="modal-note">该操作只允许在接诊进行中执行；已完成接诊不能删除录音。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 审核并签署病历 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
@@ -1990,6 +2065,8 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'cancel'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="busy" @click="doCancel">确认取消接诊</button></template>
           <template v-else-if="modal === 'finish'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="doFinish"><Icon name="check" />完成本次接诊</button></template>
           <template v-else-if="modal === 'regenerate'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="modal=null;generateRecord()"><Icon name="refresh" />重新生成</button></template>
+          <template v-else-if="modal === 'supplemental-transcription'"><button class="btn" @click="modal=null">返回检查</button><button class="btn primary" aria-label="确认重新转写" :disabled="locked" @click="modal=null;startTranscription()"><Icon name="refresh" />继续转写</button></template>
+          <template v-else-if="modal === 'retranscribe-recording'"><button class="btn" @click="modal=null">返回检查</button><button class="btn primary" aria-label="确认重新转写录音" :disabled="locked" @click="retranscribeSelectedRecording"><Icon name="refresh" />确认重新转写</button></template>
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
           <template v-else-if="modal === 'delete-recording'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="actionBusy === 'delete'" @click="deleteSelectedRecording"><Icon name="trash" />确认删除</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>

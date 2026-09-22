@@ -56,6 +56,7 @@ public class ClinicalExtractionService {
     private final long maxTurnDurationMs;
     private final int maxTurnCharacters;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
                                      MedicalRecordMapper records, ClinicalExtractionRouter clients,
                                      LlmRouteResolver routes, ObjectMapper objectMapper,
@@ -71,6 +72,15 @@ public class ClinicalExtractionService {
         this.roleReviewThreshold = roleReviewThreshold;
         this.maxTurnDurationMs = Math.max(1, maxTurnDurationMs);
         this.maxTurnCharacters = Math.max(1, maxTurnCharacters);
+    }
+
+    /** 兼容旧测试及嵌入式组装代码，使用默认提取边界。 */
+    public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
+                                     MedicalRecordMapper records, ClinicalExtractionRouter clients,
+                                     LlmRouteResolver routes, ObjectMapper objectMapper,
+                                     int roleReviewThreshold) {
+        this(extractions, recordings, records, clients, routes, objectMapper,
+                roleReviewThreshold, 120_000L, 600);
     }
 
     @Transactional(readOnly = true)

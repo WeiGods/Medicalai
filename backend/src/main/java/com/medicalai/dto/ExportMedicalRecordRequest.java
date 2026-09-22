@@ -11,4 +11,9 @@ public record ExportMedicalRecordRequest(
         @Pattern(regexp = "DOCX|PDF", message = "导出格式无效") String format,
         @NotNull(message = "导出模板版本不能为空")
         @Min(value = 1, message = "导出模板版本无效")
-        @Max(value = 999, message = "导出模板版本无效") Integer templateVersion) {}
+        @Max(value = 999, message = "导出模板版本无效") Integer templateVersion) {
+    /** 兼容旧客户端：未传模板版本时采用当前模板。 */
+    public ExportMedicalRecordRequest(String format) {
+        this(format, 6);
+    }
+}

@@ -74,14 +74,21 @@ class ClinicalWorkflowDeleteRecordingTest {
     }
 
     @Test
-    void transcribedRecordingRejectedBeforeAnyDeletion() {
+    void transcribedRecordingPurgesDerivedDataAndDeletesAudioWithoutAuditLog() {
         when(recordings.find(recordingId, doctorId)).thenReturn(Optional.of(recording("DONE")));
-        var error = assertThrows(BusinessException.class,
-                () -> workflow.deleteRecording(visitId, recordingId, doctorId));
-        assertEquals("RECORDING_TRANSCRIBED", error.code());
-        verify(recordings, never()).detachAsrJobs(any());
-        verify(recordings, never()).delete(any());
-        verifyNoInteractions(storage);
+        when(recordings.hasActiveAsrJob(visitId)).thenReturn(false);
+        when(records.hasAnyConfirmation(visitId)).thenReturn(false);
+        when(recordings.delete(recordingId)).thenReturn(1);
+
+        workflow.deleteRecording(visitId, recordingId, doctorId);
+
+        InOrder order = inOrder(recordings, storage);
+        order.verify(recordings).purgeVisitDerivedData(visitId);
+        order.verify(recordings).requeueRemainingRecordings(visitId);
+        order.verify(recordings).detachAsrJobs(recordingId);
+        order.verify(recordings).delete(recordingId);
+        order.verify(storage).delete("recordings/key.wav");
+        verifyNoInteractions(auditLogs);
     }
 
     @Test

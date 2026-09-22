@@ -42,7 +42,9 @@ public class AsrJobStore {
     @Transactional
     public Recording begin(RecordingMapper.AsrJob job, UUID token) {
         fence(job, token);
-        Recording recording = recordings.findByVisitAndStatus(job.visitId(), "UPLOADED")
+        Recording recording = (job.recordingId() == null
+                ? recordings.findByVisitAndStatus(job.visitId(), "UPLOADED")
+                : recordings.findByVisitAndIdAndStatus(job.visitId(), job.recordingId(), "UPLOADED"))
                 .orElseThrow(() -> new IllegalStateException("没有待转写录音"));
         recordings.beginAsrRecording(job.id(), recording.id(), job.providerRoute());
         recordings.updateStatus(recording.id(), "PROCESSING", null);

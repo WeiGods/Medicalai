@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class MedicalRecordMapper {
+    public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 6;
     private static final RowMapper<MedicalRecordVersion> VERSION = (rs, n) -> new MedicalRecordVersion(
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
@@ -87,7 +88,18 @@ public class MedicalRecordMapper {
 
     public boolean confirmationExists(UUID versionId) {
         return Boolean.TRUE.equals(jdbc.queryForObject(
-                "SELECT EXISTS(SELECT 1 FROM medical_record_confirmation WHERE version_id=?)", Boolean.class, versionId));
+              "SELECT EXISTS(SELECT 1 FROM medical_record_confirmation WHERE version_id=?)", Boolean.class, versionId));
+    }
+
+    /** 已签署过的接诊禁止物理删除其录音及派生链路。 */
+    public boolean hasAnyConfirmation(UUID visitId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(
+                    SELECT 1 FROM medical_record_confirmation c
+                    JOIN medical_record r ON r.id=c.record_id
+                    WHERE r.visit_id=?
+                )
+                """, Boolean.class, visitId));
     }
 
     public UUID insertConfirmation(UUID recordId, UUID versionId, UUID doctorId, String clientIp) {
@@ -140,6 +152,10 @@ public class MedicalRecordMapper {
                 recordId, versionId, confirmationId, format, templateVersion).stream().findFirst();
     }
 
+    public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format) {
+        return reusableExport(recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION);
+    }
+
     public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
                                                                String format, int templateVersion) {
         return jdbc.query("""
@@ -156,6 +172,12 @@ public class MedicalRecordMapper {
                 recordId, versionId, confirmationId, format, templateVersion).stream().findFirst();
     }
 
+    public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
+                                                               String format) {
+        return failedCurrentTemplateExport(recordId, versionId, confirmationId, format,
+                CURRENT_EXPORT_TEMPLATE_VERSION);
+    }
+
     public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
                                                String format, int templateVersion, UUID doctorId) {
         UUID id = UUID.randomUUID();
@@ -166,6 +188,12 @@ public class MedicalRecordMapper {
                 """, id, recordId, versionId, confirmationId, format, templateVersion, doctorId);
         if (inserted == 0) return Optional.empty();
         return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst();
+    }
+
+    public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
+                                               String format, UUID doctorId) {
+        return insertExport(recordId, versionNo, confirmationId, versionId, format,
+                CURRENT_EXPORT_TEMPLATE_VERSION, doctorId);
     }
 
     public UUID createExportJob(UUID visitId, UUID exportId, String format) {

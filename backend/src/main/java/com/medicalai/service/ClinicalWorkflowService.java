@@ -152,8 +152,22 @@ public class ClinicalWorkflowService {
         if ("PROCESSING".equals(recording.status())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "录音正在转写，暂不能删除");
         }
+        // PENDING 任务还没有把 recording_id 写回 ai_job，不能仅靠录音状态判断；
+        // 整个接诊有任务或实时录音会话时都拒绝删除，避免 worker 继续消费已删除的行。
+        if (recordings.hasActiveAsrJob(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊有转写任务正在执行，暂不能删除");
+        }
+        if (visits.hasOpenSession(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊仍有录音操作进行中，暂不能删除");
+        }
         if ("DONE".equals(recording.status())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_TRANSCRIBED", "已转写录音不能删除");
+            if (records.hasAnyConfirmation(visit.id()) || isConfirmed(visit.id())) {
+                throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，已完成接诊不允许删除录音");
+            }
+            // 已完成录音的句段、快照、提取和未签署病历草稿均属于该接诊的派生链路，
+            // 先在同一事务内清除，再让剩余录音重新进入队列。该物理删除不写审计日志。
+            recordings.purgeVisitDerivedData(visit.id());
+            recordings.requeueRemainingRecordings(visit.id());
         }
         // 先剥离 ASR 任务外键再删库行；转写失败的录音在 ai_job 中仍持有 recording_id 引用。
         recordings.detachAsrJobs(recording.id());
@@ -166,7 +180,7 @@ public class ClinicalWorkflowService {
                     "录音存在关联的转写会话数据，暂不能删除", e);
         }
         invalidateClinicalExtraction(visit.id());
-        if (auditLogs != null) {
+        if (!"DONE".equals(recording.status()) && auditLogs != null) {
             auditLogs.recordRecordingDeleted(doctorId, visit.id(), recording.id(), recording.fileName());
         }
         Runnable deleteObject = () -> {
@@ -209,6 +223,36 @@ public class ClinicalWorkflowService {
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
         // 步骤 4：创建 PENDING ASR 任务；定时工作线程会按任务路由异步领取并处理。
         UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider));
+        return asrJob(visitId, doctorId, jobId);
+    }
+
+    /** 在不重新上传原始文件的情况下，使用另一条 ASR 路由重新处理指定录音。 */
+    @Transactional
+    public AsrJobVO retranscribeRecording(UUID visitId, UUID recordingId, UUID doctorId, String provider) {
+        Visit visit = owned(visitId, doctorId, true);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        Recording recording = recordings.find(recordingId, doctorId)
+                .filter(item -> visit.id().equals(item.visitId()))
+                .orElseThrow(BusinessException::notFound);
+        if (!"DONE".equals(recording.status())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_NOT_TRANSCRIBED", "只能重新转写已完成的录音");
+        }
+        if (recordings.hasActiveAsrJob(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊已有转写任务正在执行");
+        }
+        if (visits.hasOpenSession(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊仍有录音操作进行中，暂不能重新转写");
+        }
+        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
+        }
+        storage.assertAsrSubmissionReady();
+        if (!recordings.requeueTranscribedRecording(recording.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_STATE_CHANGED", "录音状态已变化，请刷新后重试");
+        }
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider), recording.id());
+        invalidateClinicalExtraction(visit.id());
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -783,8 +827,20 @@ public class ClinicalWorkflowService {
     }
 
     private String nextRecordingNo(UUID visitId) {
-        int no = recordings.count(visitId) + 1;
-        return String.format("REC-%03d", no);
+        // 录音允许物理删除，不能再用 count+1，否则删除 REC-001 后补传会复用已有 REC-002。
+        int max = recordings.list(visitId).stream()
+                .map(Recording::recordingNo)
+                .filter(Objects::nonNull)
+                .mapToInt(value -> {
+                    try {
+                        String digits = value.startsWith("REC-") ? value.substring(4) : value;
+                        return Integer.parseInt(digits);
+                    } catch (NumberFormatException ignored) {
+                        return 0;
+                    }
+                })
+                .max().orElse(0);
+        return String.format("REC-%03d", max + 1);
     }
 
     private String queueProvider(String provider) {
