@@ -6,6 +6,7 @@ import { api } from './api'
 import { showMessage, type MessageDetail, type MessageType } from './message'
 import type { DemoRole, Doctor } from './types'
 
+const departmentHeadName = '演示科室长'
 const doctor = ref<Doctor | null>(null)
 const name = ref('')
 const role = ref<DemoRole>('DOCTOR')
@@ -27,14 +28,16 @@ function handleMessage(event: Event) {
 }
 
 async function login() {
-  if (!name.value.trim()) {
+  if (busy.value) return
+  const loginName = role.value === 'DEPARTMENT_HEAD' ? departmentHeadName : name.value
+  if (!loginName.trim()) {
     showMessage('请输入医生名称', 'error')
     return
   }
 
   busy.value = true
   try {
-    const result = await api.login(name.value, role.value)
+    const result = await api.login(loginName, role.value)
     doctor.value = result.doctor
     showMessage(`欢迎，${result.doctor.display_name}`, 'success')
   }
@@ -44,6 +47,11 @@ async function login() {
   finally {
     busy.value = false
   }
+}
+
+function selectRole(selectedRole: DemoRole) {
+  if (busy.value) return
+  role.value = selectedRole
 }
 
 async function logout() {
@@ -56,11 +64,13 @@ async function logout() {
   }
   finally {
     doctor.value = null
+    role.value = 'DOCTOR'
   }
 }
 
 function sessionExpired() {
   doctor.value = null
+  role.value = 'DOCTOR'
   showMessage('登录状态已失效，请重新登录', 'error')
 }
 
@@ -95,16 +105,17 @@ onUnmounted(() => {
     <section class="login-card">
       <span class="eyebrow">医生工作台 · 演示登录</span>
       <h2>欢迎回来</h2>
-      <p class="muted">输入医生名称进入接诊工作台</p>
+      <p class="muted">{{ role === 'DOCTOR' ? '输入医生名称进入接诊工作台' : '使用默认演示身份进入科室长工作台' }}</p>
       <div class="login-role" role="group" aria-label="选择模拟登录身份">
-        <button type="button" :class="{ active: role === 'DOCTOR' }" @click="role = 'DOCTOR'">医生</button>
-        <button type="button" :class="{ active: role === 'DEPARTMENT_HEAD' }" @click="role = 'DEPARTMENT_HEAD'">科室长</button>
+        <button type="button" :class="{ active: role === 'DOCTOR' }" :disabled="busy" @click="selectRole('DOCTOR')">医生</button>
+        <button type="button" :class="{ active: role === 'DEPARTMENT_HEAD' }" :disabled="busy" @click="selectRole('DEPARTMENT_HEAD')">科室长</button>
       </div>
-      <input v-model="name" autofocus placeholder="请输入医生名称" @keyup.enter="login">
+      <input v-if="role === 'DOCTOR'" v-model="name" autofocus placeholder="请输入医生名称" @keyup.enter="login()">
+      <input v-else :value="departmentHeadName" readonly aria-label="科室长名称">
       <div class="quick">
         <!-- <button v-for="n in ['李明', '王医生', '张医生']" :key="n" @click="name = n">{{ n }}</button> -->
       </div>
-      <button class="primary" :disabled="busy" @click="login">{{ busy ? '正在登录…' : '进入工作台' }}</button>
+      <button class="primary" :disabled="busy" @click="login()">{{ busy ? '正在登录…' : '进入工作台' }}</button>
       <p class="notice">当前为演示登录，后续可切换 OA 单点登录。</p>
     </section>
   </main>

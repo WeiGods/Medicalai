@@ -73,12 +73,13 @@ function record(draft = false, confirmed = false): MedicalRecord {
 }
 
 function configure(options: {
+  patients?: Patient[]
   recordings?: Recording[]
   transcript?: Transcript
   record?: MedicalRecord
   visit?: Visit
 } = {}) {
-  vi.mocked(api.patients).mockResolvedValue([patient])
+  vi.mocked(api.patients).mockResolvedValue(options.patients || [patient])
   vi.mocked(api.visits).mockResolvedValue([options.visit || activeVisit])
   vi.mocked(api.recordings).mockResolvedValue(options.recordings || [doneRecording])
   vi.mocked(api.transcript).mockResolvedValue(options.transcript || transcript())
@@ -100,6 +101,26 @@ async function mountWorkbench(options?: Parameters<typeof configure>[0]) {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.stubGlobal('scrollTo', vi.fn())
+})
+
+describe('patient avatar colors', () => {
+  it('randomly assigns distinct colors and keeps each patient color consistent across views', async () => {
+    const patients = [
+      patient,
+      { ...patient, id: 'patient-2', patient_no: 'M-SECOND', name: '李四' },
+      { ...patient, id: 'patient-3', patient_no: 'M-THIRD', name: '王五' }
+    ]
+    const wrapper = await mountWorkbench({ patients })
+    const tiles = wrapper.findAll('.queue-cards .patient-tile')
+    const coloredClasses = ['lilac', 'blue', 'rose', 'amber', 'cyan']
+    const tone = (element: ReturnType<typeof wrapper.get>) =>
+      element.classes().find(className => coloredClasses.includes(className)) || 'default'
+
+    expect(tiles).toHaveLength(3)
+    expect(new Set(tiles.map(tile => tone(tile.get('.avatar')))).size).toBe(3)
+    expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.recent .avatar')))
+    expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.patient-summary .avatar')))
+  })
 })
 
 describe('supplemental recording workflow', () => {

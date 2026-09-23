@@ -33,6 +33,7 @@ const PATIENT_ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
 const PATIENT_ID_CHECK_CODES = '10X98765432'
 const MAX_RECORDING_BYTES = 200 * 1024 * 1024
 const RECORDING_EXTENSION_PATTERN = /\.(wav|mp3|m4a|webm)$/i
+const AVATAR_TONES = ['', 'lilac', 'blue', 'rose', 'amber', 'cyan']
 
 const patients = ref<Patient[]>([])
 const visits = ref<Visit[]>([])
@@ -80,6 +81,9 @@ const modalDialog = ref<HTMLElement | null>(null)
 const activity = ref<{ time: string; text: string }[]>([])
 const recordingElapsedMs = ref(0)
 const roleReviewElements = new Map<string, HTMLElement>()
+const avatarToneByPatientId = new Map<string, string>()
+let availableAvatarTones: string[] = []
+let lastAvatarTone = ''
 let recordingTimer: number | undefined
 let recordingStartedAt = 0
 let audioPlayer: HTMLAudioElement | null = null
@@ -399,7 +403,28 @@ const formatRecordingDuration = (ms: number) => `${String(Math.floor(ms / 60000)
 const formatTime = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 const visitDate = computed(() => currentVisit.value ? formatDateTime(currentVisit.value.created_at).slice(0, 10) : formatDateTime(new Date()).slice(0, 10))
 const isPlaying = (item: Recording) => playingId.value === item.id
-const avatarClass = (patient: Patient | null) => patient?.patient_no === '002' ? 'lilac' : patient?.patient_no === '003' ? 'blue' : ''
+function nextAvatarTone() {
+  if (!availableAvatarTones.length) {
+    availableAvatarTones = [...AVATAR_TONES]
+    for (let index = availableAvatarTones.length - 1; index > 0; index -= 1) {
+      const randomIndex = Math.floor(Math.random() * (index + 1))
+      ;[availableAvatarTones[index], availableAvatarTones[randomIndex]] = [availableAvatarTones[randomIndex], availableAvatarTones[index]]
+    }
+    if (availableAvatarTones.length > 1 && availableAvatarTones[availableAvatarTones.length - 1] === lastAvatarTone) {
+      const lastIndex = availableAvatarTones.length - 1
+      ;[availableAvatarTones[lastIndex], availableAvatarTones[lastIndex - 1]] = [availableAvatarTones[lastIndex - 1], availableAvatarTones[lastIndex]]
+    }
+  }
+  const tone = availableAvatarTones.pop() || ''
+  lastAvatarTone = tone
+  return tone
+}
+
+const avatarClass = (patient: Patient | null) => {
+  if (!patient) return ''
+  if (!avatarToneByPatientId.has(patient.id)) avatarToneByPatientId.set(patient.id, nextAvatarTone())
+  return avatarToneByPatientId.get(patient.id) || ''
+}
 const highlightText = (text: string) => [{ text, mark: false }]
 const recordingStateLabel = computed(() => ({ idle: '准备录音', recording: '正在录音', paused: '已暂停' })[recordingState.value])
 const recordingTimeLabel = computed(() => formatRecordingDuration(recordingElapsedMs.value))

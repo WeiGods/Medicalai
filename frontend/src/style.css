@@ -305,3 +305,7 @@ body.modal-open{overflow:hidden}
 @media(max-width:600px){
   .visit-tile{min-height:88px}
 }
+
+.avatar.rose{background:#faeceb;color:#a96060}
+.avatar.amber{background:#fbf1df;color:#aa7a36}
+.avatar.cyan{background:#e7f3f5;color:#4d8490}
