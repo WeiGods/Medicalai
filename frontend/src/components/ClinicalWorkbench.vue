@@ -3,24 +3,24 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../api'
 import '../routeSelection.css'
 import Icon from './Icon.vue'
+import TemplateManagement from './TemplateManagement.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
-import { TEMPLATES, DEFAULT_TEMPLATE_VERSION, createTemplateDocxBlob, createTemplatePdfBlob, type RecordExportData } from '../exportTemplate'
-import { renderAsync } from 'docx-preview'
-import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
+import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, ExportTemplate, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
-const selectedTemplateVersion = ref(DEFAULT_TEMPLATE_VERSION)
-const selectedTemplate = computed(() => TEMPLATES.find(t => t.version === selectedTemplateVersion.value) ?? TEMPLATES[0])
+const exportTemplates = ref<ExportTemplate[]>([])
+const selectedTemplateRevisionId = ref('')
+const selectedTemplate = computed(() => exportTemplates.value.find(template => template.current_revision_id === selectedTemplateRevisionId.value)
+  || exportTemplates.value.find(template => template.default_template) || exportTemplates.value[0] || null)
 const previewOpen = ref(false)
 const previewUrl = ref('')
 const previewBusy = ref(false)
 const previewFormat = ref<'PDF' | 'DOCX'>('PDF')
-const previewDocContainer = ref<HTMLElement | null>(null)
 
-type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit'
+type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit' | 'templates'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
 type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'help' | 'activity' | 'delete-recording' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
@@ -37,6 +37,7 @@ const RECORDING_EXTENSION_PATTERN = /\.(wav|mp3|m4a|webm)$/i
 const patients = ref<Patient[]>([])
 const visits = ref<Visit[]>([])
 const selectedPatientId = ref('')
+const selectedVisitId = ref('')
 const view = ref<MainView>('workbench')
 const queueSearch = ref('')
 const patientSearchResults = ref<Patient[] | null>(null)
@@ -115,7 +116,8 @@ const titles: Record<MainView, [string, string]> = {
   transcript: ['转写结果', '回看医患对话，核对并编辑本次接诊采用的转写文本。'],
   record: ['病历审核与签署', '核对并完善病历草稿，确认后锁定当前版本。'],
   export: ['病历导出', '将已确认的病历由后端生成 Word 或 PDF 文件。'],
-  audit: ['日志审计', '查看全系统医生的关键操作记录。']
+  audit: ['日志审计', '查看全系统医生的关键操作记录。'],
+  templates: ['模板管理', '维护全院通用病历导出模板及其版本。']
 }
 
 function dateInputValue(value: Date) {
@@ -166,6 +168,8 @@ function patientVisit(patientId: string): Visit | null {
   return list[0] || null
 }
 
+const departmentHead = computed(() => props.doctor.role === 'DEPARTMENT_HEAD')
+
 function patientStatus(patientId: string) {
   return patientVisit(patientId)?.status || 'UNSCHEDULED'
 }
@@ -197,6 +201,7 @@ function recentVisitStatus(visit: Visit) {
 function auditActionLabel(action: string) {
   return ({
     LOGIN: '登录系统',
+    VISIT_DETAIL_VIEWED: '查看接诊详情',
     RECORDING_UPLOADED: '上传录音',
     RECORDING_DELETED: '删除录音',
     MEDICAL_RECORD_CONFIRMED: '确认病历',
@@ -225,16 +230,28 @@ function patientVisitNo(patientId: string) {
 
 const currentPatient = computed(() => patients.value.find(p => p.id === selectedPatientId.value) || null)
 const canViewAudit = computed(() => ['DEPARTMENT_HEAD', 'ADMIN'].includes(props.doctor.role))
+const canManageTemplates = computed(() => props.doctor.role === 'DEPARTMENT_HEAD')
 const showLegacyWorkspace = false
 const readOnlyCurrentPatient = computed(() => {
-  if (!currentPatient.value || !canViewAudit.value) return false
-  return currentPatient.value.created_by !== props.doctor.id
+  return departmentHead.value && !!currentVisit.value
 })
 const canCreateVisit = (patientId: string) => !patientVisit(patientId)
 const currentVisit = computed(() => {
+  if (departmentHead.value && selectedVisitId.value) {
+    return visits.value.find(visit => visit.id === selectedVisitId.value) || null
+  }
   return patientVisit(selectedPatientId.value)
 })
 const queuePatients = computed(() => patientSearchResults.value ?? patients.value)
+const queueVisitRows = computed(() => {
+  const allowedPatients = new Set((patientSearchResults.value ?? patients.value).map(patient => patient.id))
+  const patientById = new Map(patients.value.map(patient => [patient.id, patient]))
+  return visits.value
+    .filter(visit => visit.status !== 'CANCELLED' && allowedPatients.has(visit.patient_id))
+    .map(visit => ({ visit, patient: patientById.get(visit.patient_id) }))
+    .filter((item): item is { visit: Visit; patient: Patient } => !!item.patient)
+    .sort((a, b) => String(b.visit.last_activity_at || b.visit.created_at).localeCompare(String(a.visit.last_activity_at || a.visit.created_at)))
+})
 const recentVisits = computed(() => {
   const patientById = new Map(patients.value.map(patient => [patient.id, patient]))
   const seenPatientIds = new Set<string>()
@@ -267,7 +284,7 @@ const confirmed = computed(() => !!record.value?.confirmed)
 const exported = computed(() => !!record.value && exports.value.some(item =>
   item.version_no === record.value?.version_no && item.status === 'SUCCEEDED'))
 const sourceDirty = computed(() => !!record.value?.source_dirty)
-const locked = computed(() => closed.value || confirmed.value || !!actionBusy.value)
+const locked = computed(() => readOnlyCurrentPatient.value || closed.value || confirmed.value || !!actionBusy.value)
 const llmRouting = computed(() => extraction.value || transcript.value)
 const routeSelectionRequired = computed(() => false)
 const sourceRouteLabel = computed(() => {
@@ -316,6 +333,10 @@ const waitingCount = computed(() => patients.value.filter(patient => {
 }).length)
 const openVisitCount = computed(() => patients.value.filter(patient => ['ACTIVE', 'WAITING'].includes(patientVisit(patient.id)?.status || '')).length)
 const completedCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'COMPLETED').length)
+const queueCount = computed(() => departmentHead.value ? queueVisitRows.value.length : patients.value.length)
+const queueWaitingCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'WAITING').length : waitingCount.value)
+const queueActiveCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'ACTIVE').length : activeCount.value)
+const queueCompletedCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'COMPLETED').length : completedCount.value)
 const missingFields = computed(() => {
   const content = recordForm.value
   if (!content) return []
@@ -395,15 +416,21 @@ async function refreshCore(keepSelection = true) {
   const [patientList, visitList] = await Promise.all([api.patients(), api.visits()])
   patients.value = patientList
   visits.value = visitList
-  if (!keepSelection || !patientList.some(p => p.id === selectedPatientId.value)) {
+  if (departmentHead.value) {
+    const selectedVisit = keepSelection ? visitList.find(visit => visit.id === selectedVisitId.value) : null
+    const nextVisit = selectedVisit || visitList.find(visit => visit.status !== 'CANCELLED') || visitList[0]
+    selectedVisitId.value = nextVisit?.id || ''
+    selectedPatientId.value = nextVisit?.patient_id || ''
+  } else if (!keepSelection || !patientList.some(p => p.id === selectedPatientId.value)) {
     selectedPatientId.value = patientList[0]?.id || ''
+    selectedVisitId.value = patientVisit(selectedPatientId.value)?.id || ''
   }
 }
 
 async function refreshVisitState() {
   const visit = currentVisit.value
   const revision = ++visitStateRevision
-  if (!visit || readOnlyCurrentPatient.value) {
+  if (!visit) {
     recordings.value = []
     transcript.value = null
     extraction.value = null
@@ -497,17 +524,40 @@ async function selectPatient(patientId: string) {
   stopAudio()
   visitStateRevision += 1
   selectedPatientId.value = patientId
+  if (departmentHead.value) {
+    if (!visits.value.some(visit => visit.id === selectedVisitId.value && visit.patient_id === patientId)) {
+      selectedVisitId.value = visits.value.find(visit => visit.patient_id === patientId)?.id || ''
+    }
+  } else {
+    selectedVisitId.value = patientVisit(patientId)?.id || ''
+  }
   view.value = 'workbench'
   transcriptTab.value = 'dialogue'
+  if (departmentHead.value && selectedVisitId.value && typeof api.visit === 'function') {
+    try { await api.visit(selectedVisitId.value) } catch (error) {
+      toast(error instanceof Error ? error.message : '接诊详情加载失败', 'error')
+    }
+  }
   await loadAll(true)
   navigate(workflowView.value)
 }
 
+async function selectVisit(visitId: string, patientId: string) {
+  if (busy.value || actionBusy.value) return
+  selectedVisitId.value = visitId
+  selectedPatientId.value = patientId
+  await selectPatient(patientId)
+}
+
 function navigate(next: MainView) {
   const workflowViews: WorkflowView[] = ['workbench', 'audio', 'transcript', 'record', 'export']
-  if (readOnlyCurrentPatient.value && workflowViews.includes(next as WorkflowView) && next !== 'workbench') {
-    view.value = 'workbench'
-    toast('当前为只读状态，该患者由其他医生负责接诊。', 'info')
+  if (next === 'templates') {
+    if (!canManageTemplates.value) {
+      toast('仅科室长可以维护导出模板。', 'error')
+      return
+    }
+    view.value = 'templates'
+    window.scrollTo({ top: 0, behavior: 'smooth' })
     return
   }
   if (next === 'audit') {
@@ -524,6 +574,11 @@ function navigate(next: MainView) {
     view.value = next
   } else {
     const requested = next as WorkflowView
+    if (readOnlyCurrentPatient.value) {
+      view.value = requested
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+      return
+    }
     const current = workflowView.value
     if (completed.value && requested !== 'workbench') {
       view.value = requested
@@ -784,6 +839,19 @@ function requestDeleteRecording(item: Recording) {
   recordingToDelete.value = item
   modalError.value = ''
   modal.value = 'delete-recording'
+}
+
+async function loadExportTemplates() {
+  if (typeof api.exportTemplates !== 'function') return
+  try {
+    exportTemplates.value = await api.exportTemplates()
+    const preferred = exportTemplates.value.find(template => template.default_template) || exportTemplates.value[0]
+    if (preferred && !exportTemplates.value.some(template => template.current_revision_id === selectedTemplateRevisionId.value)) {
+      selectedTemplateRevisionId.value = preferred.current_revision_id
+    }
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '导出模板加载失败', 'error')
+  }
 }
 
 function requestRetranscribeRecording(item: Recording) {
@@ -1227,24 +1295,31 @@ async function doConfirm() {
 }
 
 async function recordExportLog(format: 'DOCX' | 'PDF') {
-  if (!currentVisit.value) return
-  exports.value = await api.recordExport(currentVisit.value.id, format, selectedTemplateVersion.value)
+  if (!currentVisit.value || !selectedTemplate.value) throw new Error('当前没有可用的导出模板')
+  exports.value = await api.recordExport(currentVisit.value.id, format, selectedTemplate.value.current_revision_id)
   addLog(format === 'DOCX' ? '发起 Word 导出' : '发起 PDF 导出')
 }
 
 async function waitForExport(format: 'DOCX' | 'PDF'): Promise<RecordExport | null> {
   if (!currentVisit.value || !record.value) return null
   const versionNo = record.value.version_no
-  const templateVersion = selectedTemplateVersion.value
+  const templateRevisionId = selectedTemplate.value?.current_revision_id
+  if (!templateRevisionId) throw new Error('当前没有可用的导出模板')
   let item = exports.value.find(e => e.format === format && e.version_no === versionNo
-    && e.template_version === templateVersion)
-  // 复用当前模板记录；前端生成后上传归档，不再等待后端异步排版。
+    && e.template_revision_id === templateRevisionId)
   if (!item || item.status === 'FAILED') {
     await recordExportLog(format)
     item = exports.value.find(e => e.format === format && e.version_no === versionNo
-      && e.template_version === templateVersion)
+      && e.template_revision_id === templateRevisionId)
   }
-  return item ?? null
+  if (!item) return null
+  for (let attempt = 0; attempt < 45 && ['PENDING', 'RUNNING'].includes(item.status); attempt++) {
+    await new Promise(resolve => window.setTimeout(resolve, 1000))
+    if (!currentVisit.value) return null
+    exports.value = await api.exports(currentVisit.value.id)
+    item = exports.value.find(e => e.id === item?.id) || item
+  }
+  return item
 }
 
 function exportFileBaseName(exportedAt: string) {
@@ -1270,25 +1345,10 @@ async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
   try {
     const item = await waitForExport(format)
     if (!item || !currentVisit.value) throw new Error(`${label} 导出任务未创建`)
-    if (item.status === 'SUCCEEDED') {
-      const blob = await api.exportBlob(item.id)
-      downloadBlob(blob, format, exportFileBaseName(item.created_at))
-      toast(`${label} 病历已下载。`)
-      return
-    }
-    const data: RecordExportData = {
-      visitNo: currentVisit.value.visit_no,
-      versionNo: record.value!.version_no,
-      confirmedAt: record.value!.confirmed_at,
-      content: record.value!.content
-    }
-    const blob = format === 'DOCX'
-      ? await createTemplateDocxBlob(selectedTemplateVersion.value, data)
-      : await createTemplatePdfBlob(selectedTemplateVersion.value, data)
-    const fileName = exportFileBaseName(item.created_at)
-    exports.value = await api.uploadExportFile(currentVisit.value.id, item.id, format, blob, fileName)
-    downloadBlob(blob, format, fileName)
-    toast(`${label} 病历已生成并下载。`)
+    if (item.status !== 'SUCCEEDED') throw new Error(item.error_message || `${label} 正在由服务器生成，请稍后重试下载`)
+    const blob = await api.exportBlob(item.id)
+    downloadBlob(blob, format, exportFileBaseName(item.created_at))
+    toast(`${label} 病历已下载。`)
   } catch (error) { toast(error instanceof Error ? error.message : `${label} 导出失败`, 'error') }
   finally { busy.value = false }
 }
@@ -1299,34 +1359,18 @@ async function exportPdf() {
   await exportRecord('PDF', 'PDF')
 }
 
-async function showPreview(format: 'PDF' | 'DOCX') {
-  if (!record.value?.content || !currentVisit.value) return
+async function showPreview() {
+  if (!currentVisit.value || !selectedTemplate.value) return
   previewBusy.value = true
   try {
-    const data: RecordExportData = {
-      visitNo: currentVisit.value.visit_no,
-      versionNo: record.value.version_no,
-      confirmedAt: record.value.confirmed_at,
-      content: record.value.content
-    }
-    const blob = format === 'PDF'
-      ? await createTemplatePdfBlob(selectedTemplateVersion.value, data)
-      : await createTemplateDocxBlob(selectedTemplateVersion.value, data)
-    previewFormat.value = format
+    const blob = await api.exportPreviewBlob(currentVisit.value.id, 'PDF', selectedTemplate.value.current_revision_id)
+    previewFormat.value = 'PDF'
     if (previewUrl.value) {
       URL.revokeObjectURL(previewUrl.value)
       previewUrl.value = ''
     }
     previewOpen.value = true
-    if (format === 'PDF') {
-      previewUrl.value = URL.createObjectURL(blob)
-    } else {
-      await nextTick()
-      if (previewDocContainer.value) {
-        previewDocContainer.value.innerHTML = ''
-        await renderAsync(blob, previewDocContainer.value, undefined, { inWrapper: false })
-      }
-    }
+    previewUrl.value = URL.createObjectURL(blob)
   } catch (error) { toast(error instanceof Error ? error.message : '预览生成失败', 'error') }
   finally { previewBusy.value = false }
 }
@@ -1432,7 +1476,12 @@ function updateField(key: string, event: Event) {
 }
 
 onMounted(async () => {
-  await loadAll(false)
+  await Promise.all([loadAll(false), loadExportTemplates()])
+  if (departmentHead.value && selectedVisitId.value && typeof api.visit === 'function') {
+    try { await api.visit(selectedVisitId.value) } catch (error) {
+      toast(error instanceof Error ? error.message : '接诊详情加载失败', 'error')
+    }
+  }
   navigate(workflowView.value)
 })
 
@@ -1458,6 +1507,7 @@ defineExpose({ selectPatient })
         <button class="nav-item" :class="{ active: view === 'workbench' }" @click="showWorkflowStep()">
           <Icon name="users" /><span>患者 / 接诊</span><span class="nav-count">{{ String(openVisitCount).padStart(2, '0') }}</span>
         </button>
+        <button v-if="canManageTemplates" class="nav-item" :class="{ active: view === 'templates' }" @click="navigate('templates')"><Icon name="gear" />模板管理</button>
         <button v-if="canViewAudit" class="nav-item" :class="{ active: view === 'audit' }" @click="navigate('audit')"><Icon name="list" />日志审计</button>
       </nav>
       <div class="recent">
@@ -1501,19 +1551,32 @@ defineExpose({ selectPatient })
         <div class="heading-actions" aria-hidden="true"></div>
       </div>
 
-      <template v-if="view !== 'audit'">
+      <template v-if="view !== 'audit' && view !== 'templates'">
       <section class="card queue">
         <div class="queue-head">
-          <div class="queue-title"><Icon name="users" />今日接诊 <span class="badge">{{ patients.length }} 位</span>
-            <div class="queue-stats"><span>待接诊 <b>{{ String(waitingCount).padStart(2, '0') }}</b></span><i></i><span>接诊中 <b>{{ String(activeCount).padStart(2, '0') }}</b></span><i></i><span>已完成 <b>{{ String(completedCount).padStart(2, '0') }}</b></span></div>
+          <div class="queue-title"><Icon name="users" />{{ departmentHead ? '全院接诊' : '今日接诊' }} <span class="badge">{{ queueCount }} 条</span>
+            <div class="queue-stats"><span>待接诊 <b>{{ String(queueWaitingCount).padStart(2, '0') }}</b></span><i></i><span>接诊中 <b>{{ String(queueActiveCount).padStart(2, '0') }}</b></span><i></i><span>已完成 <b>{{ String(queueCompletedCount).padStart(2, '0') }}</b></span></div>
           </div>
           <div class="queue-search-wrap">
             <input v-model="queueSearch" class="queue-search" placeholder="搜索姓名或编号" @keydown.enter.prevent="searchPatients" />
             <button type="button" class="btn small" :disabled="searchBusy" @click="searchPatients">{{ searchBusy ? '搜索中' : '搜索' }}</button>
           </div>
-          <button class="queue-add" :disabled="busy" @click="openNewPatientModal"><Icon name="plus" />新增患者</button>
+          <button v-if="!departmentHead" class="queue-add" :disabled="busy" @click="openNewPatientModal"><Icon name="plus" />新增患者</button>
         </div>
         <div class="queue-cards">
+          <template v-if="departmentHead">
+          <button v-for="row in queueVisitRows" :key="row.visit.id" class="patient-tile visit-tile" :class="{ selected: row.visit.id === selectedVisitId }" @click="selectVisit(row.visit.id, row.patient.id)">
+            <span class="avatar" :class="avatarClass(row.patient)">{{ row.patient.name[0] }}</span>
+            <span class="patient-tile-content">
+              <span class="patient-name"><b>{{ row.patient.name }}</b><span>{{ row.patient.gender }} · {{ row.patient.age ?? '—' }} 岁</span></span>
+              <span class="patient-meta" :title="`接诊编号 ${row.visit.visit_no || '—'}`">接诊编号 <strong>{{ row.visit.visit_no || '—' }}</strong></span>
+              <span class="patient-owner" :title="`接诊医生：${row.visit.doctor_name || '—'}`">接诊医生：{{ row.visit.doctor_name || '—' }}</span>
+              <span class="patient-owner" :title="`最近更新：${formatDateTime(row.visit.last_activity_at || row.visit.created_at)}`">最近更新：{{ formatDateTime(row.visit.last_activity_at || row.visit.created_at) }}</span>
+            </span>
+            <span class="tile-status" :class="statusClass(row.visit)">{{ statusText(row.visit) }}</span>
+          </button>
+          </template>
+          <template v-else>
           <button v-for="patient in queuePatients" :key="patient.id" class="patient-tile" :class="{ selected: patient.id === selectedPatientId }" @click="selectPatient(patient.id)">
             <span class="avatar" :class="avatarClass(patient)">{{ patient.name[0] }}</span>
             <span>
@@ -1529,9 +1592,10 @@ defineExpose({ selectPatient })
               {{ statusText(patientVisit(patient.id)) }}
             </span>
           </button>
-          <div v-if="!queuePatients.length" class="small-muted">暂无匹配患者</div>
+          </template>
+          <div v-if="(departmentHead ? !queueVisitRows.length : !queuePatients.length)" class="small-muted">暂无匹配接诊记录</div>
         </div>
-        <div class="queue-load-more">{{ queuePatients.length > 6 ? '向下滚动查看更多' : '' }}</div>
+        <div class="queue-load-more">{{ (departmentHead ? queueVisitRows.length : queuePatients.length) > 6 ? '向下滚动查看更多' : '' }}</div>
       </section>
 
       <section class="patient-summary">
@@ -1551,7 +1615,7 @@ defineExpose({ selectPatient })
           </div>
         </div>
         <div v-if="readOnlyCurrentPatient" class="patient-actions read-only-actions">
-          <span class="read-only-note"><Icon name="lock" />当前为只读状态，该患者由其他医生负责接诊</span>
+           <span class="read-only-note"><Icon name="lock" />科室长只读查看接诊详情，接诊医生：{{ currentVisit?.doctor_name || '—' }}</span>
         </div>
         <div v-else class="patient-actions">
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
@@ -1563,7 +1627,7 @@ defineExpose({ selectPatient })
         </div>
       </section>
 
-      <nav v-if="!readOnlyCurrentPatient" class="steps" aria-label="接诊流程">
+      <nav class="steps" aria-label="接诊流程">
         <button v-for="(label, index) in ['患者 / 接诊', '问诊音频', '转写结果', '病历审核与签署', '病历导出']" :key="label"
                 class="step" :class="{ done: index < stage || exported, current: index === stage }"
                 :disabled="completed && index === 0"
@@ -1574,17 +1638,20 @@ defineExpose({ selectPatient })
       </nav>
 
       <div v-if="derivedDataInvalidated && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，手工转写、信息提取和病历草稿已失效，请重新核对并生成病历后再确认。</span></div>
-      <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读状态，该患者由其他医生负责接诊，仅展示患者信息和接诊状态。</span></div>
+      <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读查看，接诊医生：{{ currentVisit?.doctor_name || '—' }}。录音、转写、信息提取、病历和导出记录均为只读。</span></div>
       </template>
 
-      <div v-if="view === 'workbench'" class="consultation-start-view">
+      <div v-if="view === 'templates'" class="full-view template-management-view">
+        <TemplateManagement :doctor-name="doctor.display_name" />
+      </div>
+      <div v-else-if="view === 'workbench'" class="consultation-start-view">
         <section class="card consultation-start-card" :class="{ 'is-active': active, 'is-closed': closed }">
           <div class="consultation-step-chip"><span class="step-chip-number">01</span><span>患者 / 接诊</span><small>CONSULTATION</small></div>
           <div class="consultation-start-content">
             <div class="consultation-start-icon"><Icon :name="waiting ? 'play' : closed ? 'check' : 'mic'" /></div>
             <span class="consultation-state-kicker">{{ readOnlyCurrentPatient ? 'READ ONLY' : waiting ? 'READY TO START' : closed ? 'VISIT CLOSED' : 'VISIT IN PROGRESS' }}</span>
             <h2>{{ readOnlyCurrentPatient ? `接诊状态：${statusText(currentVisit)}` : waiting ? '准备开始本次接诊' : closed ? `本次接诊${statusText(currentVisit)}` : '本次接诊进行中' }}</h2>
-            <p>{{ readOnlyCurrentPatient ? '当前患者由其他医生负责接诊，科室长仅可查看患者信息、接诊医生和接诊状态。' : waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。已完成接诊的患者不支持重复接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
+             <p>{{ readOnlyCurrentPatient ? '科室长仅可查看患者信息、接诊医生和该接诊已有的业务数据。' : waiting ? '确认患者身份后开始接诊，下一步即可上传录音或使用网页录音。' : closed ? '本次接诊记录已保留。已完成接诊的患者不支持重复接诊。' : '接诊已开始，前往录音上传即可使用文件上传或网页录音。' }}</p>
             <button v-if="!readOnlyCurrentPatient && waiting" class="btn primary start-consultation-btn" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
             <button v-else-if="!readOnlyCurrentPatient && active" class="btn primary start-consultation-btn" :disabled="busy" @click="navigate('audio')"><Icon name="mic" />进入录音上传</button>
             <span v-else-if="readOnlyCurrentPatient" class="small-muted">仅可查看状态</span>
@@ -1659,7 +1726,7 @@ defineExpose({ selectPatient })
                 <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
                   <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
                 </div>
-                <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+             <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
               </aside>
            <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -1672,7 +1739,7 @@ defineExpose({ selectPatient })
                   <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
                   <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
                     <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
-                    <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
+                     <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="!readOnlyCurrentPatient && item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
                   </div>
                 </div>
               </div>
@@ -1692,7 +1759,7 @@ defineExpose({ selectPatient })
                   </div>
                 </template>
                 <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-                <div v-if="!locked" class="extraction-actions">
+             <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions">
                   <span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div>
                   <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button>
                   <button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
@@ -1700,8 +1767,8 @@ defineExpose({ selectPatient })
               </div>
               <div class="transcript-actions">
                 <span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
-                <button v-if="transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
-                <button v-else class="btn small soft" :disabled="locked || !allTranscribed" @click="generateRecord"><Icon name="sparkle" />生成病历</button>
+             <button v-if="!readOnlyCurrentPatient && transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
+             <button v-else-if="!readOnlyCurrentPatient" class="btn small soft" :disabled="locked || !allTranscribed" @click="generateRecord"><Icon name="sparkle" />生成病历</button>
               </div>
             </template>
             <div v-else class="empty-state"><div class="empty-icon"><Icon name="text" /></div><h3>等待录音转写</h3><p>上传完整录音后，医患对话会显示在这里。</p></div>
@@ -1776,9 +1843,12 @@ defineExpose({ selectPatient })
               <span class="step-guard-kicker">步骤 01 尚未开始</span>
               <h3>先开始本次接诊</h3>
               <p>开始接诊后，才能上传录音或使用网页录音。</p>
-              <button class="btn primary" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
+              <button v-if="!readOnlyCurrentPatient" class="btn primary" :disabled="busy || !currentPatient" @click="startVisit"><Icon name="play" />开始接诊</button>
+              <span v-else class="small-muted">科室长仅可查看该接诊记录</span>
             </div>
             <template v-else-if="active">
+              <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" />当前接诊正在进行，科室长仅可查看已有录音和处理结果。</div>
+              <template v-if="!readOnlyCurrentPatient">
               <div class="audio-source-grid">
                 <div class="upload-method">
                   <div class="method-heading"><span class="method-icon"><Icon name="upload" /></span><div><h3>上传录音文件</h3><p>支持 MP3、WAV、M4A、WEBM</p></div></div>
@@ -1801,6 +1871,7 @@ defineExpose({ selectPatient })
                 </div>
               </div>
               <div class="upload-footer"><span>完整录音上传后，点击“开始转写”</span></div>
+              </template>
               <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
@@ -1816,7 +1887,7 @@ defineExpose({ selectPatient })
                   <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
                 </div>
               </div>
-              <div v-if="recordings.length" class="asr-controls">
+              <div v-if="recordings.length && !readOnlyCurrentPatient" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
                   <legend>转写模型</legend>
                   <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网转写</label>
@@ -1825,7 +1896,7 @@ defineExpose({ selectPatient })
                 <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
               </div>
-              <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
+              <div v-if="!readOnlyCurrentPatient && recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
               </div>
             </template>
@@ -1865,7 +1936,7 @@ defineExpose({ selectPatient })
             <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
               <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
             </div>
-            <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></div>
+            <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
           </aside>
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -1878,7 +1949,7 @@ defineExpose({ selectPatient })
               <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
               <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
                 <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
-                <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
+                 <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="!readOnlyCurrentPatient && item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
               </div>
             </div>
           </div>
@@ -1894,11 +1965,11 @@ defineExpose({ selectPatient })
               <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact"><div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
             </template>
             <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-            <div v-if="!locked" class="extraction-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
+            <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
           </div>
           <div class="transcript-actions"><span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
-            <button v-if="transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
-            <button v-else class="btn small soft" :disabled="locked || !allTranscribed" @click="generateRecord"><Icon name="sparkle" />生成病历</button>
+            <button v-if="!readOnlyCurrentPatient && transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
+            <button v-else-if="!readOnlyCurrentPatient" class="btn small soft" :disabled="locked || !allTranscribed" @click="generateRecord"><Icon name="sparkle" />生成病历</button>
           </div>
         </section>
       </div>
@@ -1907,11 +1978,11 @@ defineExpose({ selectPatient })
         <section class="card record-card">
           <div class="card-head"><h2><Icon name="file" />门诊病历 <span v-if="record?.record_id" class="badge" :class="confirmed ? 'teal' : 'amber'">{{ confirmed ? '已签署' : '待签署' }}</span></h2>
             <div class="record-header-actions"><span v-if="record?.record_id" class="record-version">v{{ record.version_no }}.0</span>
-              <button v-if="record?.record_id && !confirmed && !closed" class="btn small" :disabled="busy || !allTranscribed" @click="modal='regenerate'"><Icon name="refresh" />重新生成</button>
+              <button v-if="!readOnlyCurrentPatient && record?.record_id && !confirmed && !closed" class="btn small" :disabled="busy || !allTranscribed" @click="modal='regenerate'"><Icon name="refresh" />重新生成</button>
             </div>
           </div>
           <div class="record-subbar"><span class="template-label"><Icon name="list" />标准门诊病历模板</span><span>{{ doctor.department_name }} · v0.1</span></div>
-          <div v-if="!record?.record_id" class="empty-state"><div class="empty-icon"><Icon name="file" /></div><h3>让对话成为清晰的病历</h3><p>完成全部录音转写后，按标准模板生成一份病历草稿。</p><button class="btn primary" :disabled="!allTranscribed || busy || closed" @click="generateRecord"><Icon name="sparkle" />生成病历草稿</button></div>
+           <div v-if="!record?.record_id" class="empty-state"><div class="empty-icon"><Icon name="file" /></div><h3>让对话成为清晰的病历</h3><p>完成全部录音转写后，按标准模板生成一份病历草稿。</p><button v-if="!readOnlyCurrentPatient" class="btn primary" :disabled="!allTranscribed || busy || closed" @click="generateRecord"><Icon name="sparkle" />生成病历草稿</button><span v-else class="small-muted">该接诊尚未生成病历</span></div>
           <template v-else>
             <div class="record-signing-status" :class="{ signed: confirmed }">
               <Icon :name="confirmed ? 'shield' : 'check'" />
@@ -1953,14 +2024,14 @@ defineExpose({ selectPatient })
         <div class="info-banner"><Icon :name="confirmed ? 'shield' : 'lock'" />
           <span>{{ confirmed ? `当前可导出版本：v${record?.version_no}.0 · 签署医生：${record?.confirmed_by_name || doctor.display_name} · 签署时间：${formatDateTime(record?.confirmed_at)}` : '请先完成医生签署，签署后的版本才可以导出。' }}</span>
         </div>
-        <section class="card">
+        <section v-if="!readOnlyCurrentPatient" class="card">
           <div class="card-head"><h2><Icon name="download" />选择导出格式</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
           <div class="template-picker">
             <label for="export-template">导出模板</label>
-            <select id="export-template" v-model.number="selectedTemplateVersion" :disabled="!confirmed || busy">
-              <option v-for="t in TEMPLATES" :key="t.version" :value="t.version">{{ t.name }}（v{{ t.version }}）· {{ t.description }}</option>
+            <select id="export-template" v-model="selectedTemplateRevisionId" :disabled="!confirmed || busy || !exportTemplates.length">
+              <option v-for="t in exportTemplates" :key="t.current_revision_id" :value="t.current_revision_id">{{ t.name }}（v{{ t.current_revision_no }}）· {{ t.description }}</option>
             </select>
-            <button class="btn" :disabled="!confirmed || previewBusy || busy" @click="showPreview(previewFormat)"><Icon name="eye" />实时预览</button>
+            <button class="btn" :disabled="!confirmed || !selectedTemplate || previewBusy || busy" @click="showPreview"><Icon name="eye" />实时预览</button>
           </div>
           <div class="export-options">
             <div class="export-option"><Icon name="file" /><h3>Word 文档</h3><p>统一 A4 版式、章节编号与字段标签。<br>生成 .docx 并自动归档下载。</p><button class="btn primary" :disabled="!confirmed || busy" @click="exportWord"><Icon name="download" />导出 Word</button></div>
@@ -1973,7 +2044,7 @@ defineExpose({ selectPatient })
           <div class="card-head"><h2><Icon name="clock" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
           <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>模板</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
             <tr v-if="!exports.length"><td colspan="4">暂无导出记录</td></tr>
-            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>模板 v{{ item.template_version }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
+            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.template_name }} · v{{ item.template_revision_no }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
           </tbody></table></div>
         </section>
       </div>
@@ -1985,7 +2056,7 @@ defineExpose({ selectPatient })
             <label>开始日期<input v-model="auditFrom" type="date" :max="auditTo || undefined"></label>
             <label>结束日期<input v-model="auditTo" type="date" :min="auditFrom || undefined"></label>
             <label>操作医生<select v-model="auditDoctorId"><option value="">全部医生</option><option v-for="operator in auditOperators" :key="operator.id" :value="operator.id">{{ operator.display_name }}</option></select></label>
-            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="RECORDING_UPLOADED">上传录音</option><option value="RECORDING_DELETED">删除录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
+            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="VISIT_DETAIL_VIEWED">查看接诊详情</option><option value="RECORDING_UPLOADED">上传录音</option><option value="RECORDING_DELETED">删除录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
             <button class="btn primary audit-search" :disabled="auditBusy" @click="loadAudit(1)"><Icon name="search" />查询</button>
           </div>
         </section>
@@ -2001,7 +2072,7 @@ defineExpose({ selectPatient })
       </div>
     </main>
 
-    <footer v-if="view !== 'audit'" class="bottom-bar">
+    <footer v-if="view !== 'audit' && view !== 'templates' && !readOnlyCurrentPatient" class="bottom-bar">
       <div class="bottom-status">
         <span class="status-emblem"><Icon :name="confirmed ? 'shield' : 'save'" /></span>
         <div>
@@ -2076,15 +2147,10 @@ defineExpose({ selectPatient })
     <div v-if="previewOpen" class="preview-backdrop" role="presentation" @click.self="closePreview" @keydown.esc="closePreview">
       <div class="preview-dialog" role="dialog" aria-modal="true" aria-label="导出模板预览">
         <div class="preview-head">
-          <h2><Icon name="eye" />模板预览 · {{ selectedTemplate.name }}（v{{ selectedTemplate.version }}）</h2>
-          <div class="preview-format-toggle" role="group" aria-label="预览格式">
-            <button :class="{ active: previewFormat === 'PDF' }" :disabled="previewBusy" @click="showPreview('PDF')">PDF</button>
-            <button :class="{ active: previewFormat === 'DOCX' }" :disabled="previewBusy" @click="showPreview('DOCX')">Word</button>
-          </div>
+          <h2><Icon name="eye" />模板预览 · {{ selectedTemplate?.name || '导出模板' }}（v{{ selectedTemplate?.current_revision_no || '—' }}）</h2>
           <button class="icon-btn" aria-label="关闭预览" @click="closePreview"><Icon name="x" /></button>
         </div>
         <iframe v-if="previewUrl" :src="previewUrl" class="preview-frame" title="PDF 预览"></iframe>
-        <div v-if="previewFormat === 'DOCX'" ref="previewDocContainer" class="preview-docx"></div>
       </div>
     </div>
   </div>

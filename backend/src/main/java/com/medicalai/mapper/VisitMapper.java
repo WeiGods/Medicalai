@@ -33,6 +33,11 @@ public class VisitMapper {
                 ROW,id,doctorId).stream().findFirst();
     }
 
+    public Optional<Visit> find(UUID id, boolean lock) {
+        return jdbc.query("SELECT * FROM visit WHERE id=?" + (lock ? " FOR UPDATE" : ""),
+                ROW, id).stream().findFirst();
+    }
+
     public UUID doctorId(UUID visitId) {
         return jdbc.queryForObject("SELECT doctor_id FROM visit WHERE id=?", UUID.class, visitId);
     }

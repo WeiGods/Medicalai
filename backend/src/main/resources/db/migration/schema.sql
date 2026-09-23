@@ -272,6 +272,122 @@ CREATE TABLE IF NOT EXISTS record_export (
         REFERENCES medical_record_version(id, record_id)
 );
 
+-- 全院共享的受控病历导出模板。主表只保存状态及当前修订指针，版式本身永不覆盖。
+CREATE TABLE IF NOT EXISTS export_template (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_key varchar(64) NOT NULL UNIQUE,
+    name varchar(80) NOT NULL,
+    description varchar(256) NOT NULL DEFAULT '',
+    status varchar(16) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','DISABLED','DELETED')),
+    is_default boolean NOT NULL DEFAULT false,
+    current_revision_id uuid,
+    created_by uuid REFERENCES doctor(id),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
+);
+
+ALTER TABLE export_template DROP CONSTRAINT IF EXISTS export_template_status_check;
+ALTER TABLE export_template ADD CONSTRAINT export_template_status_check
+    CHECK (status IN ('ACTIVE','DISABLED','DELETED'));
+
+CREATE TABLE IF NOT EXISTS export_template_revision (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_id uuid NOT NULL REFERENCES export_template(id),
+    revision_no int NOT NULL CHECK (revision_no > 0),
+    definition_json jsonb NOT NULL,
+    created_by uuid REFERENCES doctor(id),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    CONSTRAINT uq_export_template_revision_no UNIQUE (template_id, revision_no)
+);
+
+ALTER TABLE export_template ADD COLUMN IF NOT EXISTS current_revision_id uuid;
+ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_id uuid REFERENCES export_template(id);
+ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_revision_id uuid REFERENCES export_template_revision(id);
+ALTER TABLE record_export ALTER COLUMN template_version DROP NOT NULL;
+-- 数字版本只用于识别待清理的 v1-v5。新导出必须默认写入 NULL，不能被后续启动清理误判。
+ALTER TABLE record_export ALTER COLUMN template_version DROP DEFAULT;
+
+-- 以固定 ID 初始化曾在浏览器端硬编码的 v6/v7/v8，保证升级后历史记录可映射。
+INSERT INTO export_template(id,template_key,name,description,status,is_default,current_revision_id)
+VALUES
+ ('00000000-0000-0000-0000-000000000006','v6','紧凑单页','合并表格、小字号，正常病历单页呈现','ACTIVE',true,NULL),
+ ('00000000-0000-0000-0000-000000000007','v7','标准病历','独立节标题与分节表格，经典文档层次','ACTIVE',false,NULL),
+ ('00000000-0000-0000-0000-000000000008','v8','宽松阅读','字号与行距更大，可读性优先，长内容自动分页','ACTIVE',false,NULL)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO export_template_revision(id,template_id,revision_no,definition_json)
+VALUES
+('00000000-0000-0000-0000-000000000106','00000000-0000-0000-0000-000000000006',1,$json${"documentTitle":"门诊病历","layout":"MERGED_TABLE","page":{"marginTop":60,"marginRight":54,"marginBottom":50,"marginLeft":54},"style":{"fontSize":9.5,"lineHeight":13.5,"labelSize":9,"sectionSize":10,"cellPadding":4},"headerEnabled":true,"footerEnabled":true,"sections":[{"key":"basic","title":"一、基本信息","layout":"GRID_2","fields":[{"key":"name","label":"患者姓名","visible":true},{"key":"gender","label":"性别","visible":true},{"key":"age","label":"年龄","visible":true},{"key":"phone","label":"联系方式","visible":true}]},{"key":"visit","title":"二、就诊内容","layout":"TABLE","fields":[{"key":"chief","label":"患者主诉","visible":true},{"key":"present","label":"患者现病史","visible":true},{"key":"past","label":"患者既往史","visible":true}]},{"key":"treatment","title":"三、诊疗记录","layout":"TABLE","fields":[{"key":"opinion","label":"医生处理意见","visible":true},{"key":"medication","label":"用药情况","visible":true},{"key":"followup","label":"复诊建议","visible":true}]},{"key":"sign","title":"四、签署信息","layout":"TABLE","fields":[{"key":"doctor","label":"接诊医生","visible":true},{"key":"date","label":"接诊日期","visible":true},{"key":"record_version","label":"病历版本","visible":true},{"key":"confirmed_at","label":"确认时间","visible":true}]}]}$json$::jsonb),
+('00000000-0000-0000-0000-000000000107','00000000-0000-0000-0000-000000000007',1,$json${"documentTitle":"门诊病历","layout":"SEPARATE_TABLES","page":{"marginTop":72,"marginRight":54,"marginBottom":62,"marginLeft":54},"style":{"fontSize":10.5,"lineHeight":16,"labelSize":9.5,"sectionSize":13,"cellPadding":7},"headerEnabled":true,"footerEnabled":true,"sections":[{"key":"basic","title":"一、基本信息","layout":"GRID_2","fields":[{"key":"name","label":"患者姓名","visible":true},{"key":"gender","label":"性别","visible":true},{"key":"age","label":"年龄","visible":true},{"key":"phone","label":"联系方式","visible":true}]},{"key":"visit","title":"二、就诊内容","layout":"TABLE","fields":[{"key":"chief","label":"患者主诉","visible":true},{"key":"present","label":"患者现病史","visible":true},{"key":"past","label":"患者既往史","visible":true}]},{"key":"treatment","title":"三、诊疗记录","layout":"TABLE","fields":[{"key":"opinion","label":"医生处理意见","visible":true},{"key":"medication","label":"用药情况","visible":true},{"key":"followup","label":"复诊建议","visible":true}]},{"key":"sign","title":"四、签署信息","layout":"TABLE","fields":[{"key":"doctor","label":"接诊医生","visible":true},{"key":"date","label":"接诊日期","visible":true},{"key":"record_version","label":"病历版本","visible":true},{"key":"confirmed_at","label":"确认时间","visible":true}]}]}$json$::jsonb),
+('00000000-0000-0000-0000-000000000108','00000000-0000-0000-0000-000000000008',1,$json${"documentTitle":"门诊病历","layout":"MERGED_TABLE","page":{"marginTop":66,"marginRight":58,"marginBottom":58,"marginLeft":58},"style":{"fontSize":11,"lineHeight":18,"labelSize":10.5,"sectionSize":11.5,"cellPadding":8},"headerEnabled":true,"footerEnabled":true,"sections":[{"key":"basic","title":"一、基本信息","layout":"GRID_2","fields":[{"key":"name","label":"患者姓名","visible":true},{"key":"gender","label":"性别","visible":true},{"key":"age","label":"年龄","visible":true},{"key":"phone","label":"联系方式","visible":true}]},{"key":"visit","title":"二、就诊内容","layout":"TABLE","fields":[{"key":"chief","label":"患者主诉","visible":true},{"key":"present","label":"患者现病史","visible":true},{"key":"past","label":"患者既往史","visible":true}]},{"key":"treatment","title":"三、诊疗记录","layout":"TABLE","fields":[{"key":"opinion","label":"医生处理意见","visible":true},{"key":"medication","label":"用药情况","visible":true},{"key":"followup","label":"复诊建议","visible":true}]},{"key":"sign","title":"四、签署信息","layout":"TABLE","fields":[{"key":"doctor","label":"接诊医生","visible":true},{"key":"date","label":"接诊日期","visible":true},{"key":"record_version","label":"病历版本","visible":true},{"key":"confirmed_at","label":"确认时间","visible":true}]}]}$json$::jsonb)
+ON CONFLICT (id) DO NOTHING;
+
+-- 将 v6/v7/v8 的系统初始定义升级为带完整 appearance 的不可变 v2。
+-- 只在当前指针仍为系统 v1 时切换，绝不覆盖科室长已保存的后续修订。
+INSERT INTO export_template_revision(id,template_id,revision_no,definition_json)
+SELECT '00000000-0000-0000-0000-000000000206'::uuid, r.template_id, 2,
+       jsonb_set(r.definition_json, '{appearance}', $json${
+         "theme":"MEDICAL_GREEN",
+         "table":{"border":"THIN","cellPadding":4,"labelColumnRatio":24,"sectionHeader":"SHADED_ROW"},
+         "docx":{"header":{"enabled":true,"content":"TITLE","alignment":"CENTER"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","RECORD_VERSION","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"},
+         "pdf":{"header":{"enabled":true,"content":"TITLE_WITH_VERSION","alignment":"SPLIT"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"}
+       }$json$::jsonb)
+FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000106'::uuid
+ON CONFLICT DO NOTHING;
+
+INSERT INTO export_template_revision(id,template_id,revision_no,definition_json)
+SELECT '00000000-0000-0000-0000-000000000207'::uuid, r.template_id, 2,
+       jsonb_set(r.definition_json, '{appearance}', $json${
+         "theme":"MEDICAL_GREEN",
+         "table":{"border":"THIN","cellPadding":7,"labelColumnRatio":24,"sectionHeader":"TEXT_LABEL"},
+         "docx":{"header":{"enabled":true,"content":"TITLE","alignment":"CENTER"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","RECORD_VERSION","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"},
+         "pdf":{"header":{"enabled":true,"content":"TITLE_WITH_VERSION","alignment":"SPLIT"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"}
+       }$json$::jsonb)
+FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000107'::uuid
+ON CONFLICT DO NOTHING;
+
+INSERT INTO export_template_revision(id,template_id,revision_no,definition_json)
+SELECT '00000000-0000-0000-0000-000000000208'::uuid, r.template_id, 2,
+       jsonb_set(r.definition_json, '{appearance}', $json${
+         "theme":"MEDICAL_GREEN",
+         "table":{"border":"THIN","cellPadding":8,"labelColumnRatio":24,"sectionHeader":"SHADED_ROW"},
+         "docx":{"header":{"enabled":true,"content":"TITLE","alignment":"CENTER"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","RECORD_VERSION","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"},
+         "pdf":{"header":{"enabled":true,"content":"TITLE_WITH_VERSION","alignment":"SPLIT"},"footer":{"enabled":true,"content":"PAGE_X_OF_Y","alignment":"CENTER"},"metadata":{"position":"BELOW_TITLE","fields":["VISIT_NO","CONFIRMED_AT"]},"basicInfo":"INLINE_PAIR"}
+       }$json$::jsonb)
+FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000108'::uuid
+ON CONFLICT DO NOTHING;
+
+UPDATE export_template SET current_revision_id=CASE template_key
+    WHEN 'v6' THEN '00000000-0000-0000-0000-000000000206'::uuid
+    WHEN 'v7' THEN '00000000-0000-0000-0000-000000000207'::uuid
+    WHEN 'v8' THEN '00000000-0000-0000-0000-000000000208'::uuid END
+WHERE ((template_key='v6' AND (current_revision_id IS NULL OR current_revision_id='00000000-0000-0000-0000-000000000106'::uuid)
+        AND EXISTS (SELECT 1 FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000206'::uuid))
+    OR (template_key='v7' AND (current_revision_id IS NULL OR current_revision_id='00000000-0000-0000-0000-000000000107'::uuid)
+        AND EXISTS (SELECT 1 FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000207'::uuid))
+    OR (template_key='v8' AND (current_revision_id IS NULL OR current_revision_id='00000000-0000-0000-0000-000000000108'::uuid)
+        AND EXISTS (SELECT 1 FROM export_template_revision r WHERE r.id='00000000-0000-0000-0000-000000000208'::uuid)));
+
+UPDATE export_template SET current_revision_id=CASE template_key
+    WHEN 'v6' THEN '00000000-0000-0000-0000-000000000106'::uuid
+    WHEN 'v7' THEN '00000000-0000-0000-0000-000000000107'::uuid
+    WHEN 'v8' THEN '00000000-0000-0000-0000-000000000108'::uuid END
+WHERE template_key IN ('v6','v7','v8') AND current_revision_id IS NULL;
+
+ALTER TABLE export_template DROP CONSTRAINT IF EXISTS fk_export_template_current_revision;
+ALTER TABLE export_template ADD CONSTRAINT fk_export_template_current_revision
+    FOREIGN KEY (current_revision_id) REFERENCES export_template_revision(id) DEFERRABLE INITIALLY DEFERRED;
+
+UPDATE record_export SET template_id=CASE template_version
+    WHEN 6 THEN '00000000-0000-0000-0000-000000000006'::uuid
+    WHEN 7 THEN '00000000-0000-0000-0000-000000000007'::uuid
+    WHEN 8 THEN '00000000-0000-0000-0000-000000000008'::uuid END,
+    template_revision_id=CASE template_version
+    WHEN 6 THEN '00000000-0000-0000-0000-000000000106'::uuid
+    WHEN 7 THEN '00000000-0000-0000-0000-000000000107'::uuid
+    WHEN 8 THEN '00000000-0000-0000-0000-000000000108'::uuid END
+WHERE template_version IN (6,7,8) AND template_revision_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     doctor_id uuid REFERENCES doctor(id),
@@ -344,28 +460,22 @@ ALTER TABLE clinical_extraction_version ADD COLUMN IF NOT EXISTS provider_route 
 CREATE INDEX IF NOT EXISTS ix_ai_job_asr_pending ON ai_job(job_type, status, created_at);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS error_message varchar(1024);
 ALTER TABLE record_export ADD COLUMN IF NOT EXISTS template_version smallint NOT NULL DEFAULT 1;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v3
-    ON record_export(version_id, format, template_version) WHERE template_version = 3;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v4
-    ON record_export(version_id, format, template_version) WHERE template_version = 4;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v5
-    ON record_export(version_id, format, template_version) WHERE template_version = 5;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_current_template_v6
-    ON record_export(version_id, format, template_version) WHERE template_version = 6;
--- 模板版本由前端注册表动态选择，统一用一条通用唯一索引覆盖所有版本。
+-- 数字模板版本仅用于升级识别；所有新导出以不可变修订 ID 做幂等键。
 DROP INDEX IF EXISTS uq_record_export_current_template;
 DROP INDEX IF EXISTS uq_record_export_current_template_v2;
 DROP INDEX IF EXISTS uq_record_export_current_template_v3;
 DROP INDEX IF EXISTS uq_record_export_current_template_v4;
 DROP INDEX IF EXISTS uq_record_export_current_template_v5;
 DROP INDEX IF EXISTS uq_record_export_current_template_v6;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_version_format_template
-    ON record_export(version_id, format, template_version);
+DROP INDEX IF EXISTS uq_record_export_version_format_template;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_record_export_version_format_revision
+    ON record_export(version_id, format, template_revision_id) WHERE template_revision_id IS NOT NULL;
 
--- 兼容旧版前端直接写入的伪成功导出：没有真实文件时必须回到可重试的 PENDING。
+-- 将映射后的历史 v6-v8 未完成任务交由后端统一渲染，浏览器端不再生成或上传文件。
 UPDATE record_export
 SET status='PENDING', object_key=NULL, error_message='待后端重新生成导出文件'
-WHERE status='SUCCEEDED' AND (object_key IS NULL OR object_key='client-generated');
+WHERE status='SUCCEEDED' AND (object_key IS NULL OR object_key='client-generated')
+  AND template_revision_id IS NOT NULL;
 INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,result_ref,provider_route)
 SELECT gen_random_uuid(),
        CASE WHEN e.format='DOCX' THEN 'EXPORT_DOCX' ELSE 'EXPORT_PDF' END,
@@ -373,20 +483,12 @@ SELECT gen_random_uuid(),
 FROM record_export e
 JOIN medical_record r ON r.id=e.record_id
 WHERE e.status='PENDING'
-  AND e.template_version < 3
+  AND e.template_revision_id IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM ai_job j
       WHERE j.idempotency_key='export:' || e.id
   )
 ON CONFLICT (idempotency_key) DO NOTHING;
-
--- 新模板由前端生成并上传归档，不进入后端排版队列。
-DELETE FROM ai_job
-WHERE job_type IN ('EXPORT_DOCX', 'EXPORT_PDF')
-  AND result_ref IN (
-      SELECT e.id FROM record_export e
-      WHERE e.template_version >= 3 AND e.status = 'PENDING'
-  );
 
 ALTER TABLE medical_record ALTER COLUMN current_version DROP NOT NULL;
 ALTER TABLE medical_record ALTER COLUMN current_version DROP DEFAULT;

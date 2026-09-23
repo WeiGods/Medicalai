@@ -55,6 +55,8 @@ public class ClinicalWorkflowService {
     private final AuditLogService auditLogs;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ExportFileService exportFiles;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExportTemplateService exportTemplates;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
@@ -110,8 +112,20 @@ public class ClinicalWorkflowService {
 
     @Transactional
     public List<RecordingVO> recordings(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return recordings(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public List<RecordingVO> recordings(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         return recordings.list(visit.id()).stream().map(RecordingVO::from).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public Recording readableRecording(UUID recordingId, UUID doctorId, DoctorRole role) {
+        Recording recording = recordings.findById(recordingId).orElseThrow(BusinessException::notFound);
+        readable(recording.visitId(), doctorId, role);
+        return recording;
     }
 
     @Transactional
@@ -258,19 +272,29 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public AsrJobVO asrJob(UUID visitId, UUID doctorId, UUID jobId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return asrJob(visitId, doctorId, jobId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public AsrJobVO asrJob(UUID visitId, UUID doctorId, UUID jobId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         RecordingMapper.AsrJob job = recordings.asrJob(jobId, visit.id())
                 .orElseThrow(BusinessException::notFound);
         List<Recording> all = recordings.list(visit.id());
         int completed = (int) all.stream().filter(r -> "DONE".equals(r.status())).count();
-        TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId) : null;
+        TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId, role) : null;
         return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result,
                 displayProvider(job.providerRoute()));
     }
 
     @Transactional(readOnly = true)
     public TranscriptVO transcript(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return transcript(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public TranscriptVO transcript(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         Optional<DialogueSnapshot> snapshot = recordings.latestSnapshot(visit.id());
         if (snapshot.isEmpty()) {
             return new TranscriptVO(null, 0, null, null, "", false, false, List.of());
@@ -292,7 +316,12 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public ClinicalExtractionVO clinicalExtraction(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return clinicalExtraction(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public ClinicalExtractionVO clinicalExtraction(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElse(null);
         if (snapshot == null) {
             return new ClinicalExtractionVO(null, 0, "PENDING", null, null, Map.of(), List.of(), null, null);
@@ -463,7 +492,12 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public MedicalRecordVO medicalRecord(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return medicalRecord(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public MedicalRecordVO medicalRecord(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         Optional<MedicalRecordVersion> version = records.currentVersion(visit.id());
         if (version.isEmpty()) {
             return new MedicalRecordVO(null, visit.id(), 0, "DRAFT", "PENDING", null, false, null, null, false);
@@ -551,7 +585,12 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public List<ConfirmationVO> confirmations(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return confirmations(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public List<ConfirmationVO> confirmations(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         return records.confirmations(visit.id()).stream()
                 .map(c -> new ConfirmationVO(c.id(), c.versionNo(), c.doctorName(), c.confirmedAt())).toList();
     }
@@ -566,28 +605,79 @@ public class ClinicalWorkflowService {
         if (confirmedVersion == null || !confirmedVersion.versionId().equals(version.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORD_NOT_CONFIRMED", "请先确认当前病历版本");
         }
-        int templateVersion = request.templateVersion();
+        // Unit tests that exercise the retired in-process API do not construct the template service.
+        // The running application always resolves a concrete active revision before writing an export job.
+        if (exportTemplates == null) return recordExportLegacy(visitId, doctorId, request, visit, version, confirmedVersion);
+        var template = exportTemplates.activeRevision(request.templateRevisionId());
         RecordExport reusable = records.reusableExport(version.recordId(), version.id(),
-                confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
+                confirmedVersion.confirmationId(), request.format(), template.revision().id()).orElse(null);
         if (reusable != null) {
             return exports(visitId, doctorId);
         }
         RecordExport failed = records.failedCurrentTemplateExport(version.recordId(), version.id(),
-                confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
+                confirmedVersion.confirmationId(), request.format(), template.revision().id()).orElse(null);
         if (failed != null) {
             records.requeueFailedExport(visit.id(), failed.id(), request.format());
             return exports(visitId, doctorId);
         }
         RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
-                version.id(), request.format(), templateVersion, doctorId).orElse(null);
+                version.id(), request.format(), template.template().id(), template.revision().id(), doctorId).orElse(null);
         if (export == null) {
-            // A concurrent request inserted the current template first. Reuse that job after the unique-index race.
+            // A concurrent request inserted the same immutable revision first. Reuse that job after the unique-index race.
             RecordExport concurrent = records.reusableExport(version.recordId(), version.id(),
-                    confirmedVersion.confirmationId(), request.format(), templateVersion).orElse(null);
+                    confirmedVersion.confirmationId(), request.format(), template.revision().id()).orElse(null);
             if (concurrent == null) {
                 throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_IN_PROGRESS", "导出任务正在创建，请稍后重试");
             }
             return exports(visitId, doctorId);
+        }
+        records.createExportJob(visit.id(), export.id(), request.format());
+        return exports(visitId, doctorId);
+    }
+
+    @Transactional(readOnly = true)
+    public byte[] previewExport(UUID visitId, UUID doctorId, ExportMedicalRecordRequest request) {
+        if (exportTemplates == null || exportFiles == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "EXPORT_PREVIEW_UNAVAILABLE", "导出预览服务不可用");
+        }
+        Visit visit = owned(visitId, doctorId, false);
+        MedicalRecordVersion version = records.currentVersion(visit.id())
+                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "RECORD_REQUIRED", "请先生成病历草稿"));
+        MedicalRecordMapper.ConfirmedVersion confirmed = records.currentConfirmedVersion(visit.id()).orElse(null);
+        if (confirmed == null || !confirmed.versionId().equals(version.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_NOT_CONFIRMED", "请先确认当前病历版本");
+        }
+        var template = exportTemplates.activeRevision(request.templateRevisionId());
+        Instant confirmedAt = records.confirmations(visit.id()).stream().findFirst().map(MedicalRecordMapper.ConfirmationRow::confirmedAt)
+                .orElse(null);
+        try {
+            return exportFiles.render(new MedicalRecordMapper.ExportPayload(UUID.randomUUID(), version.recordId(), version.id(),
+                    visit.id(), visit.visitNo(), version.versionNo(), request.format(), version.contentJson(), version.editedContentJson(),
+                    confirmedAt, template.revision().definitionJson()));
+        } catch (java.io.IOException error) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "EXPORT_PREVIEW_FAILED", "病历预览生成失败", error);
+        }
+    }
+
+    private List<RecordExportVO> recordExportLegacy(UUID visitId, UUID doctorId, ExportMedicalRecordRequest request,
+                                                     Visit visit, MedicalRecordVersion version,
+                                                     MedicalRecordMapper.ConfirmedVersion confirmedVersion) {
+        int templateVersion = MedicalRecordMapper.CURRENT_EXPORT_TEMPLATE_VERSION;
+        RecordExport reusable = records.reusableExport(version.recordId(), version.id(),
+                confirmedVersion.confirmationId(), request.format()).orElse(null);
+        if (reusable != null) return exports(visitId, doctorId);
+        RecordExport failed = records.failedCurrentTemplateExport(version.recordId(), version.id(),
+                confirmedVersion.confirmationId(), request.format()).orElse(null);
+        if (failed != null) {
+            records.requeueFailedExport(visit.id(), failed.id(), request.format());
+            return exports(visitId, doctorId);
+        }
+        RecordExport export = records.insertExport(version.recordId(), version.versionNo(), confirmedVersion.confirmationId(),
+                version.id(), request.format(), doctorId).orElse(null);
+        if (export == null) {
+            RecordExport concurrent = records.reusableExport(version.recordId(), version.id(),
+                    confirmedVersion.confirmationId(), request.format()).orElse(null);
+            if (concurrent == null) throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_IN_PROGRESS", "导出任务正在创建，请稍后重试");
         }
         return exports(visitId, doctorId);
     }
@@ -633,10 +723,15 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public List<RecordExportVO> exports(UUID visitId, UUID doctorId) {
-        Visit visit = owned(visitId, doctorId, false);
+        return exports(visitId, doctorId, DoctorRole.DOCTOR);
+    }
+
+    @Transactional(readOnly = true)
+    public List<RecordExportVO> exports(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
         return records.exportsByVisit(visit.id()).stream()
-                .map(e -> new RecordExportVO(e.id(), e.versionNo(), e.templateVersion(), e.format(), e.status(),
-                        e.doctorName(), e.createdAt()))
+                .map(e -> new RecordExportVO(e.id(), e.versionNo(), e.templateId(), e.templateRevisionId(),
+                        e.templateName(), e.templateRevisionNo(), e.format(), e.status(), e.doctorName(), e.createdAt()))
                 .toList();
     }
 
@@ -786,6 +881,13 @@ public class ClinicalWorkflowService {
 
     private Visit owned(UUID visitId, UUID doctorId, boolean lock) {
         return visits.find(visitId, doctorId, lock).orElseThrow(BusinessException::notFound);
+    }
+
+    private Visit readable(UUID visitId, UUID doctorId, DoctorRole role) {
+        if (role == DoctorRole.DEPARTMENT_HEAD) {
+            return visits.find(visitId, false).orElseThrow(BusinessException::notFound);
+        }
+        return owned(visitId, doctorId, false);
     }
 
     private void requireActive(Visit visit) {

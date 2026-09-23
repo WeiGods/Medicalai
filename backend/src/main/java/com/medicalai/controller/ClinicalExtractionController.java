@@ -1,6 +1,7 @@
 package com.medicalai.controller;
 
 import com.medicalai.domain.AuthenticatedDoctor;
+import com.medicalai.domain.DoctorRole;
 import com.medicalai.dto.LlmRouteRequest;
 import com.medicalai.service.ClinicalWorkflowService;
 import com.medicalai.vo.ClinicalExtractionVO;
@@ -27,13 +28,14 @@ public class ClinicalExtractionController {
     @GetMapping
     public ClinicalExtractionVO get(@PathVariable("visitId") UUID visitId,
                                     @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return service.clinicalExtraction(visitId, current.doctor().id());
+        return service.clinicalExtraction(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
     }
 
     @PostMapping("/generate")
     public ClinicalExtractionVO generate(@PathVariable("visitId") UUID visitId,
                                          @Valid @RequestBody(required = false) LlmRouteRequest request,
                                          @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return service.generateClinicalExtraction(visitId, current.doctor().id(),
                 request == null ? null : request.provider());
     }
@@ -41,6 +43,14 @@ public class ClinicalExtractionController {
     @PostMapping("/confirm")
     public ClinicalExtractionVO confirm(@PathVariable("visitId") UUID visitId,
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return service.confirmClinicalExtraction(visitId, current.doctor().id());
+    }
+
+    private void requireWrite(AuthenticatedDoctor current) {
+        if (current == null || !DoctorRole.from(current.doctor().role()).canWriteClinicalData()) {
+            throw new com.medicalai.exception.BusinessException(org.springframework.http.HttpStatus.FORBIDDEN,
+                    "CLINICAL_READ_ONLY", "科室长只能查看接诊数据，不能执行修改操作");
+        }
     }
 }

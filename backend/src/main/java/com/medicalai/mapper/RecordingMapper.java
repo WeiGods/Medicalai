@@ -40,6 +40,10 @@ public class RecordingMapper {
                 """, RECORDING, id, doctorId).stream().findFirst();
     }
 
+    public Optional<Recording> findById(UUID id) {
+        return jdbc.query("SELECT * FROM recording WHERE id=?", RECORDING, id).stream().findFirst();
+    }
+
     public int count(UUID visitId) {
         Integer n = jdbc.queryForObject("SELECT count(*) FROM recording WHERE visit_id=?", Integer.class, visitId);
         return n == null ? 0 : n;

@@ -1,6 +1,7 @@
 package com.medicalai.controller;
 
 import com.medicalai.domain.AuthenticatedDoctor;
+import com.medicalai.domain.DoctorRole;
 import com.medicalai.dto.SaveTranscriptRequest;
 import com.medicalai.dto.LlmRouteRequest;
 import com.medicalai.dto.UpdateUtteranceRoleRequest;
@@ -19,12 +20,13 @@ public class TranscriptController {
     @GetMapping
     public TranscriptVO get(@PathVariable("visitId") UUID visitId,
                             @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return service.transcript(visitId, current.doctor().id());
+        return service.transcript(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
     }
 
     @PutMapping
     public TranscriptVO save(@PathVariable("visitId") UUID visitId, @Valid @RequestBody SaveTranscriptRequest request,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return service.saveTranscript(visitId, current.doctor().id(), request);
     }
 
@@ -32,6 +34,7 @@ public class TranscriptController {
     public TranscriptVO updateRole(@PathVariable("visitId") UUID visitId, @PathVariable("utteranceId") UUID utteranceId,
                                    @Valid @RequestBody UpdateUtteranceRoleRequest request,
                                    @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return service.updateUtteranceRole(visitId, current.doctor().id(), utteranceId, request);
     }
 
@@ -39,7 +42,15 @@ public class TranscriptController {
     public TranscriptVO reclassifyRoles(@PathVariable("visitId") UUID visitId,
                                          @Valid @RequestBody(required = false) LlmRouteRequest request,
                                          @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return service.reclassifyTranscriptRoles(visitId, current.doctor().id(),
                 request == null ? null : request.provider());
+    }
+
+    private void requireWrite(AuthenticatedDoctor current) {
+        if (current == null || !DoctorRole.from(current.doctor().role()).canWriteClinicalData()) {
+            throw new com.medicalai.exception.BusinessException(org.springframework.http.HttpStatus.FORBIDDEN,
+                    "CLINICAL_READ_ONLY", "科室长只能查看接诊数据，不能执行修改操作");
+        }
     }
 }

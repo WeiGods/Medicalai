@@ -1,6 +1,7 @@
 package com.medicalai.controller;
 
 import com.medicalai.domain.AuthenticatedDoctor;
+import com.medicalai.domain.DoctorRole;
 import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.MedicalRecordMapper;
 import com.medicalai.service.ExportFileService;
@@ -29,14 +30,14 @@ public class ExportController {
     @GetMapping("/{exportId}")
     public MedicalRecordMapper.ExportDownload status(@PathVariable("exportId") UUID exportId,
                                                      @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return records.findExportForDownload(exportId, current.doctor().id())
+        return exportFor(current, exportId)
                 .orElseThrow(BusinessException::notFound);
     }
 
     @GetMapping("/{exportId}/download")
     public ResponseEntity<Resource> download(@PathVariable("exportId") UUID exportId,
                                               @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        var export = records.findExportForDownload(exportId, current.doctor().id())
+        var export = exportFor(current, exportId)
                 .orElseThrow(BusinessException::notFound);
         if (!"SUCCEEDED".equals(export.status()) || export.objectKey() == null || export.objectKey().isBlank()) {
             throw new BusinessException(org.springframework.http.HttpStatus.CONFLICT,
@@ -80,5 +81,15 @@ public class ExportController {
             records.markExportFileMissing(export.id());
             throw regenerationError;
         }
+    }
+
+    private boolean isDepartmentHead(AuthenticatedDoctor current) {
+        return current != null && DoctorRole.from(current.doctor().role()) == DoctorRole.DEPARTMENT_HEAD;
+    }
+
+    private java.util.Optional<MedicalRecordMapper.ExportDownload> exportFor(AuthenticatedDoctor current, UUID exportId) {
+        return isDepartmentHead(current)
+                ? records.findExportForDownload(exportId, current.doctor().id(), true)
+                : records.findExportForDownload(exportId, current.doctor().id());
     }
 }

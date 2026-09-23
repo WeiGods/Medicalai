@@ -12,13 +12,23 @@ public enum DoctorRole {
         return this == DEPARTMENT_HEAD || this == ADMIN;
     }
 
-    /** 科室长和管理员仅可汇总查看全员患者及接诊状态。 */
+    /** 只有科室长可以汇总查看全院患者及接诊状态。 */
     public boolean canReadAllPatientStatuses() {
-        return this == DEPARTMENT_HEAD || this == ADMIN;
+        return this == DEPARTMENT_HEAD;
+    }
+
+    /** 科室长是跨医生只读角色，临床写操作只允许普通医生执行。 */
+    public boolean canWriteClinicalData() {
+        return this == DOCTOR;
     }
 
     public boolean canUseDemoLogin() {
         return this == DOCTOR || this == DEPARTMENT_HEAD;
+    }
+
+    /** Export layouts affect clinical documents across the hospital, so administrators are intentionally excluded. */
+    public boolean canManageTemplates() {
+        return this == DEPARTMENT_HEAD;
     }
 
     public static DoctorRole from(String value) {

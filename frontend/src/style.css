@@ -79,8 +79,6 @@ body.modal-open{overflow:hidden}
 .preview-format-toggle button+button{border-left:1px solid #dce7df}
 .preview-format-toggle button.active{background:var(--teal);color:#fff;font-weight:600}
 .preview-format-toggle button:disabled{opacity:.6}
-.preview-docx{flex:1;overflow:auto;background:#eef1ef;padding:14px 0}
-.preview-docx .docx-wrapper{background:transparent;padding:0}
 @media(max-width:600px){.preview-backdrop{padding:10px}.preview-dialog{width:100%;height:calc(100vh - 20px);border-radius:10px}.template-picker .btn{margin-left:0}}
 
 .queue-search{width:240px;border:1px solid var(--line);border-radius:8px;padding:9px 12px;font-size:13px}.queue-head{display:flex;align-items:center;justify-content:space-between}.queue-pagination{display:flex;justify-content:center;align-items:center;gap:14px;padding:14px;border-top:1px solid var(--line)}.queue-cards{display:grid!important;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.patient-tile{min-width:0!important}.recent{border-top:1px solid var(--line);margin-top:22px;padding-top:20px}.side-footer span{display:none}@media(max-width:900px){.queue-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.queue-cards{grid-template-columns:1fr}.queue-search{width:160px}}
@@ -283,9 +281,27 @@ body.modal-open{overflow:hidden}
 .recent-item.selected .recent-meta{color:#60917d}
 
 /* 审计是全局页面，不复用当前接诊的左侧队列布局。 */
-.audit-view{max-width:none;width:100%}
-@media(min-width:1100px){.main>.full-view.audit-view{width:100%;max-width:100%;margin-left:0}}
+.audit-view,.template-management-view{max-width:none;width:100%}
+@media(min-width:1100px){.main>.full-view.audit-view,.main>.full-view.template-management-view{width:100%;max-width:100%;margin-left:0}}
 
 .global-message{position:fixed;left:50%;top:24px;transform:translate(-50%,-12px);display:flex;align-items:center;gap:9px;max-width:min(520px,calc(100vw - 32px));padding:12px 18px;border:1px solid #cfe4d7;border-radius:7px;background:#fff;color:#456c59;box-shadow:0 10px 30px #244b3a24;font-size:12px;line-height:1.6;z-index:200;animation:message-in .2s ease-out forwards}.global-message-error{border-color:#efd2cb;background:#fff8f6;color:#a55e52}.global-message-success{border-color:#c9e4d2;background:#f7fcf8;color:#3f805a}.global-message-mark{width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:#68a683}.global-message-error .global-message-mark{background:#cf796b}.global-message-success .global-message-mark{background:#4d9b70}@keyframes message-in{to{transform:translate(-50%,0)}}
 .modal-field.invalid input{border-color:#d69b82}
 .field-error{margin:6px 0 0;color:#b77560;font-size:10px;line-height:1.6}
+
+.patient-tile-content{display:block;min-width:0;flex:1;overflow:hidden}
+.visit-tile{align-items:flex-start}
+.visit-tile .avatar{margin-top:2px}
+.visit-tile .patient-name{min-width:0;max-width:100%;overflow:hidden}
+.visit-tile .patient-name b,.visit-tile .patient-name>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.visit-tile .patient-name b{flex:0 1 auto}
+.visit-tile .patient-name>span{flex:0 1 auto}
+.visit-tile .patient-meta,.visit-tile .patient-owner{display:block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.visit-tile .patient-meta{margin-top:5px;line-height:1.35}
+.visit-tile .patient-owner{margin-top:2px}
+.visit-tile .tile-status{flex:0 0 auto;align-self:flex-start;margin-left:8px;white-space:nowrap}
+@media(min-width:1100px){
+  .main>.queue .visit-tile{min-height:96px}
+}
+@media(max-width:600px){
+  .visit-tile{min-height:88px}
+}

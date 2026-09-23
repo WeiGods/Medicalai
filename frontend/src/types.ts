@@ -169,14 +169,40 @@ export interface Confirmation {
 export interface RecordExport {
   id: string
   version_no: number
-  template_version: number
+  template_id: string | null
+  template_revision_id: string | null
+  template_name: string
+  template_revision_no: number
   format: 'DOCX' | 'PDF' | string
   status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | string
   doctor_name: string
   created_at: string
+  error_message?: string | null
 }
 
-export type AuditAction = 'LOGIN' | 'RECORDING_UPLOADED' | 'RECORDING_DELETED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
+export interface ExportTemplate {
+  id: string
+  template_key: string
+  name: string
+  description: string
+  status: 'ACTIVE' | 'DISABLED' | string
+  default_template: boolean
+  current_revision_id: string
+  current_revision_no: number
+  definition_json?: string | null
+  updated_at: string
+}
+
+export interface ExportTemplateRevision {
+  id: string
+  template_id: string
+  revision_no: number
+  definition_json: string
+  created_by: string | null
+  created_at: string
+}
+
+export type AuditAction = 'LOGIN' | 'VISIT_DETAIL_VIEWED' | 'RECORDING_UPLOADED' | 'RECORDING_DELETED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
 
 export interface AuditLog {
   id: string

@@ -12,6 +12,11 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class MedicalRecordMapper {
     public static final int CURRENT_EXPORT_TEMPLATE_VERSION = 6;
+    static final String INSERT_REVISION_EXPORT_SQL = """
+            INSERT INTO record_export(id,record_id,version_id,confirmation_id,format,template_version,template_id,template_revision_id,status,object_key,created_by)
+            VALUES (?,?,?,?,?,NULL,?,?,'PENDING',NULL,?)
+            ON CONFLICT DO NOTHING
+            """;
     private static final RowMapper<MedicalRecordVersion> VERSION = (rs, n) -> new MedicalRecordVersion(
             rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class), rs.getInt("version_no"),
             rs.getObject("source_snapshot_id", UUID.class), rs.getString("source_snapshot_hash"),
@@ -156,6 +161,12 @@ public class MedicalRecordMapper {
         return reusableExport(recordId, versionId, confirmationId, format, CURRENT_EXPORT_TEMPLATE_VERSION);
     }
 
+    public Optional<RecordExport> reusableExport(UUID recordId, UUID versionId, UUID confirmationId, String format,
+                                                 UUID templateRevisionId) {
+        return exportByRevision(recordId, versionId, confirmationId, format, templateRevisionId,
+                "e.status IN ('PENDING','RUNNING','SUCCEEDED')");
+    }
+
     public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
                                                                String format, int templateVersion) {
         return jdbc.query("""
@@ -178,6 +189,11 @@ public class MedicalRecordMapper {
                 CURRENT_EXPORT_TEMPLATE_VERSION);
     }
 
+    public Optional<RecordExport> failedCurrentTemplateExport(UUID recordId, UUID versionId, UUID confirmationId,
+                                                               String format, UUID templateRevisionId) {
+        return exportByRevision(recordId, versionId, confirmationId, format, templateRevisionId, "e.status='FAILED'");
+    }
+
     public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
                                                String format, int templateVersion, UUID doctorId) {
         UUID id = UUID.randomUUID();
@@ -194,6 +210,15 @@ public class MedicalRecordMapper {
                                                String format, UUID doctorId) {
         return insertExport(recordId, versionNo, confirmationId, versionId, format,
                 CURRENT_EXPORT_TEMPLATE_VERSION, doctorId);
+    }
+
+    public Optional<RecordExport> insertExport(UUID recordId, int versionNo, UUID confirmationId, UUID versionId,
+                                               String format, UUID templateId, UUID templateRevisionId, UUID doctorId) {
+        UUID id = UUID.randomUUID();
+        int inserted = jdbc.update(INSERT_REVISION_EXPORT_SQL, id, recordId, versionId, confirmationId, format,
+                templateId, templateRevisionId, doctorId);
+        if (inserted == 0) return Optional.empty();
+        return exportsByVisit(visitIdOf(recordId)).stream().filter(e -> e.id().equals(id)).findFirst();
     }
 
     public UUID createExportJob(UUID visitId, UUID exportId, String format) {
@@ -344,50 +369,84 @@ public class MedicalRecordMapper {
                 SELECT e.id,e.format,e.version_id,e.record_id,
                        r.visit_id,vi.visit_no,v.version_no,
                        v.content_json,v.edited_content_json,
-                       c.confirmed_at
+                       c.confirmed_at,tr.definition_json
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
                 JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=r.id
                 JOIN medical_record_confirmation c ON c.id=e.confirmation_id
                     AND c.record_id=r.id AND c.version_id=v.id
                 JOIN visit vi ON vi.id=r.visit_id
-                WHERE e.id=? AND r.status='CONFIRMED'
-                  AND r.current_version=r.confirmed_version
-                  AND v.version_no=r.current_version AND c.declaration=true
+                LEFT JOIN export_template_revision tr ON tr.id=e.template_revision_id
+                -- Export recovery must use the version and template revision frozen on the export row.
+                -- The record may legitimately have a newer signed revision by the time a historical file is rebuilt.
+                WHERE e.id=? AND c.declaration=true
                 """, (rs, n) -> new ExportPayload(rs.getObject("id", UUID.class),
                         rs.getObject("record_id", UUID.class), rs.getObject("version_id", UUID.class),
                         rs.getObject("visit_id", UUID.class), rs.getString("visit_no"),
                         rs.getInt("version_no"), rs.getString("format"),
                         rs.getString("content_json"), rs.getString("edited_content_json"),
-                        DatabaseDateTime.getInstant(rs, "confirmed_at")), exportId)
+                        DatabaseDateTime.getInstant(rs, "confirmed_at"), rs.getString("definition_json")), exportId)
                 .stream().findFirst();
     }
 
     public Optional<ExportDownload> findExportForDownload(UUID exportId, UUID doctorId) {
+        return findExportForDownload(exportId, doctorId, false);
+    }
+
+    public Optional<ExportDownload> findExportForDownload(UUID exportId, UUID doctorId, boolean includeAll) {
+        String scope = includeAll ? "" : " AND v.doctor_id=?";
+        Object[] parameters = includeAll ? new Object[]{exportId} : new Object[]{exportId, doctorId};
         return jdbc.query("""
                 SELECT e.id,e.format,e.status,e.object_key,e.error_message
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
                 JOIN visit v ON v.id=r.visit_id
-                WHERE e.id=? AND v.doctor_id=?
-                """, (rs, n) -> new ExportDownload(rs.getObject("id", UUID.class),
+                WHERE e.id=?
+                """ + scope, (rs, n) -> new ExportDownload(rs.getObject("id", UUID.class),
                         rs.getString("format"), rs.getString("status"), rs.getString("object_key"),
-                        rs.getString("error_message")), exportId, doctorId).stream().findFirst();
+                        rs.getString("error_message")), parameters).stream().findFirst();
     }
 
     public List<RecordExport> exportsByVisit(UUID visitId) {
         return jdbc.query("""
-                SELECT e.id,e.record_id,ver.version_no,e.template_version,e.format,e.status,d.display_name,e.created_at
+                SELECT e.id,e.record_id,ver.version_no,e.template_id,e.template_revision_id,
+                       COALESCE(t.name,'模板 v' || COALESCE(e.template_version::text,'')) AS template_name,
+                       COALESCE(tr.revision_no,e.template_version,0) AS template_revision_no,
+                       e.format,e.status,d.display_name,e.created_at
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
                 JOIN visit v ON v.id=r.visit_id
                 JOIN medical_record_version ver ON ver.id=e.version_id AND ver.record_id=r.id
                 JOIN doctor d ON d.id=e.created_by
+                LEFT JOIN export_template t ON t.id=e.template_id
+                LEFT JOIN export_template_revision tr ON tr.id=e.template_revision_id
                 WHERE r.visit_id=? ORDER BY e.created_at DESC
-                """, (rs,n) -> new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
-                        rs.getInt("version_no"), rs.getInt("template_version"), rs.getString("format"),
-                        rs.getString("status"), rs.getString("display_name"),
-                        DatabaseDateTime.getInstant(rs, "created_at")), visitId);
+                """, this::recordExport, visitId);
+    }
+
+    private Optional<RecordExport> exportByRevision(UUID recordId, UUID versionId, UUID confirmationId, String format,
+                                                     UUID templateRevisionId, String stateClause) {
+        return jdbc.query("""
+                SELECT e.id,e.record_id,v.version_no,e.template_id,e.template_revision_id,t.name AS template_name,
+                       tr.revision_no AS template_revision_no,e.format,e.status,d.display_name,e.created_at
+                FROM record_export e
+                JOIN medical_record_version v ON v.id=e.version_id AND v.record_id=e.record_id
+                JOIN doctor d ON d.id=e.created_by
+                JOIN export_template t ON t.id=e.template_id
+                JOIN export_template_revision tr ON tr.id=e.template_revision_id
+                WHERE e.record_id=? AND e.version_id=? AND e.confirmation_id=? AND e.format=?
+                  AND e.template_revision_id=? AND %s
+                ORDER BY e.created_at DESC LIMIT 1
+                """.formatted(stateClause), this::recordExport, recordId, versionId, confirmationId, format, templateRevisionId)
+                .stream().findFirst();
+    }
+
+    private RecordExport recordExport(java.sql.ResultSet rs, int row) throws java.sql.SQLException {
+        return new RecordExport(rs.getObject("id", UUID.class), rs.getObject("record_id", UUID.class),
+                rs.getInt("version_no"), rs.getObject("template_id", UUID.class),
+                rs.getObject("template_revision_id", UUID.class), rs.getString("template_name"),
+                rs.getInt("template_revision_no"), rs.getString("format"), rs.getString("status"),
+                rs.getString("display_name"), DatabaseDateTime.getInstant(rs, "created_at"));
     }
 
     private UUID visitIdOf(UUID recordId) {
@@ -401,6 +460,13 @@ public class MedicalRecordMapper {
     public record ExportAuditContext(UUID doctorId, UUID visitId, String format) {}
     public record ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
                                 int versionNo, String format, String contentJson, String editedContentJson,
-                                Instant confirmedAt) {}
+                                Instant confirmedAt, String templateDefinitionJson) {
+        public ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
+                             int versionNo, String format, String contentJson, String editedContentJson,
+                             Instant confirmedAt) {
+            this(id, recordId, versionId, visitId, visitNo, versionNo, format, contentJson, editedContentJson,
+                    confirmedAt, null);
+        }
+    }
     public record ExportDownload(UUID id, String format, String status, String objectKey, String errorMessage) {}
 }

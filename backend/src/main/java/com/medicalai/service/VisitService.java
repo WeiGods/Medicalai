@@ -17,6 +17,8 @@ public class VisitService {
     private final DoctorMapper doctors;
     private final AudioStorageService storage;
     private final Clock clock;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private AuditLogService auditLogs;
 
     public VisitService(VisitMapper visits, PatientMapper patients, DoctorMapper doctors,
                         AudioStorageService storage, Clock clock) {
@@ -30,6 +32,14 @@ public class VisitService {
     }
 
     public VisitVO get(UUID id, UUID doctorId) { return VisitVO.from(owned(id,doctorId,false)); }
+
+    public VisitVO get(UUID id, UUID doctorId, DoctorRole role, String clientIp) {
+        Visit visit = readable(id, doctorId, role);
+        if (role == DoctorRole.DEPARTMENT_HEAD && !doctorId.equals(visit.doctorId()) && auditLogs != null) {
+            auditLogs.recordVisitDetailViewed(doctorId, visit.id(), visit.visitNo(), visit.doctorNameSnapshot(), clientIp);
+        }
+        return VisitVO.from(visit);
+    }
 
     @Transactional
     public VisitVO create(CreateVisitRequest request, Doctor doctor) {
@@ -84,6 +94,13 @@ public class VisitService {
 
     private Visit owned(UUID id, UUID doctorId, boolean lock) {
         return visits.find(id,doctorId,lock).orElseThrow(BusinessException::notFound);
+    }
+
+    private Visit readable(UUID id, UUID doctorId, DoctorRole role) {
+        if (role == DoctorRole.DEPARTMENT_HEAD) {
+            return visits.find(id, false).orElseThrow(BusinessException::notFound);
+        }
+        return owned(id, doctorId, false);
     }
 
     private static BusinessException invalidState() {

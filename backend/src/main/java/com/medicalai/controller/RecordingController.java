@@ -1,6 +1,7 @@
 package com.medicalai.controller;
 
 import com.medicalai.domain.AuthenticatedDoctor;
+import com.medicalai.domain.DoctorRole;
 import com.medicalai.domain.Recording;
 import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.RecordingMapper;
@@ -16,6 +17,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.http.HttpStatus;
 
 @RestController
 @RequestMapping("/api/v1")
@@ -33,7 +35,7 @@ public class RecordingController {
     @GetMapping("/visits/{visitId}/recordings")
     public List<RecordingVO> list(@PathVariable("visitId") UUID visitId,
                                   @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return workflow.recordings(visitId, current.doctor().id());
+        return workflow.recordings(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
     }
 
     @PostMapping(value = "/visits/{visitId}/recordings", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -41,6 +43,7 @@ public class RecordingController {
                               @RequestPart("file") MultipartFile file,
                               @RequestParam(value = "duration_ms", required = false) Long durationMs,
                               @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         return workflow.upload(visitId, current.doctor().id(), file, durationMs);
     }
 
@@ -48,6 +51,7 @@ public class RecordingController {
     public void delete(@PathVariable("visitId") UUID visitId,
                        @PathVariable("recordingId") UUID recordingId,
                        @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
         workflow.deleteRecording(visitId, recordingId, current.doctor().id());
     }
 
@@ -59,6 +63,7 @@ public class RecordingController {
         if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
         }
+        requireWrite(current);
         return workflow.transcribe(visitId, current.doctor().id(), provider);
     }
 
@@ -71,6 +76,7 @@ public class RecordingController {
         if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
         }
+        requireWrite(current);
         return workflow.retranscribeRecording(visitId, recordingId, current.doctor().id(), provider);
     }
 
@@ -79,13 +85,13 @@ public class RecordingController {
     @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")
     public AsrJobVO transcriptionStatus(@PathVariable("visitId") UUID visitId, @PathVariable("jobId") UUID jobId,
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        return workflow.asrJob(visitId, current.doctor().id(), jobId);
+        return workflow.asrJob(visitId, current.doctor().id(), jobId, DoctorRole.from(current.doctor().role()));
     }
 
     @GetMapping("/recordings/{recordingId}/audio")
     public ResponseEntity<ByteArrayResource> audio(@PathVariable("recordingId") UUID recordingId,
                                                    @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        Recording recording = recordings.find(recordingId, current.doctor().id()).orElseThrow(BusinessException::notFound);
+        Recording recording = workflow.readableRecording(recordingId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
         if (recording.objectKey() == null || recording.objectKey().isBlank()) {
             throw new BusinessException(org.springframework.http.HttpStatus.NOT_FOUND,
                     "AUDIO_NOT_FOUND", "录音文件不存在");
@@ -102,6 +108,12 @@ public class RecordingController {
                 .contentLength(bytes.length)
                 .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
                 .body(new ByteArrayResource(bytes));
+    }
+
+    private void requireWrite(AuthenticatedDoctor current) {
+        if (current == null || !DoctorRole.from(current.doctor().role()).canWriteClinicalData()) {
+            throw new BusinessException(HttpStatus.FORBIDDEN, "CLINICAL_READ_ONLY", "科室长只能查看接诊数据，不能执行修改操作");
+        }
     }
 
     private MediaType resolveMediaType(Recording recording) {

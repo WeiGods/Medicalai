@@ -1,6 +1,7 @@
 import type {
   AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
-  Recording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole
+  Recording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole, ExportTemplate,
+  ExportTemplateRevision
 } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
@@ -62,6 +63,7 @@ export const api = {
   },
   patients: (keyword = '') => request<Patient[]>(`/api/v1/patients${keyword ? `?keyword=${encodeURIComponent(keyword)}` : ''}`),
   visits: () => request<Visit[]>('/api/v1/visits'),
+  visit: (visitId: string) => request<Visit>(`/api/v1/visits/${visitId}`),
   createPatient: (payload: { name: string; gender: string; age: number | null; phone?: string; idNo?: string }) => request<Patient>('/api/v1/patients', {
     method: 'POST',
     body: JSON.stringify({
@@ -128,16 +130,36 @@ export const api = {
     body: JSON.stringify({ declaration })
   }),
   confirmations: (visitId: string) => request<Confirmation[]>(`/api/v1/visits/${visitId}/confirmations`),
-  recordExport: (visitId: string, format: 'DOCX' | 'PDF', templateVersion: number) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`, {
+  exportTemplates: () => request<ExportTemplate[]>('/api/v1/export-templates'),
+  recordExport: (visitId: string, format: 'DOCX' | 'PDF', templateRevisionId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`, {
     method: 'POST',
-    body: JSON.stringify({ format, template_version: templateVersion })
+    body: JSON.stringify({ format, template_revision_id: templateRevisionId })
   }),
-  uploadExportFile: (visitId: string, exportId: string, format: 'DOCX' | 'PDF', file: Blob, fileName?: string) => {
-    const body = new FormData()
-    const ext = format === 'DOCX' ? 'docx' : 'pdf'
-    body.append('file', file, `${fileName || `medical-record-${exportId}`}.${ext}`)
-    return request<RecordExport[]>(`/api/v1/visits/${visitId}/exports/${exportId}/file`, { method: 'POST', body }, false)
-  },
+  exportPreviewBlob: (visitId: string, format: 'DOCX' | 'PDF', templateRevisionId: string) => blobRequest(`/api/v1/visits/${visitId}/exports/preview`, {
+    method: 'POST', body: JSON.stringify({ format, template_revision_id: templateRevisionId })
+  }),
+  managedTemplates: () => request<ExportTemplate[]>('/api/v1/template-management/templates'),
+  createTemplate: (payload: { name: string; description: string; definition_json: string }) => request<ExportTemplate>('/api/v1/template-management/templates', {
+    method: 'POST', body: JSON.stringify(payload)
+  }),
+  saveTemplate: (templateId: string, payload: { current_revision_id: string; definition_json: string }) => request<ExportTemplateRevision>(
+    `/api/v1/template-management/templates/${templateId}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  setTemplateStatus: (templateId: string, enabled: boolean) => request<void>(`/api/v1/template-management/templates/${templateId}/status`, {
+    method: 'PATCH', body: JSON.stringify({ enabled })
+  }),
+  setDefaultTemplate: (templateId: string) => request<void>(`/api/v1/template-management/templates/${templateId}/default`, { method: 'PATCH' }),
+  deleteTemplate: (templateId: string) => request<void>(`/api/v1/template-management/templates/${templateId}`, { method: 'DELETE' }),
+  templateRevisions: (templateId: string) => request<ExportTemplateRevision[]>(`/api/v1/template-management/templates/${templateId}/revisions`),
+  restoreTemplateRevision: (templateId: string, revisionId: string, currentRevisionId: string) => request<ExportTemplateRevision>(
+    `/api/v1/template-management/templates/${templateId}/revisions/${revisionId}/restore`, {
+      method: 'POST', body: JSON.stringify({ current_revision_id: currentRevisionId })
+    }),
+  templatePreviewBlob: (templateId: string, format: 'DOCX' | 'PDF' = 'PDF') => blobRequest(`/api/v1/template-management/templates/${templateId}/preview`, {
+    method: 'POST', body: JSON.stringify({ format })
+  }),
+  draftTemplatePreviewBlob: (format: 'DOCX' | 'PDF', definitionJson: string) => blobRequest('/api/v1/template-management/templates/preview', {
+    method: 'POST', body: JSON.stringify({ format, definition_json: definitionJson })
+  }),
   exports: (visitId: string) => request<RecordExport[]>(`/api/v1/visits/${visitId}/exports`),
   auditLogs: (query: { from?: string; to?: string; doctorId?: string; action?: AuditAction; page?: number; pageSize?: number }) => {
     const params = new URLSearchParams()
@@ -195,4 +217,22 @@ export const api = {
     }
     return response.blob()
   }
+}
+
+async function blobRequest(path: string, options: RequestInit = {}): Promise<Blob> {
+  const headers = new Headers(options.headers)
+  headers.set('Content-Type', 'application/json')
+  const token = localStorage.getItem('medicalai_token')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${base}${path}`, { ...options, headers })
+  if (response.status === 401) {
+    clearSession()
+    window.dispatchEvent(new Event('medicalai:unauthorized'))
+  }
+  if (!response.ok) {
+    let message = `请求失败（${response.status}）`
+    try { message = (await response.json() as { message?: string }).message || message } catch {}
+    throw new Error(message)
+  }
+  return response.blob()
 }

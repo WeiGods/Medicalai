@@ -34,6 +34,11 @@ public class AuditLogService {
                 "登录系统", clientIp);
     }
 
+    public void recordVisitDetailViewed(UUID viewerId, UUID visitId, String visitNo, String doctorName, String clientIp) {
+        record(viewerId, visitId, AuditAction.VISIT_DETAIL_VIEWED, visitId, AuditResourceType.VISIT,
+                AuditResult.SUCCESS, "查看接诊详情：" + safeVisitNo(visitNo) + " · 接诊医生：" + safeName(doctorName), clientIp);
+    }
+
     public void recordRecordingUploaded(UUID doctorId, UUID visitId, UUID recordingId, String fileName) {
         record(doctorId, visitId, AuditAction.RECORDING_UPLOADED, recordingId, AuditResourceType.RECORDING,
                 AuditResult.SUCCESS, "上传录音：" + safeFileName(fileName), null);
@@ -95,5 +100,13 @@ public class AuditLogService {
         int separatorIndex = normalized.lastIndexOf('/');
         String baseName = separatorIndex >= 0 ? normalized.substring(separatorIndex + 1) : normalized;
         return baseName.replaceAll("\\p{Cntrl}", " ");
+    }
+
+    private String safeVisitNo(String value) {
+        return value == null || value.isBlank() ? "未编号接诊" : value.strip().replaceAll("[\\p{Cntrl}]", " ");
+    }
+
+    private String safeName(String value) {
+        return value == null || value.isBlank() ? "未标记" : value.strip().replaceAll("[\\p{Cntrl}]", " ");
     }
 }

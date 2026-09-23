@@ -68,7 +68,9 @@ public class PatientService {
         String normalized = value == null ? "" : value.strip();
         // A complete ID ending in X must be masked; the generic mask cannot distinguish it
         // from a value that an upstream system has already desensitized.
-        if (normalized.matches("\\d{17}X")) return mask(normalized, 3, 4);
+        if (normalized.matches("\\d{17}X")) {
+            return normalized.substring(0, 3) + "****" + normalized.substring(normalized.length() - 4);
+        }
         return mask(value, 3, 4);
     }
 
