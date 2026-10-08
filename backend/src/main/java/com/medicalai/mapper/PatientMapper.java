@@ -53,6 +53,12 @@ public class PatientMapper {
                 .stream().findFirst();
     }
 
+    /** Locks a patient row to serialize deletion with visit creation. */
+    public Optional<Patient> findByIdForUpdate(UUID id) {
+        return jdbc.query(SELECT_WITH_CREATOR + " WHERE p.id=? FOR UPDATE OF p", ROW, id)
+                .stream().findFirst();
+    }
+
     /** 创建接诊时必须锁定且验证患者归属，防止通过患者 ID 越权建立接诊。 */
     public Optional<Patient> findOwnedByIdForUpdate(UUID id, UUID doctorId) {
         return jdbc.query(SELECT_WITH_CREATOR + " WHERE p.id=? AND p.created_by=? AND p.status='ACTIVE' FOR UPDATE OF p", ROW,

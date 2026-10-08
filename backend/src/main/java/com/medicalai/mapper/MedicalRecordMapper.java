@@ -355,13 +355,19 @@ public class MedicalRecordMapper {
 
     public Optional<ExportAuditContext> exportAuditContext(UUID exportId) {
         return jdbc.query("""
-                SELECT e.created_by,r.visit_id,e.format
+                SELECT e.created_by,r.visit_id,e.format,vi.patient_id,vi.patient_name_snapshot,
+                       p.name AS patient_name,p.patient_no,vi.visit_no
                 FROM record_export e
                 JOIN medical_record r ON r.id=e.record_id
+                JOIN visit vi ON vi.id=r.visit_id
+                JOIN patient p ON p.id=vi.patient_id
                 WHERE e.id=?
                 """, (resultSet, rowNum) -> new ExportAuditContext(
                 resultSet.getObject("created_by", UUID.class), resultSet.getObject("visit_id", UUID.class),
-                resultSet.getString("format")), exportId).stream().findFirst();
+                resultSet.getString("format"), resultSet.getObject("patient_id", UUID.class),
+                resultSet.getString("patient_name_snapshot") == null
+                        ? resultSet.getString("patient_name") : resultSet.getString("patient_name_snapshot"),
+                resultSet.getString("patient_no"), resultSet.getString("visit_no")), exportId).stream().findFirst();
     }
 
     public Optional<ExportPayload> exportPayload(UUID exportId) {
@@ -457,7 +463,12 @@ public class MedicalRecordMapper {
     public record ExportRow(UUID id, int versionNo, String format, String status, String doctorName, Instant createdAt) {}
     public record ConfirmedVersion(UUID recordId, UUID versionId, int versionNo, UUID confirmationId) {}
     public record ExportJob(UUID jobId, UUID exportId, int attempt) {}
-    public record ExportAuditContext(UUID doctorId, UUID visitId, String format) {}
+    public record ExportAuditContext(UUID doctorId, UUID visitId, String format,
+                                     UUID patientId, String patientName, String patientNo, String visitNo) {
+        public ExportAuditContext(UUID doctorId, UUID visitId, String format) {
+            this(doctorId, visitId, format, null, null, null, null);
+        }
+    }
     public record ExportPayload(UUID id, UUID recordId, UUID versionId, UUID visitId, String visitNo,
                                 int versionNo, String format, String contentJson, String editedContentJson,
                                 Instant confirmedAt, String templateDefinitionJson) {

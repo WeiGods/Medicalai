@@ -6,5 +6,6 @@ public enum AuditResourceType {
     VISIT,
     RECORDING,
     MEDICAL_RECORD,
-    RECORD_EXPORT
+    RECORD_EXPORT,
+    PATIENT
 }

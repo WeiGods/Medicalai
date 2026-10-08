@@ -700,11 +700,15 @@ public class ClinicalWorkflowService {
         }
         String objectKey = exportFiles.storeUploaded(export.id(), export.format(), file);
         if (!records.markUploadedExportSucceeded(export.id(), visit.id(), doctorId, objectKey)) {
+            // If deletion or another terminal update invalidated the export while bytes were written,
+            // remove the just-created archive immediately instead of leaving an untracked file.
+            exportFiles.deleteStoredExport(objectKey);
             throw new BusinessException(HttpStatus.CONFLICT, "EXPORT_ALREADY_FINISHED", "导出任务已结束，不能重复上传");
         }
         records.exportAuditContext(export.id()).ifPresent(context -> {
             Runnable writeAudit = () -> auditLogs.recordMedicalRecordExport(context.doctorId(), context.visitId(),
-                    export.id(), context.format(), AuditResult.SUCCESS);
+                    export.id(), context.format(), AuditResult.SUCCESS, context.patientId(), context.patientName(),
+                    context.patientNo(), context.visitNo());
             if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()
                     && org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()) {
                 org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(

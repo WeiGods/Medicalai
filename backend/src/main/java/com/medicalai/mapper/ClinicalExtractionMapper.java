@@ -28,6 +28,13 @@ public class ClinicalExtractionMapper {
         this.jdbc = jdbc;
     }
 
+    /** Reacquire the visit lock after the model call, before persisting any result rows. */
+    private void requireVisitForWrite(UUID visitId) {
+        boolean exists = !jdbc.query("SELECT id FROM visit WHERE id=? FOR UPDATE",
+                (rs, n) -> rs.getObject("id", UUID.class), visitId).isEmpty();
+        if (!exists) throw com.medicalai.exception.BusinessException.notFound();
+    }
+
     public Optional<Version> current(UUID visitId) {
         return jdbc.query("""
                 SELECT v.* FROM clinical_extraction_version v
@@ -54,6 +61,7 @@ public class ClinicalExtractionMapper {
     public Version insert(UUID visitId, UUID snapshotId, String snapshotHash, String status,
                           String contentJson, String qualityIssuesJson, String providerRoute,
                           String generatedBy, UUID doctorId) {
+        requireVisitForWrite(visitId);
         UUID extractionId = jdbc.query("SELECT id FROM clinical_extraction WHERE visit_id=?",
                 (rs, n) -> rs.getObject("id", UUID.class), visitId).stream().findFirst().orElseGet(() -> {
                     UUID id = UUID.randomUUID();

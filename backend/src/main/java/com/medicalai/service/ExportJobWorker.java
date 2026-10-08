@@ -70,7 +70,8 @@ public class ExportJobWorker {
 
     private void writeTerminalAudit(UUID exportId, MedicalRecordMapper.ExportAuditContext context, AuditResult result) {
         try {
-            auditLogs.recordMedicalRecordExport(context.doctorId(), context.visitId(), exportId, context.format(), result);
+            auditLogs.recordMedicalRecordExport(context.doctorId(), context.visitId(), exportId, context.format(), result,
+                    context.patientId(), context.patientName(), context.patientNo(), context.visitNo());
         } catch (RuntimeException exception) {
             LOG.error("Export audit log failed: exportId={}, result={}", exportId, result, exception);
         }

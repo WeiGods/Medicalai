@@ -18,7 +18,9 @@ vi.mock('../api', () => ({
     managedTemplates: vi.fn(),
     saveTranscript: vi.fn(),
     retranscribeRecording: vi.fn(),
-    transcribe: vi.fn()
+    transcribe: vi.fn(),
+    deletePatient: vi.fn(),
+    patientDeletionStatus: vi.fn()
   }
 }))
 
@@ -78,9 +80,10 @@ function configure(options: {
   transcript?: Transcript
   record?: MedicalRecord
   visit?: Visit
+  visits?: Visit[]
 } = {}) {
   vi.mocked(api.patients).mockResolvedValue(options.patients || [patient])
-  vi.mocked(api.visits).mockResolvedValue([options.visit || activeVisit])
+  vi.mocked(api.visits).mockResolvedValue(options.visits || [options.visit || activeVisit])
   vi.mocked(api.recordings).mockResolvedValue(options.recordings || [doneRecording])
   vi.mocked(api.transcript).mockResolvedValue(options.transcript || transcript())
   vi.mocked(api.clinicalExtraction).mockResolvedValue(pendingExtraction)
@@ -215,6 +218,34 @@ describe('supplemental recording workflow', () => {
   })
 })
 
+describe('transcript review navigation', () => {
+  it('scrolls to a flagged utterance inside the dialogue region', async () => {
+    const source = transcript()
+    const wrapper = await mountWorkbench({
+      transcript: {
+        ...source,
+        turns: [{ ...source.turns[0], role_review_required: true }]
+      }
+    })
+    const container = wrapper.get('.transcript-body').element
+    const dialogue = wrapper.get('.dialogue').element
+    const scrollTo = vi.fn()
+    Object.defineProperties(container, {
+      scrollHeight: { configurable: true, value: 600 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollTo: { configurable: true, value: scrollTo }
+    })
+    Object.defineProperties(dialogue, {
+      offsetTop: { configurable: true, value: 400 },
+      offsetHeight: { configurable: true, value: 40 }
+    })
+
+    await wrapper.get('.role-attention-action').trigger('click')
+
+    expect(scrollTo).toHaveBeenCalledWith({ top: 320, behavior: 'smooth' })
+  })
+})
+
 describe('template management navigation', () => {
   it('is visible only to a department head and does not render the patient workflow when open', async () => {
     configure()
@@ -275,5 +306,63 @@ describe('department head read-only visit view', () => {
     expect(wrapper.text()).toContain('导出记录')
     expect(wrapper.text()).not.toContain('选择导出格式')
     expect(wrapper.findAll('button').some(button => button.text().includes('导出 Word'))).toBe(false)
+  })
+
+  it('offers deletion only to a department head and confirms patient identity and visit count before calling the API', async () => {
+    const secondVisit: Visit = { ...activeVisit, id: 'visit-2', visit_no: 'V-002', status: 'COMPLETED' }
+    configure({ visits: [activeVisit, secondVisit] })
+    const head: Doctor = { ...doctor, role: 'DEPARTMENT_HEAD' }
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+
+    await wrapper.get('.patient-actions button.danger').trigger('click')
+    expect(wrapper.text()).toContain('患者编号 P-001')
+    expect(wrapper.text()).toContain('共包含 2 条接诊记录')
+    expect(api.deletePatient).not.toHaveBeenCalled()
+
+    await wrapper.get('.modal-actions button:first-child').trigger('click')
+    expect(api.deletePatient).not.toHaveBeenCalled()
+    wrapper.unmount()
+
+    const doctorWrapper = await mountWorkbench()
+    expect(doctorWrapper.find('.patient-actions button.danger').exists()).toBe(false)
+  })
+
+  it('deletes after the second confirmation, refreshes the queue, and clears the deleted patient details', async () => {
+    configure()
+    const head: Doctor = { ...doctor, role: 'DEPARTMENT_HEAD' }
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+    vi.mocked(api.deletePatient).mockResolvedValue({ deletion_id: 'deletion-1', cleanup_status: 'COMPLETED' })
+    vi.mocked(api.patients).mockResolvedValue([])
+    vi.mocked(api.visits).mockResolvedValue([])
+
+    await wrapper.get('.patient-actions button.danger').trigger('click')
+    await wrapper.get('.modal-body input[type="checkbox"]').setValue(true)
+    await wrapper.get('.modal-actions button.danger').trigger('click')
+    await flushPromises()
+
+    expect(api.deletePatient).toHaveBeenCalledWith(patient.id)
+    expect(api.patients).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('.patient-summary h2').text()).toContain('未选择患者')
+    expect(wrapper.text()).not.toContain('测试患者')
+    wrapper.unmount()
+  })
+
+  it('shows the persistent file cleanup message while deletion cleanup is pending', async () => {
+    configure()
+    const head: Doctor = { ...doctor, role: 'DEPARTMENT_HEAD' }
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+    vi.mocked(api.deletePatient).mockResolvedValue({ deletion_id: 'deletion-2', cleanup_status: 'PENDING' })
+
+    await wrapper.get('.patient-actions button.danger').trigger('click')
+    await wrapper.get('.modal-body input[type="checkbox"]').setValue(true)
+    await wrapper.get('.modal-actions button.danger').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('业务数据已删除，文件清理中。')
+    expect(api.patientDeletionStatus).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 })

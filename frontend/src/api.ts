@@ -1,7 +1,7 @@
 import type {
   AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
   Recording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole, ExportTemplate,
-  ExportTemplateRevision
+  ExportTemplateRevision, PatientDeletionResult
 } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
@@ -74,6 +74,8 @@ export const api = {
       id_no: payload.idNo?.trim() || null
     })
   }),
+  deletePatient: (patientId: string) => request<PatientDeletionResult>(`/api/v1/patients/${patientId}`, { method: 'DELETE' }),
+  patientDeletionStatus: (deletionId: string) => request<PatientDeletionResult>(`/api/v1/patients/deletions/${deletionId}`),
   createVisit: (patientId: string) => request<Visit>('/api/v1/visits', {
     method: 'POST',
     body: JSON.stringify({ patient_id: patientId })

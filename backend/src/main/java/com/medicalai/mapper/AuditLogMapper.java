@@ -22,6 +22,7 @@ public class AuditLogMapper {
             FROM audit_log a
             LEFT JOIN doctor d ON d.id=a.doctor_id
             LEFT JOIN visit v ON v.id=a.visit_id
+            LEFT JOIN patient p ON p.id=COALESCE(a.patient_id_snapshot,v.patient_id)
             WHERE a.action IN (%s)
             """.formatted(SUPPORTED_ACTIONS);
 
@@ -33,10 +34,18 @@ public class AuditLogMapper {
 
     public void insert(AuditLog log) {
         jdbc.update("""
-                INSERT INTO audit_log(id,doctor_id,visit_id,action,resource_id,resource_type,result,detail,client_ip)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                INSERT INTO audit_log(id,doctor_id,visit_id,action,resource_id,resource_type,result,detail,client_ip,
+                                      patient_id_snapshot,patient_name_snapshot,patient_no_snapshot,visit_no_snapshot)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, log.id(), log.doctorId(), log.visitId(), log.action().name(), log.resourceId(),
-                log.resourceType().name(), log.result().name(), log.detail(), log.clientIp());
+                log.resourceType().name(), log.result().name(), log.detail(), log.clientIp(),
+                log.patientIdSnapshot(), log.patientNameSnapshot(), log.patientNoSnapshot(), log.visitNoSnapshot());
+    }
+
+    /** Serializes an after-commit audit insert with visit deletion. */
+    public boolean lockVisitForAudit(java.util.UUID visitId) {
+        return !jdbc.query("SELECT id FROM visit WHERE id=? FOR KEY SHARE",
+                (rs, n) -> rs.getObject("id", java.util.UUID.class), visitId).isEmpty();
     }
 
     public long count(AuditLogQueryRequest request) {
@@ -54,13 +63,16 @@ public class AuditLogMapper {
         parameters.add(pageSize);
         parameters.add(offset);
         return jdbc.query("""
-                SELECT a.id,a.action,a.result,d.display_name,v.patient_name_snapshot,v.visit_no,
+                SELECT a.id,a.action,a.result,d.display_name,
+                       COALESCE(a.patient_name_snapshot,v.patient_name_snapshot,p.name) AS patient_name_snapshot,
+                       COALESCE(a.patient_no_snapshot,p.patient_no) AS patient_no_snapshot,
+                       COALESCE(a.visit_no_snapshot,v.visit_no) AS visit_no,
                        a.detail,a.client_ip,a.created_at
                 """ + QUERY_BASE + query.where() + " ORDER BY a.created_at DESC,a.id DESC LIMIT ? OFFSET ?",
                 (resultSet, rowNum) -> new AuditLogVO(resultSet.getObject("id", java.util.UUID.class),
                         resultSet.getString("action"), resultSet.getString("result"),
                         resultSet.getString("display_name"), resultSet.getString("patient_name_snapshot"),
-                        resultSet.getString("visit_no"), resultSet.getString("detail"),
+                        resultSet.getString("patient_no_snapshot"), resultSet.getString("visit_no"), resultSet.getString("detail"),
                         resultSet.getString("client_ip"), DatabaseDateTime.getInstant(resultSet, "created_at")),
                 parameters.toArray());
     }

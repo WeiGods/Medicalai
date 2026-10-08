@@ -309,3 +309,97 @@ body.modal-open{overflow:hidden}
 .avatar.rose{background:#faeceb;color:#a96060}
 .avatar.amber{background:#fbf1df;color:#aa7a36}
 .avatar.cyan{background:#e7f3f5;color:#4d8490}
+
+/* 桌面端转写页固定在视口内，仅转写内容本身承担纵向滚动。 */
+@media(min-width:1100px){
+  .main.transcript-page{
+    display:grid;
+    grid-template-columns:280px minmax(0,1fr);
+    grid-template-rows:auto auto auto auto minmax(0,1fr);
+    column-gap:18px;
+    height:calc(100vh - 77px);
+    min-height:0;
+    padding-bottom:80px;
+    overflow:hidden;
+  }
+  .main.transcript-page>.page-heading{grid-column:1/-1;grid-row:1}
+  .main.transcript-page>.queue{
+    float:none;
+    grid-column:1;
+    grid-row:2/6;
+    display:flex;
+    flex-direction:column;
+    min-height:0;
+    margin:0;
+  }
+  .main.transcript-page>.queue .queue-head{flex:0 0 auto}
+  .main.transcript-page>.queue .queue-cards{
+    flex:1 1 0;
+    min-height:0;
+    max-height:none;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+  }
+  .main.transcript-page>.queue .queue-load-more{flex:0 0 auto}
+  .main.transcript-page>.patient-summary{
+    grid-column:2;
+    grid-row:2;
+    min-width:0;
+    max-width:none;
+    margin:0 0 18px;
+  }
+  .main.transcript-page>.steps{
+    grid-column:2;
+    grid-row:3;
+    min-width:0;
+    max-width:none;
+    margin:0 0 18px;
+  }
+  .main.transcript-page>.transcript-notices{
+    grid-column:2;
+    grid-row:4;
+    display:grid;
+    align-content:start;
+    min-height:0;
+  }
+  .main.transcript-page>.transcript-notices:empty{display:none}
+  .main.transcript-page>.transcript-notices>.info-banner{margin:0 0 12px}
+  .main.transcript-page>.transcript-view{
+    grid-column:2;
+    grid-row:5;
+    width:auto;
+    max-width:none;
+    min-width:0;
+    min-height:0;
+    margin:0;
+  }
+  .main.transcript-page>.transcript-view>.card{
+    display:flex;
+    flex-direction:column;
+    width:100%;
+    height:100%;
+    min-height:0;
+    margin:0;
+    overflow:hidden;
+  }
+  .transcript-view .card-head,
+  .transcript-view .role-attention,
+  .transcript-view .transcript-tabs,
+  .transcript-view .transcript-actions{flex:0 0 auto}
+  .transcript-view .transcript-body{
+    position:relative;
+    flex:1 1 0;
+    min-height:0;
+    max-height:none;
+    overflow-x:hidden;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+  }
+  .transcript-view>.card>.card-body{
+    display:flex;
+    flex:1 1 0;
+    flex-direction:column;
+    min-height:0;
+  }
+  .transcript-view .transcript-editor{height:auto;min-height:0;flex:1 1 0;resize:none}
+}

@@ -202,7 +202,7 @@ export interface ExportTemplateRevision {
   created_at: string
 }
 
-export type AuditAction = 'LOGIN' | 'VISIT_DETAIL_VIEWED' | 'RECORDING_UPLOADED' | 'RECORDING_DELETED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT'
+export type AuditAction = 'LOGIN' | 'VISIT_DETAIL_VIEWED' | 'RECORDING_UPLOADED' | 'RECORDING_DELETED' | 'MEDICAL_RECORD_CONFIRMED' | 'MEDICAL_RECORD_EXPORT' | 'PATIENT_DELETED'
 
 export interface AuditLog {
   id: string
@@ -210,10 +210,16 @@ export interface AuditLog {
   result: 'SUCCESS' | 'FAILED' | string
   operator_name: string | null
   patient_name: string | null
+  patient_no: string | null
   visit_no: string | null
   detail: string | null
   client_ip: string | null
   created_at: string
+}
+
+export interface PatientDeletionResult {
+  deletion_id: string
+  cleanup_status: 'COMPLETED' | 'PENDING' | string
 }
 
 export interface AuditLogPage {

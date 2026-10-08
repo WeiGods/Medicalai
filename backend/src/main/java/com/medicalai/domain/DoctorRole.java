@@ -31,6 +31,11 @@ public enum DoctorRole {
         return this == DEPARTMENT_HEAD;
     }
 
+    /** Patient deletion is a destructive department-wide operation reserved for department heads. */
+    public boolean canDeletePatients() {
+        return this == DEPARTMENT_HEAD;
+    }
+
     public static DoctorRole from(String value) {
         return Arrays.stream(values())
                 .filter(role -> role.name().equals(value))

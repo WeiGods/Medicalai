@@ -54,11 +54,29 @@ public class AuditLogService {
                 AuditResult.SUCCESS, "确认病历版本 v" + versionNo, null);
     }
 
+    public void recordPatientDeleted(Doctor doctor, UUID patientId, String patientName, String patientNo,
+                                     int visitCount, String clientIp) {
+        mapper.insert(new AuditLog(UUID.randomUUID(), doctor.id(), null, AuditAction.PATIENT_DELETED, patientId,
+                AuditResourceType.PATIENT, AuditResult.SUCCESS, "删除患者及其业务数据（接诊数：" + visitCount + "）",
+                abbreviate(clientIp, CLIENT_IP_MAX_LENGTH), null, patientId, abbreviate(patientName, 128),
+                abbreviate(patientNo, 64), null));
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordMedicalRecordExport(UUID doctorId, UUID visitId, UUID exportId, String format,
+                                          AuditResult result, UUID patientId, String patientName,
+                                          String patientNo, String visitNo) {
+        boolean visitStillExists = mapper.lockVisitForAudit(visitId);
+        mapper.insert(new AuditLog(UUID.randomUUID(), doctorId, visitStillExists ? visitId : null,
+                AuditAction.MEDICAL_RECORD_EXPORT, exportId, AuditResourceType.RECORD_EXPORT, result,
+                abbreviate("导出病历：" + format, DETAIL_MAX_LENGTH), null, null, patientId,
+                abbreviate(patientName, 128), abbreviate(patientNo, 64), abbreviate(visitNo, 64)));
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordMedicalRecordExport(UUID doctorId, UUID visitId, UUID exportId, String format,
                                           AuditResult result) {
-        record(doctorId, visitId, AuditAction.MEDICAL_RECORD_EXPORT, exportId, AuditResourceType.RECORD_EXPORT, result,
-                "导出病历：" + format, null);
+        recordMedicalRecordExport(doctorId, visitId, exportId, format, result, null, null, null, null);
     }
 
     public AuditLogPageVO list(AuthenticatedDoctor current, AuditLogQueryRequest request) {

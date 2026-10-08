@@ -401,6 +401,27 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS patient_id_snapshot uuid;
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS patient_name_snapshot varchar(128);
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS patient_no_snapshot varchar(64);
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS visit_no_snapshot varchar(64);
+
+CREATE TABLE IF NOT EXISTS patient_deletion_cleanup (
+    id uuid PRIMARY KEY,
+    visit_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    export_keys jsonb NOT NULL DEFAULT '[]'::jsonb,
+    status varchar(16) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','RUNNING','COMPLETED')),
+    attempt_count int NOT NULL DEFAULT 0,
+    locked_at timestamp(0) without time zone,
+    next_attempt_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    last_error varchar(1024),
+    requested_by uuid REFERENCES doctor(id),
+    created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
+    completed_at timestamp(0) without time zone
+);
+CREATE INDEX IF NOT EXISTS ix_patient_deletion_cleanup_pending
+    ON patient_deletion_cleanup(status,next_attempt_at,created_at);
+
 CREATE TABLE IF NOT EXISTS visit_transcript (
     visit_id uuid PRIMARY KEY REFERENCES visit(id),
     snapshot_id uuid NOT NULL REFERENCES dialogue_snapshot(id),

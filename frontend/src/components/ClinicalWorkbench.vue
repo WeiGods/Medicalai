@@ -22,7 +22,7 @@ const previewFormat = ref<'PDF' | 'DOCX'>('PDF')
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit' | 'templates'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
-type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'help' | 'activity' | 'delete-recording' | null
+type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'help' | 'activity' | 'delete-recording' | 'delete-patient' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 type ManualPatientField = keyof ManualPatientForm
@@ -44,7 +44,7 @@ const queueSearch = ref('')
 const patientSearchResults = ref<Patient[] | null>(null)
 const searchBusy = ref(false)
 const busy = ref(false)
-const actionBusy = ref<'' | 'upload' | 'delete' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
+const actionBusy = ref<'' | 'upload' | 'delete' | 'delete-patient' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
@@ -72,6 +72,10 @@ const selectedLlmRoute = ref<LlmProvider | null>(null)
 const modal = ref<ModalKind>(null)
 const modalError = ref('')
 const confirmChecked = ref(false)
+const deletePatientChecked = ref(false)
+const pendingPatientDeletionId = ref('')
+let patientDeletionPollTimer: number | undefined
+let patientDeletionPollBusy = false
 const newPatientForm = ref<ManualPatientForm>({ name: '', gender: '', age: null, phone: '', idNo: '' })
 const newPatientErrors = ref<Partial<Record<ManualPatientField, string>>>({})
 const dragging = ref(false)
@@ -81,6 +85,7 @@ const modalDialog = ref<HTMLElement | null>(null)
 const activity = ref<{ time: string; text: string }[]>([])
 const recordingElapsedMs = ref(0)
 const roleReviewElements = new Map<string, HTMLElement>()
+const transcriptBody = ref<HTMLElement | null>(null)
 const avatarToneByPatientId = new Map<string, string>()
 let availableAvatarTones: string[] = []
 let lastAvatarTone = ''
@@ -209,7 +214,8 @@ function auditActionLabel(action: string) {
     RECORDING_UPLOADED: '上传录音',
     RECORDING_DELETED: '删除录音',
     MEDICAL_RECORD_CONFIRMED: '确认病历',
-    MEDICAL_RECORD_EXPORT: '病历导出'
+    MEDICAL_RECORD_EXPORT: '病历导出',
+    PATIENT_DELETED: '删除患者'
   } as Record<string, string>)[action] || action
 }
 
@@ -231,6 +237,9 @@ function compactVisitNo(value: string | null | undefined) {
 function patientVisitNo(patientId: string) {
   return compactVisitNo(patientVisit(patientId)?.visit_no)
 }
+
+const currentPatientVisitCount = computed(() => visits.value.filter(visit => visit.patient_id === selectedPatientId.value).length)
+const patientDeletionPending = computed(() => !!pendingPatientDeletionId.value)
 
 const currentPatient = computed(() => patients.value.find(p => p.id === selectedPatientId.value) || null)
 const canViewAudit = computed(() => ['DEPARTMENT_HEAD', 'ADMIN'].includes(props.doctor.role))
@@ -456,14 +465,7 @@ async function refreshVisitState() {
   const visit = currentVisit.value
   const revision = ++visitStateRevision
   if (!visit) {
-    recordings.value = []
-    transcript.value = null
-    extraction.value = null
-    record.value = null
-    recordForm.value = null
-    confirmations.value = []
-    exports.value = []
-    transcriptDraft.value = ''
+    clearVisitArtifacts()
     return
   }
   const [recordingList, transcriptState, extractionState, recordState, confirmationList, exportList] = await Promise.all([
@@ -483,6 +485,73 @@ async function refreshVisitState() {
   confirmations.value = confirmationList
   exports.value = exportList
   transcriptDraft.value = transcriptState.transcript
+}
+
+function clearVisitArtifacts() {
+  visitStateRevision += 1
+  recordings.value = []
+  transcript.value = null
+  extraction.value = null
+  record.value = null
+  recordForm.value = null
+  confirmations.value = []
+  exports.value = []
+  transcriptDraft.value = ''
+}
+
+async function deleteSelectedPatient() {
+  const patientToDelete = currentPatient.value
+  if (!departmentHead.value || !patientToDelete || actionBusy.value) return
+  if (!deletePatientChecked.value) {
+    modalError.value = '请再次确认将删除该患者及其所有接诊业务数据。'
+    return
+  }
+  actionBusy.value = 'delete-patient'
+  try {
+    const result = await api.deletePatient(patientToDelete.id)
+    modal.value = null
+    modalError.value = ''
+    deletePatientChecked.value = false
+    selectedPatientId.value = ''
+    selectedVisitId.value = ''
+    patientSearchResults.value = null
+    clearVisitArtifacts()
+    if (result.cleanup_status === 'PENDING') {
+      pendingPatientDeletionId.value = result.deletion_id
+      startPatientDeletionPolling(result.deletion_id)
+      toast('业务数据已删除，文件清理中。')
+    } else {
+      toast('患者及其业务数据已删除，关联日志已保留。', 'success')
+    }
+    await loadAll(false)
+    if (queueSearch.value.trim()) await searchPatients()
+  } catch (error) {
+    modalError.value = error instanceof Error ? error.message : '删除患者失败'
+  } finally {
+    actionBusy.value = ''
+  }
+}
+
+function startPatientDeletionPolling(deletionId: string) {
+  if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
+  patientDeletionPollBusy = false
+  patientDeletionPollTimer = window.setInterval(async () => {
+    if (patientDeletionPollBusy || pendingPatientDeletionId.value !== deletionId) return
+    patientDeletionPollBusy = true
+    try {
+      const result = await api.patientDeletionStatus(deletionId)
+      if (result.cleanup_status === 'COMPLETED') {
+        pendingPatientDeletionId.value = ''
+        if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
+        patientDeletionPollTimer = undefined
+        toast('患者相关文件清理已完成。')
+      }
+    } catch {
+      // 后端仍会持续重试；临时状态查询失败不影响已完成的业务数据删除。
+    } finally {
+      patientDeletionPollBusy = false
+    }
+  }, 5000)
 }
 
 async function loadAll(keepSelection = true) {
@@ -1087,7 +1156,19 @@ async function openRoleReview() {
   transcriptTab.value = 'dialogue'
   await nextTick()
   const firstReviewId = transcript.value?.turns.find(turn => turn.role_review_required)?.id
-  if (firstReviewId) roleReviewElements.get(firstReviewId)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  const element = firstReviewId ? roleReviewElements.get(firstReviewId) : null
+  const container = transcriptBody.value
+  if (!element) return
+
+  if (container && container.scrollHeight > container.clientHeight) {
+    container.scrollTo({
+      top: element.offsetTop - (container.clientHeight - element.offsetHeight) / 2,
+      behavior: 'smooth'
+    })
+    return
+  }
+
+  element.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 async function copyTranscript() {
@@ -1514,6 +1595,7 @@ onUnmounted(() => {
   stopAudio()
   stopRecorder()
   resetRecordingTimer()
+  if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
   document.body.classList.remove('modal-open')
 })
 
@@ -1566,7 +1648,7 @@ defineExpose({ selectPatient })
       </div>
     </header>
 
-    <main class="main">
+    <main class="main" :class="{ 'transcript-page': view === 'transcript' }">
       <div class="page-heading">
         <div>
           <div class="eyebrow"><i class="dot green"></i> CLINICAL WORKSPACE</div>
@@ -1574,6 +1656,9 @@ defineExpose({ selectPatient })
           <p>{{ titles[view][1] }}</p>
         </div>
         <div class="heading-actions" aria-hidden="true"></div>
+      </div>
+      <div v-if="patientDeletionPending" class="info-banner patient-deletion-pending">
+        <Icon name="info" /><span>业务数据已删除，文件清理中。清理完成后此提示会自动消失。</span>
       </div>
 
       <template v-if="view !== 'audit' && view !== 'templates'">
@@ -1641,8 +1726,10 @@ defineExpose({ selectPatient })
         </div>
         <div v-if="readOnlyCurrentPatient" class="patient-actions read-only-actions">
            <span class="read-only-note"><Icon name="lock" />科室长只读查看接诊详情，接诊医生：{{ currentVisit?.doctor_name || '—' }}</span>
+           <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
         </div>
         <div v-else class="patient-actions">
+          <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
           <template v-else-if="!closed">
             <button class="btn" :disabled="!exported || busy" title="当前版本确认并完成导出后可结束接诊" @click="modal='finish'"><Icon name="stop" />结束接诊</button>
@@ -1662,8 +1749,10 @@ defineExpose({ selectPatient })
         </button>
       </nav>
 
-      <div v-if="derivedDataInvalidated && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，手工转写、信息提取和病历草稿已失效，请重新核对并生成病历后再确认。</span></div>
-      <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读查看，接诊医生：{{ currentVisit?.doctor_name || '—' }}。录音、转写、信息提取、病历和导出记录均为只读。</span></div>
+      <div class="transcript-notices">
+        <div v-if="derivedDataInvalidated && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，手工转写、信息提取和病历草稿已失效，请重新核对并生成病历后再确认。</span></div>
+        <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读查看，接诊医生：{{ currentVisit?.doctor_name || '—' }}。录音、转写、信息提取、病历和导出记录均为只读。</span></div>
+      </div>
       </template>
 
       <div v-if="view === 'templates'" class="full-view template-management-view">
@@ -1953,7 +2042,7 @@ defineExpose({ selectPatient })
         </section>
       </div>
 
-      <div v-else-if="view === 'transcript'" class="full-view">
+      <div v-else-if="view === 'transcript'" class="full-view transcript-view">
         <section class="card">
           <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button v-if="canReturnToAudio" class="btn small" aria-label="返回录音上传" @click="navigate('audio')"><Icon name="arrow-left" />返回录音上传</button><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
           <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
@@ -1968,7 +2057,7 @@ defineExpose({ selectPatient })
             <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
             <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
           </div>
-          <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
+          <div v-if="transcriptTab === 'dialogue'" ref="transcriptBody" class="transcript-body">
             <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
             <div v-for="(item, index) in segments" :key="item.turn?.id || index" :ref="element => setRoleReviewElement(item.turn?.id, element)" class="dialogue" :class="{ patient: item.roleCode === 'PATIENT', 'needs-review': item.turn?.role_review_required }">
               <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
@@ -2081,7 +2170,7 @@ defineExpose({ selectPatient })
             <label>开始日期<input v-model="auditFrom" type="date" :max="auditTo || undefined"></label>
             <label>结束日期<input v-model="auditTo" type="date" :min="auditFrom || undefined"></label>
             <label>操作医生<select v-model="auditDoctorId"><option value="">全部医生</option><option v-for="operator in auditOperators" :key="operator.id" :value="operator.id">{{ operator.display_name }}</option></select></label>
-            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="VISIT_DETAIL_VIEWED">查看接诊详情</option><option value="RECORDING_UPLOADED">上传录音</option><option value="RECORDING_DELETED">删除录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option></select></label>
+            <label>操作类型<select v-model="auditAction"><option value="">全部类型</option><option value="LOGIN">登录系统</option><option value="VISIT_DETAIL_VIEWED">查看接诊详情</option><option value="RECORDING_UPLOADED">上传录音</option><option value="RECORDING_DELETED">删除录音</option><option value="MEDICAL_RECORD_CONFIRMED">确认病历</option><option value="MEDICAL_RECORD_EXPORT">病历导出</option><option value="PATIENT_DELETED">删除患者</option></select></label>
             <button class="btn primary audit-search" :disabled="auditBusy" @click="loadAudit(1)"><Icon name="search" />查询</button>
           </div>
         </section>
@@ -2090,7 +2179,7 @@ defineExpose({ selectPatient })
           <div class="table-wrap"><table class="log-table audit-log-table"><thead><tr><th>时间</th><th>操作人</th><th>操作类型</th><th>患者 / 接诊</th><th>操作详情</th><th>结果</th><th>IP</th></tr></thead><tbody>
             <tr v-if="auditBusy"><td colspan="7">正在加载日志…</td></tr>
             <tr v-else-if="!auditLogs.length"><td colspan="7">暂无符合条件的日志记录</td></tr>
-            <tr v-for="item in auditLogs" :key="item.id"><td>{{ formatDateTime(item.created_at) }}</td><td>{{ item.operator_name || '系统' }}</td><td>{{ auditActionLabel(item.action) }}</td><td><template v-if="item.visit_no || item.patient_name">{{ item.patient_name || '未记录患者' }}<br><span class="small-muted">{{ item.visit_no || '—' }}</span></template><template v-else>—</template></td><td>{{ item.detail || '—' }}</td><td><span class="badge" :class="item.result === 'SUCCESS' ? 'teal' : 'red'">{{ auditResultLabel(item.result) }}</span></td><td>{{ item.client_ip || '—' }}</td></tr>
+            <tr v-for="item in auditLogs" :key="item.id"><td>{{ formatDateTime(item.created_at) }}</td><td>{{ item.operator_name || '系统' }}</td><td>{{ auditActionLabel(item.action) }}</td><td><template v-if="item.visit_no || item.patient_name">{{ item.patient_name || '未记录患者' }}<br><span class="small-muted">{{ item.patient_no || '—' }} · {{ item.visit_no || '—' }}</span></template><template v-else-if="item.patient_no">患者编号 {{ item.patient_no }}</template><template v-else>—</template></td><td>{{ item.detail || '—' }}</td><td><span class="badge" :class="item.result === 'SUCCESS' ? 'teal' : 'red'">{{ auditResultLabel(item.result) }}</span></td><td>{{ item.client_ip || '—' }}</td></tr>
           </tbody></table></div>
           <div class="audit-pagination"><span>第 {{ auditPage }} 页</span><div><button class="btn small" :disabled="auditBusy || auditPage <= 1" @click="loadAudit(auditPage - 1)">上一页</button><button class="btn small" :disabled="auditBusy || auditPage * 20 >= auditTotal" @click="loadAudit(auditPage + 1)">下一页</button></div></div>
         </section>
@@ -2116,7 +2205,7 @@ defineExpose({ selectPatient })
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','supplemental-transcription':'重新转写确认','retranscribe-recording':'重新转写录音','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','supplemental-transcription':'重新转写确认','retranscribe-recording':'重新转写录音','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音','delete-patient':'删除患者及业务数据' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
@@ -2153,6 +2242,7 @@ defineExpose({ selectPatient })
             <div class="modal-error">{{ modalError }}</div>
           </template>
           <template v-else-if="modal === 'delete-recording'"><p>确定删除录音 <b>{{ recordingToDelete?.file_name }}</b> 吗？</p><p>删除后录音对象和相关转写链路会物理清理，且不会写入删除审计，可重新上传正确录音。</p><p>当前手工编辑的转写文本、信息提取和病历草稿会失效，需重新转写、核对并生成病历。</p><div class="modal-note">该操作只允许在接诊进行中执行；已完成接诊不能删除录音。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
+          <template v-else-if="modal === 'delete-patient'"><p>即将删除患者 <b>{{ currentPatient?.name }}</b>（患者编号 <b>{{ currentPatient?.patient_no }}</b>，{{ currentPatient?.gender || '性别未记录' }}，{{ currentPatient?.age ?? '年龄未记录' }} 岁），共包含 <b>{{ currentPatientVisitCount }}</b> 条接诊记录。</p><p>患者和所有接诊业务数据将立即物理删除，包含录音、转写、信息提取、病历、导出记录及其业务文件；既有审计日志和此次删除记录会保留。</p><div class="modal-note">此操作无法撤销。外部文件暂时无法删除时，后台会继续重试。</div><label class="confirm-check"><input v-model="deletePatientChecked" type="checkbox" /><span>我已核对患者身份和接诊数量，确认永久删除该患者的全部业务数据。</span></label><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'help'"><p><b>完整流程</b><br>开始接诊 → 上传录音 → 开始转写 → 生成病历 → 审核并签署病历 → 后端生成并下载 Word / PDF → 结束接诊。</p><p>非必填字段未提及则留空；诊疗记录仅供医生补充。</p></template>
           <template v-else><p v-if="!activity.length">接诊开始后将在这里记录业务操作。</p><p v-for="item in activity.slice(0, 12)" :key="item.time"><span class="small-muted">{{ item.time }}</span><br>{{ item.text }}</p></template>
         </div>
@@ -2165,6 +2255,7 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'retranscribe-recording'"><button class="btn" @click="modal=null">返回检查</button><button class="btn primary" aria-label="确认重新转写录音" :disabled="locked" @click="retranscribeSelectedRecording"><Icon name="refresh" />确认重新转写</button></template>
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
           <template v-else-if="modal === 'delete-recording'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="actionBusy === 'delete'" @click="deleteSelectedRecording"><Icon name="trash" />确认删除</button></template>
+          <template v-else-if="modal === 'delete-patient'"><button class="btn" @click="modal=null; deletePatientChecked=false">取消</button><button class="btn danger" :disabled="!deletePatientChecked || actionBusy === 'delete-patient'" @click="deleteSelectedPatient"><Icon name="trash" />永久删除患者</button></template>
           <template v-else><button class="btn primary" @click="modal=null"><Icon name="check" />开始使用</button></template>
         </div>
       </div>
