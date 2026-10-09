@@ -83,8 +83,7 @@ public class MedicalRecordController {
     public ResponseEntity<ByteArrayResource> previewExport(@PathVariable("visitId") UUID visitId,
                                                             @Valid @RequestBody ExportMedicalRecordRequest request,
                                                             @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        requireWrite(current);
-        byte[] bytes = service.previewExport(visitId, current.doctor().id(), request);
+        byte[] bytes = service.previewExport(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()), request);
         MediaType type = "PDF".equals(request.format()) ? MediaType.APPLICATION_PDF :
                 MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         return ResponseEntity.ok().contentType(type).body(new ByteArrayResource(bytes));

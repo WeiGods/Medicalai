@@ -403,3 +403,10 @@ body.modal-open{overflow:hidden}
   }
   .transcript-view .transcript-editor{height:auto;min-height:0;flex:1 1 0;resize:none}
 }
+
+@media(min-width:1100px){
+  .main>.full-view.export-view.department-readonly-export>.export-preview-card,
+  .main>.full-view.export-view.department-readonly-export>.export-history-card{min-height:0}
+}
+
+.export-view.department-readonly-export .export-preview-card>.template-picker{padding-bottom:16px}

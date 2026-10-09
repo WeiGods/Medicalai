@@ -1,8 +1,8 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ClinicalWorkbench from './ClinicalWorkbench.vue'
 import { api } from '../api'
-import type { ClinicalExtraction, Doctor, MedicalRecord, Patient, Recording, Transcript, Visit } from '../types'
+import type { ClinicalExtraction, Doctor, ExportTemplate, MedicalRecord, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
 
 vi.mock('../api', () => ({
   api: {
@@ -15,6 +15,9 @@ vi.mock('../api', () => ({
     confirmations: vi.fn(),
     exports: vi.fn(),
     exportTemplates: vi.fn(),
+    exportBlob: vi.fn(),
+    exportPreviewBlob: vi.fn(),
+    recordExport: vi.fn(),
     managedTemplates: vi.fn(),
     saveTranscript: vi.fn(),
     retranscribeRecording: vi.fn(),
@@ -81,6 +84,8 @@ function configure(options: {
   record?: MedicalRecord
   visit?: Visit
   visits?: Visit[]
+  exports?: RecordExport[]
+  templates?: ExportTemplate[]
 } = {}) {
   vi.mocked(api.patients).mockResolvedValue(options.patients || [patient])
   vi.mocked(api.visits).mockResolvedValue(options.visits || [options.visit || activeVisit])
@@ -89,8 +94,8 @@ function configure(options: {
   vi.mocked(api.clinicalExtraction).mockResolvedValue(pendingExtraction)
   vi.mocked(api.medicalRecord).mockResolvedValue(options.record || record())
   vi.mocked(api.confirmations).mockResolvedValue([])
-  vi.mocked(api.exports).mockResolvedValue([])
-  vi.mocked(api.exportTemplates).mockResolvedValue([])
+  vi.mocked(api.exports).mockResolvedValue(options.exports || [])
+  vi.mocked(api.exportTemplates).mockResolvedValue(options.templates || [])
   vi.mocked(api.managedTemplates).mockResolvedValue([])
 }
 
@@ -104,6 +109,10 @@ async function mountWorkbench(options?: Parameters<typeof configure>[0]) {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.stubGlobal('scrollTo', vi.fn())
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
 })
 
 describe('patient avatar colors', () => {
@@ -279,7 +288,7 @@ describe('department head read-only visit view', () => {
     await flushPromises()
 
     const tile = wrapper.get('.visit-tile')
-    expect(tile.get('.patient-tile-content').exists()).toBe(true)
+    expect(tile.find('.patient-tile-content').exists()).toBe(true)
     expect(tile.get('.patient-meta').attributes('title')).toContain(longVisit.visit_no)
     expect(tile.get('.patient-owner').attributes('title')).toContain(longVisit.doctor_name)
   })
@@ -305,7 +314,10 @@ describe('department head read-only visit view', () => {
     await wrapper.get('.step:nth-child(5)').trigger('click')
     expect(wrapper.text()).toContain('导出记录')
     expect(wrapper.text()).not.toContain('选择导出格式')
+    expect(wrapper.text()).toContain('病历预览')
+    expect(wrapper.findAll('button').some(button => button.text().includes('实时预览'))).toBe(true)
     expect(wrapper.findAll('button').some(button => button.text().includes('导出 Word'))).toBe(false)
+    expect(wrapper.findAll('button').some(button => button.text().includes('导出 PDF'))).toBe(false)
   })
 
   it('offers deletion only to a department head and confirms patient identity and visit count before calling the API', async () => {
@@ -363,6 +375,110 @@ describe('department head read-only visit view', () => {
 
     expect(wrapper.text()).toContain('业务数据已删除，文件清理中。')
     expect(api.patientDeletionStatus).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+})
+
+describe('historical export downloads and read-only previews', () => {
+  const template: ExportTemplate = {
+    id: 'template-1', template_key: 'standard', name: '标准病历', description: '标准版式', status: 'ACTIVE',
+    default_template: true, current_revision_id: 'revision-1', current_revision_no: 2,
+    updated_at: '2026-09-21T08:00:00Z'
+  }
+  const historicalExport: RecordExport = {
+    id: 'export-1', version_no: 1, template_id: template.id, template_revision_id: template.current_revision_id,
+    template_name: template.name, template_revision_no: 2, format: 'PDF', status: 'SUCCEEDED',
+    doctor_name: doctor.display_name, created_at: '2026-09-21T08:35:00Z'
+  }
+  const head: Doctor = { ...doctor, id: 'head-1', display_name: '科室长', role: 'DEPARTMENT_HEAD' }
+
+  it.each([
+    ['DOCTOR', 'PDF'], ['DOCTOR', 'DOCX'], ['DEPARTMENT_HEAD', 'PDF'], ['DEPARTMENT_HEAD', 'DOCX']
+  ])('lets %s download a historical %s even when the current version is unsigned', async (role, format) => {
+    configure({
+      record: { ...record(true), version_no: 3 },
+      visit: { ...activeVisit, status: 'COMPLETED' },
+      exports: [{ ...historicalExport, format }]
+    })
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: role === 'DOCTOR' ? doctor : head } })
+    await flushPromises()
+    await wrapper.get('.step:nth-child(5)').trigger('click')
+    const createUrl = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:historical-export')
+    const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    let fileName = ''
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      fileName = this.download
+    })
+    vi.mocked(api.exportBlob).mockResolvedValue(new Blob(['historical content']))
+
+    await wrapper.get(`button[aria-label="下载 v1.0 ${format}"]`).trigger('click')
+    await flushPromises()
+
+    expect(api.exportBlob).toHaveBeenCalledWith(historicalExport.id)
+    expect(fileName).toBe(`【20260921】测试医生_测试患者_V1.${format === 'DOCX' ? 'docx' : 'pdf'}`)
+    expect(createUrl).toHaveBeenCalledOnce()
+    expect(revokeUrl).toHaveBeenCalledWith('blob:historical-export')
+    expect(api.recordExport).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('only offers downloads for successful exports', async () => {
+    const wrapper = await mountWorkbench({
+      record: record(true, true),
+      exports: ['SUCCEEDED', 'PENDING', 'RUNNING', 'FAILED'].map((status, index) => ({
+        ...historicalExport, id: `export-${index}`, status
+      }))
+    })
+    await wrapper.get('.step:nth-child(5)').trigger('click')
+
+    expect(wrapper.findAll('.log-table button')).toHaveLength(1)
+    expect(wrapper.findAll('.log-table tbody tr')).toHaveLength(4)
+    wrapper.unmount()
+  })
+
+  it('keeps the download action available after a failed request', async () => {
+    const wrapper = await mountWorkbench({ record: record(true, true), exports: [historicalExport] })
+    await wrapper.get('.step:nth-child(5)').trigger('click')
+    vi.mocked(api.exportBlob).mockRejectedValue(new Error('文件下载失败'))
+
+    await wrapper.get('button[aria-label="下载 v1.0 PDF"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('button[aria-label="下载 v1.0 PDF"]').attributes('disabled')).toBeUndefined()
+    expect(api.recordExport).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('lets a department head preview another doctor\'s signed record with the selected template', async () => {
+    configure({ record: record(true, true), templates: [template] })
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+    await wrapper.get('.step:nth-child(5)').trigger('click')
+    vi.mocked(api.exportPreviewBlob).mockResolvedValue(new Blob(['%PDF']))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:read-only-preview')
+    const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+
+    await wrapper.get('.template-picker button').trigger('click')
+    await flushPromises()
+
+    expect(api.exportPreviewBlob).toHaveBeenCalledWith(activeVisit.id, 'PDF', template.current_revision_id)
+    expect(wrapper.get('iframe[title="PDF 预览"]').attributes('src')).toBe('blob:read-only-preview')
+    expect(wrapper.find('.export-options').exists()).toBe(false)
+    expect(wrapper.find('.bottom-bar').exists()).toBe(false)
+    expect(api.recordExport).not.toHaveBeenCalled()
+    await wrapper.get('button[aria-label="关闭预览"]').trigger('click')
+    expect(revokeUrl).toHaveBeenCalledWith('blob:read-only-preview')
+    wrapper.unmount()
+  })
+
+  it('disables template preview until the current record is signed', async () => {
+    configure({ record: record(true), templates: [template] })
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+    await wrapper.get('.step:nth-child(5)').trigger('click')
+
+    expect(wrapper.get('.template-picker button').attributes('disabled')).toBeDefined()
+    expect(api.exportPreviewBlob).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 })

@@ -1428,11 +1428,10 @@ async function waitForExport(format: 'DOCX' | 'PDF'): Promise<RecordExport | nul
   return item
 }
 
-function exportFileBaseName(exportedAt: string) {
+function exportFileBaseName(exportedAt: string, versionNo = record.value?.version_no || 1) {
   const date = formatDateTime(exportedAt).slice(0, 10).replace(/-/g, '')
-  const doctorName = (record.value?.confirmed_by_name || props.doctor.display_name).replace(/[\\/:*?"<>|]/g, '').trim()
+  const doctorName = (record.value?.confirmed_by_name || currentVisit.value?.doctor_name || props.doctor.display_name).replace(/[\\/:*?"<>|]/g, '').trim()
   const patientName = (currentPatient.value?.name || record.value?.content?.name || '').replace(/[\\/:*?"<>|]/g, '').trim()
-  const versionNo = record.value?.version_no || 1
   return `【${date}】${doctorName || '医生'}_${patientName || '患者'}_V${versionNo}`
 }
 
@@ -1443,6 +1442,21 @@ function downloadBlob(blob: Blob, format: 'DOCX' | 'PDF', fileName: string) {
   link.download = `${fileName}.${format === 'DOCX' ? 'docx' : 'pdf'}`
   link.click()
   URL.revokeObjectURL(url)
+}
+
+async function downloadHistoricalExport(item: RecordExport) {
+  const format = item.format
+  if (busy.value || item.status !== 'SUCCEEDED' || (format !== 'DOCX' && format !== 'PDF')) return
+  busy.value = true
+  try {
+    const blob = await api.exportBlob(item.id)
+    downloadBlob(blob, format, exportFileBaseName(item.created_at, item.version_no))
+    toast(`${format === 'DOCX' ? 'Word' : 'PDF'} 病历已下载。`)
+  } catch (error) {
+    toast(error instanceof Error ? error.message : '历史导出文件下载失败', 'error')
+  } finally {
+    busy.value = false
+  }
 }
 
 async function exportRecord(format: 'DOCX' | 'PDF', label: string) {
@@ -1466,10 +1480,13 @@ async function exportPdf() {
 }
 
 async function showPreview() {
-  if (!currentVisit.value || !selectedTemplate.value) return
+  if (!currentVisit.value || !selectedTemplate.value || !confirmed.value || busy.value || previewBusy.value) return
+  const visitId = currentVisit.value.id
+  const templateRevisionId = selectedTemplate.value.current_revision_id
   previewBusy.value = true
   try {
-    const blob = await api.exportPreviewBlob(currentVisit.value.id, 'PDF', selectedTemplate.value.current_revision_id)
+    const blob = await api.exportPreviewBlob(visitId, 'PDF', templateRevisionId)
+    if (currentVisit.value?.id !== visitId || selectedTemplate.value?.current_revision_id !== templateRevisionId) return
     previewFormat.value = 'PDF'
     if (previewUrl.value) {
       URL.revokeObjectURL(previewUrl.value)
@@ -1751,7 +1768,7 @@ defineExpose({ selectPatient })
 
       <div class="transcript-notices">
         <div v-if="derivedDataInvalidated && !closed && !confirmed" class="info-banner"><Icon name="info" /><span>录音或转写已更新，手工转写、信息提取和病历草稿已失效，请重新核对并生成病历后再确认。</span></div>
-        <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读查看，接诊医生：{{ currentVisit?.doctor_name || '—' }}。录音、转写、信息提取、病历和导出记录均为只读。</span></div>
+        <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" /><span>当前为只读查看，接诊医生：{{ currentVisit?.doctor_name || '—' }}。录音、转写、病历内容和导出记录均只读；已有成功的导出文件可下载。</span></div>
       </div>
       </template>
 
@@ -2134,31 +2151,31 @@ defineExpose({ selectPatient })
         </section>
       </div>
 
-      <div v-else-if="view === 'export'" class="full-view">
+      <div v-else-if="view === 'export'" class="full-view export-view" :class="{ 'department-readonly-export': readOnlyCurrentPatient }">
         <div class="info-banner"><Icon :name="confirmed ? 'shield' : 'lock'" />
           <span>{{ confirmed ? `当前可导出版本：v${record?.version_no}.0 · 签署医生：${record?.confirmed_by_name || doctor.display_name} · 签署时间：${formatDateTime(record?.confirmed_at)}` : '请先完成医生签署，签署后的版本才可以导出。' }}</span>
         </div>
-        <section v-if="!readOnlyCurrentPatient" class="card">
-          <div class="card-head"><h2><Icon name="download" />选择导出格式</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
+        <section class="card export-preview-card">
+          <div class="card-head"><h2><Icon :name="readOnlyCurrentPatient ? 'eye' : 'download'" />{{ readOnlyCurrentPatient ? '病历预览' : '选择导出格式' }}</h2><span class="small-muted">{{ record?.record_id ? `病历编号 MR-${currentVisit?.visit_no}` : '等待生成病历' }}</span></div>
           <div class="template-picker">
-            <label for="export-template">导出模板</label>
-            <select id="export-template" v-model="selectedTemplateRevisionId" :disabled="!confirmed || busy || !exportTemplates.length">
+            <label for="export-template">{{ readOnlyCurrentPatient ? '预览模板' : '导出模板' }}</label>
+            <select id="export-template" v-model="selectedTemplateRevisionId" :disabled="!confirmed || busy || previewBusy || !exportTemplates.length">
               <option v-for="t in exportTemplates" :key="t.current_revision_id" :value="t.current_revision_id">{{ t.name }}（v{{ t.current_revision_no }}）· {{ t.description }}</option>
             </select>
             <button class="btn" :disabled="!confirmed || !selectedTemplate || previewBusy || busy" @click="showPreview"><Icon name="eye" />实时预览</button>
           </div>
-          <div class="export-options">
+          <div v-if="!readOnlyCurrentPatient" class="export-options">
             <div class="export-option"><Icon name="file" /><h3>Word 文档</h3><p>统一 A4 版式、章节编号与字段标签。<br>生成 .docx 并自动归档下载。</p><button class="btn primary" :disabled="!confirmed || busy" @click="exportWord"><Icon name="download" />导出 Word</button></div>
             <div class="export-option"><Icon name="file" /><h3>PDF 文档</h3><p>统一 A4 版式、表格与页码。<br>生成 PDF 并自动归档下载。</p><button class="btn" :disabled="!confirmed || busy" @click="exportPdf"><Icon name="download" />导出 PDF</button></div>
           </div>
-          <div class="readonly-note">导出任务完成后才允许下载；只有当前确认版本可以导出。</div>
+          <div v-if="!readOnlyCurrentPatient" class="readonly-note">导出任务完成后才允许下载；只有当前确认版本可以导出。</div>
         </section>
 
-        <section class="card">
+        <section class="card export-history-card">
           <div class="card-head"><h2><Icon name="clock" />导出记录</h2><span class="small-muted">当前接诊 {{ currentVisit?.visit_no || '—' }}</span></div>
-          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>模板</th><th>格式 / 状态</th><th>操作时间</th></tr></thead><tbody>
-            <tr v-if="!exports.length"><td colspan="4">暂无导出记录</td></tr>
-            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.template_name }} · v{{ item.template_revision_no }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td></tr>
+          <div class="table-wrap"><table class="log-table"><thead><tr><th>病历版本</th><th>模板</th><th>格式 / 状态</th><th>操作时间</th><th>操作</th></tr></thead><tbody>
+            <tr v-if="!exports.length"><td colspan="5">暂无导出记录</td></tr>
+            <tr v-for="item in exports.slice().reverse()" :key="item.id"><td>v{{ item.version_no }}.0</td><td>{{ item.template_name }} · v{{ item.template_revision_no }}</td><td>{{ item.format }} · {{ exportStatusLabel(item.status) }}</td><td>{{ formatDateTime(item.created_at) }}</td><td><button v-if="item.status === 'SUCCEEDED'" class="btn small" :disabled="busy" :aria-label="`下载 v${item.version_no}.0 ${item.format}`" @click="downloadHistoricalExport(item)"><Icon name="download" />下载</button><span v-else class="small-muted">—</span></td></tr>
           </tbody></table></div>
         </section>
       </div>

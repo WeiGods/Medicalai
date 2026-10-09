@@ -637,10 +637,18 @@ public class ClinicalWorkflowService {
 
     @Transactional(readOnly = true)
     public byte[] previewExport(UUID visitId, UUID doctorId, ExportMedicalRecordRequest request) {
+        return previewExport(visitId, doctorId, DoctorRole.DOCTOR, request);
+    }
+
+    @Transactional(readOnly = true)
+    public byte[] previewExport(UUID visitId, UUID doctorId, DoctorRole role, ExportMedicalRecordRequest request) {
+        if (role == null || !role.canPreviewMedicalRecords()) {
+            throw new BusinessException(HttpStatus.FORBIDDEN, "RECORD_PREVIEW_FORBIDDEN", "当前账号无权预览病历");
+        }
         if (exportTemplates == null || exportFiles == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "EXPORT_PREVIEW_UNAVAILABLE", "导出预览服务不可用");
         }
-        Visit visit = owned(visitId, doctorId, false);
+        Visit visit = readable(visitId, doctorId, role);
         MedicalRecordVersion version = records.currentVersion(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "RECORD_REQUIRED", "请先生成病历草稿"));
         MedicalRecordMapper.ConfirmedVersion confirmed = records.currentConfirmedVersion(visit.id()).orElse(null);

@@ -22,6 +22,11 @@ public enum DoctorRole {
         return this == DOCTOR;
     }
 
+    /** 病历模板预览是只读操作，不授予临床修改或创建导出任务的权限。 */
+    public boolean canPreviewMedicalRecords() {
+        return this == DOCTOR || this == DEPARTMENT_HEAD;
+    }
+
     public boolean canUseDemoLogin() {
         return this == DOCTOR || this == DEPARTMENT_HEAD;
     }
