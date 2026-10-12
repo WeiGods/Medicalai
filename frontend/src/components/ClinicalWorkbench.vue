@@ -4,6 +4,7 @@ import { api } from '../api'
 import '../routeSelection.css'
 import Icon from './Icon.vue'
 import TemplateManagement from './TemplateManagement.vue'
+import RecordingAudioPlayer from './RecordingAudioPlayer.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
@@ -43,6 +44,13 @@ const view = ref<MainView>('workbench')
 const queueSearch = ref('')
 const patientSearchResults = ref<Patient[] | null>(null)
 const searchBusy = ref(false)
+const queueDoctorFilter = ref('')
+const queueStatusFilter = ref<'OPEN' | 'ALL' | 'WAITING' | 'ACTIVE' | 'COMPLETED'>('OPEN')
+const collapsedDoctorGroups = ref(new Set<string>())
+const queueCardsElement = ref<HTMLElement | null>(null)
+const queueHasMore = ref(false)
+const queueHiddenCount = ref(0)
+const queueScrollAcknowledged = ref(false)
 const busy = ref(false)
 const actionBusy = ref<'' | 'upload' | 'delete' | 'delete-patient' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
@@ -80,12 +88,26 @@ const newPatientForm = ref<ManualPatientForm>({ name: '', gender: '', age: null,
 const newPatientErrors = ref<Partial<Record<ManualPatientField, string>>>({})
 const dragging = ref(false)
 const playingId = ref('')
+const audioLoadingId = ref('')
+const audioIsPlaying = ref(false)
+const audioEnded = ref(false)
+const audioCurrentTime = ref(0)
+const audioMediaDuration = ref(0)
+const audioVolume = ref(1)
+const audioPlaybackRate = ref(1)
+const audioPlaybackError = ref('')
+const audioAutoplayBlocked = ref(false)
+const audioPlaybackUrl = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
+const audioElement = ref<HTMLAudioElement | null>(null)
 const modalDialog = ref<HTMLElement | null>(null)
 const activity = ref<{ time: string; text: string }[]>([])
 const recordingElapsedMs = ref(0)
 const roleReviewElements = new Map<string, HTMLElement>()
 const transcriptBody = ref<HTMLElement | null>(null)
+const recordingLevel = ref(0)
+const recordingSignalDetected = ref(false)
+const recordingSignalAvailable = ref(true)
 const avatarToneByPatientId = new Map<string, string>()
 let availableAvatarTones: string[] = []
 let lastAvatarTone = ''
@@ -94,12 +116,38 @@ let recordingStartedAt = 0
 let audioPlayer: HTMLAudioElement | null = null
 let recorder: MediaRecorder | null = null
 let recorderStream: MediaStream | null = null
+let microphoneAudioContext: AudioContext | null = null
+let microphoneAnalyser: AnalyserNode | null = null
+let microphoneMeterFrame = 0
+let recordingPeakRms = 0
 let recordChunks: Blob[] = []
 let audioObjectUrl: string | null = null
 let audioLoadAbort: AbortController | null = null
 let visitStateRevision = 0
 let patientSearchRevision = 0
+let queueResizeObserver: ResizeObserver | undefined
 const recordingState = ref<'idle' | 'recording' | 'paused'>('idle')
+const recordingSignalLabel = computed(() => {
+  if (recordingState.value === 'recording' || recordingState.value === 'paused') {
+    if (!recordingSignalAvailable.value) return '浏览器未提供麦克风电平检测；录音仍在进行。'
+    return recordingSignalDetected.value
+      ? '已检测到麦克风声音'
+      : '尚未检测到声音，请检查麦克风是否静音或选错输入设备。'
+  }
+  if (recordingElapsedMs.value && recordingSignalAvailable.value && !recordingSignalDetected.value) {
+    return '录音文件已生成，但未检测到麦克风声音；请检查输入设备后试听。'
+  }
+  return recordingElapsedMs.value ? '录音数据已生成，可以试听。' : '点击开始录音，浏览器会请求麦克风权限'
+})
+
+function recordingWaveHeight(index: number) {
+  return `${Math.max(4, Math.round(recordingLevel.value * (8 + (index * 17) % 28)))}px`
+}
+
+function setAudioElement(recordingId: string, element: HTMLAudioElement | null) {
+  if (recordingId !== playingId.value) return
+  audioElement.value = element
+}
 
 
 watch(modal, async value => {
@@ -118,6 +166,77 @@ watch(modal, async value => {
 watch(() => transcript.value?.snapshot_id, () => {
   selectedLlmRoute.value = null
 })
+
+watch(view, (next, previous) => {
+  if (next !== previous) stopAudio()
+})
+
+function updateQueueScrollState() {
+  const element = queueCardsElement.value
+  if (!element) {
+    queueHasMore.value = false
+    queueHiddenCount.value = 0
+    return
+  }
+  const hasMore = element.scrollHeight - element.clientHeight > 2
+  const bounds = element.getBoundingClientRect()
+  const groups = Array.from(element.querySelectorAll<HTMLElement>('.doctor-queue-group'))
+  const nestedLists = groups.flatMap(group => Array.from(group.querySelectorAll<HTMLElement>('.doctor-group-items')))
+  const nestedOverflow = nestedLists.some(list => list.scrollHeight - list.clientHeight > 2)
+  const hiddenGroups = new Set(groups.filter(group => {
+    const header = group.querySelector<HTMLElement>('.doctor-group-head')
+    return !!header && header.getBoundingClientRect().bottom > bounds.bottom + 1
+  }))
+  const hiddenCount = hasMore ? groups.reduce((count, group) => hiddenGroups.has(group)
+    ? count + Number(group.dataset.visitCount || 0) : count, 0)
+    + Array.from(element.querySelectorAll<HTMLElement>('.patient-tile')).filter(tile =>
+      !hiddenGroups.has(tile.closest<HTMLElement>('.doctor-queue-group') as HTMLElement)
+      && tile.getBoundingClientRect().bottom > bounds.bottom + 1).length : 0
+  const nestedHiddenCount = nestedLists.reduce((count, list) => {
+    if (list.scrollHeight - list.clientHeight <= 2) return count
+    return count + Array.from(list.querySelectorAll<HTMLElement>('.patient-tile'))
+      .filter(tile => tile.getBoundingClientRect().bottom > list.getBoundingClientRect().bottom + 1).length
+  }, 0)
+  queueHiddenCount.value = hiddenCount + nestedHiddenCount
+  queueHasMore.value = (hasMore && hiddenCount > 0) || (nestedOverflow && nestedHiddenCount > 0)
+}
+
+function onQueueScroll() {
+  updateQueueScrollState()
+  queueScrollAcknowledged.value = true
+}
+
+function scrollQueueFurther() {
+  const element = queueCardsElement.value
+  if (!element) return
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  const visibleNestedList = Array.from(element.querySelectorAll<HTMLElement>('.doctor-group-items'))
+    .find(list => list.scrollHeight - list.clientHeight > 2
+      && list.getBoundingClientRect().bottom > element.getBoundingClientRect().top
+      && list.getBoundingClientRect().top < element.getBoundingClientRect().bottom)
+  if (visibleNestedList) {
+    visibleNestedList.scrollBy({ top: Math.max(150, visibleNestedList.clientHeight * 0.72), behavior: reduceMotion ? 'auto' : 'smooth' })
+    return
+  }
+  element.scrollBy({ top: Math.max(180, element.clientHeight * 0.72), behavior: reduceMotion ? 'auto' : 'smooth' })
+}
+
+watch(queueCardsElement, async element => {
+  queueResizeObserver?.disconnect()
+  queueResizeObserver = undefined
+  if (!element) return
+  if (typeof ResizeObserver !== 'undefined') {
+    queueResizeObserver = new ResizeObserver(updateQueueScrollState)
+    queueResizeObserver.observe(element)
+  }
+  await nextTick()
+  updateQueueScrollState()
+})
+watch(() => [patients.value, visits.value, patientSearchResults.value, view.value, queueDoctorFilter.value, queueStatusFilter.value, collapsedDoctorGroups.value], async () => {
+  queueScrollAcknowledged.value = false
+  await nextTick()
+  updateQueueScrollState()
+}, { flush: 'post' })
 
 const titles: Record<MainView, [string, string]> = {
   workbench: ['接诊工作台', '从医患对话到结构化病历，让每一次接诊更从容。'],
@@ -186,6 +305,21 @@ function patientStatus(patientId: string) {
 function statusClass(visit: Visit | null) {
   const status = visit?.status || 'WAITING'
   return ({ WAITING: 'waiting', ACTIVE: 'active', COMPLETED: 'completed', CANCELLED: 'cancelled', ARCHIVED: 'archived' } as Record<string, string>)[status] || 'waiting'
+}
+
+function visitActivityTime(visit: Visit) {
+  return String(visit.last_activity_at || visit.created_at || '')
+}
+
+function visitStatusPriority(status: string) {
+  return status === 'ACTIVE' ? 0 : status === 'WAITING' ? 1 : status === 'COMPLETED' ? 2 : 3
+}
+
+function toggleDoctorGroup(doctorId: string) {
+  const next = new Set(collapsedDoctorGroups.value)
+  if (next.has(doctorId)) next.delete(doctorId)
+  else next.add(doctorId)
+  collapsedDoctorGroups.value = next
 }
 
 function exportStatusLabel(status: string) {
@@ -263,7 +397,44 @@ const queueVisitRows = computed(() => {
     .filter(visit => visit.status !== 'CANCELLED' && allowedPatients.has(visit.patient_id))
     .map(visit => ({ visit, patient: patientById.get(visit.patient_id) }))
     .filter((item): item is { visit: Visit; patient: Patient } => !!item.patient)
-    .sort((a, b) => String(b.visit.last_activity_at || b.visit.created_at).localeCompare(String(a.visit.last_activity_at || a.visit.created_at)))
+    .sort((a, b) => visitStatusPriority(a.visit.status) - visitStatusPriority(b.visit.status)
+      || visitActivityTime(b.visit).localeCompare(visitActivityTime(a.visit)))
+})
+const queueDoctorOptions = computed(() => {
+  const doctors = new Map<string, string>()
+  for (const { visit } of queueVisitRows.value) {
+    doctors.set(visit.doctor_id, visit.doctor_name || '未标记医生')
+  }
+  return [...doctors.entries()].sort((a, b) => a[1].localeCompare(b[1], 'zh-CN'))
+})
+const selectedQueueVisitRows = computed(() => queueVisitRows.value.filter(({ visit }) =>
+  !queueDoctorFilter.value || visit.doctor_id === queueDoctorFilter.value))
+const filteredQueueVisitRows = computed(() => selectedQueueVisitRows.value.filter(({ visit }) => {
+  if (queueStatusFilter.value === 'OPEN') return visit.status === 'ACTIVE' || visit.status === 'WAITING'
+  if (queueStatusFilter.value === 'ALL') return true
+  return visit.status === queueStatusFilter.value
+}))
+const queueDoctorGroups = computed(() => {
+  const groups = new Map<string, { id: string; name: string; rows: typeof filteredQueueVisitRows.value; active: number; waiting: number; completed: number; latest: string }>()
+  for (const row of filteredQueueVisitRows.value) {
+    const id = row.visit.doctor_id || 'unknown'
+    let group = groups.get(id)
+    if (!group) {
+      group = { id, name: row.visit.doctor_name || '未标记医生', rows: [], active: 0, waiting: 0, completed: 0, latest: '' }
+      groups.set(id, group)
+    }
+    group.rows.push(row)
+    if (row.visit.status === 'ACTIVE') group.active += 1
+    if (row.visit.status === 'WAITING') group.waiting += 1
+    if (row.visit.status === 'COMPLETED') group.completed += 1
+    group.latest = group.latest > visitActivityTime(row.visit) ? group.latest : visitActivityTime(row.visit)
+  }
+  return [...groups.values()].map(group => ({
+    ...group,
+    rows: group.rows.sort((a, b) => visitStatusPriority(a.visit.status) - visitStatusPriority(b.visit.status)
+      || visitActivityTime(b.visit).localeCompare(visitActivityTime(a.visit)))
+  })).sort((a, b) => (b.active + b.waiting) - (a.active + a.waiting) || b.latest.localeCompare(a.latest)
+    || a.name.localeCompare(b.name, 'zh-CN'))
 })
 const recentVisits = computed(() => {
   const patientById = new Map(patients.value.map(patient => [patient.id, patient]))
@@ -347,9 +518,11 @@ const waitingCount = computed(() => patients.value.filter(patient => {
 const openVisitCount = computed(() => patients.value.filter(patient => ['ACTIVE', 'WAITING'].includes(patientVisit(patient.id)?.status || '')).length)
 const completedCount = computed(() => patients.value.filter(patient => patientVisit(patient.id)?.status === 'COMPLETED').length)
 const queueCount = computed(() => departmentHead.value ? queueVisitRows.value.length : patients.value.length)
-const queueWaitingCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'WAITING').length : waitingCount.value)
-const queueActiveCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'ACTIVE').length : activeCount.value)
-const queueCompletedCount = computed(() => departmentHead.value ? queueVisitRows.value.filter(row => row.visit.status === 'COMPLETED').length : completedCount.value)
+const queueDisplayedCount = computed(() => departmentHead.value && queueStatusFilter.value === 'OPEN' ? queueOpenCount.value : queueCount.value)
+const queueWaitingCount = computed(() => departmentHead.value ? selectedQueueVisitRows.value.filter(row => row.visit.status === 'WAITING').length : waitingCount.value)
+const queueActiveCount = computed(() => departmentHead.value ? selectedQueueVisitRows.value.filter(row => row.visit.status === 'ACTIVE').length : activeCount.value)
+const queueCompletedCount = computed(() => departmentHead.value ? selectedQueueVisitRows.value.filter(row => row.visit.status === 'COMPLETED').length : completedCount.value)
+const queueOpenCount = computed(() => queueWaitingCount.value + queueActiveCount.value)
 const missingFields = computed(() => {
   const content = recordForm.value
   if (!content) return []
@@ -411,7 +584,7 @@ const formatDuration = (ms: number | null) => {
 const formatRecordingDuration = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 const formatTime = (ms: number) => `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 const visitDate = computed(() => currentVisit.value ? formatDateTime(currentVisit.value.created_at).slice(0, 10) : formatDateTime(new Date()).slice(0, 10))
-const isPlaying = (item: Recording) => playingId.value === item.id
+const isAudioLoading = (item: Recording) => audioLoadingId.value === item.id
 function nextAvatarTone() {
   if (!availableAvatarTones.length) {
     availableAvatarTones = [...AVATAR_TONES]
@@ -452,7 +625,9 @@ async function refreshCore(keepSelection = true) {
   visits.value = visitList
   if (departmentHead.value) {
     const selectedVisit = keepSelection ? visitList.find(visit => visit.id === selectedVisitId.value) : null
-    const nextVisit = selectedVisit || visitList.find(visit => visit.status !== 'CANCELLED') || visitList[0]
+    const prioritizedVisits = visitList.filter(visit => visit.status !== 'CANCELLED').slice().sort((a, b) =>
+      visitStatusPriority(a.status) - visitStatusPriority(b.status) || visitActivityTime(b).localeCompare(visitActivityTime(a)))
+    const nextVisit = selectedVisit || prioritizedVisits[0] || visitList[0]
     selectedVisitId.value = nextVisit?.id || ''
     selectedPatientId.value = nextVisit?.patient_id || ''
   } else if (!keepSelection || !patientList.some(p => p.id === selectedPatientId.value)) {
@@ -593,7 +768,10 @@ async function searchPatients() {
   try {
     const results = await api.patients(queueSearch.value.trim())
     // 连续搜索时仅展示最后一次请求的结果，避免慢请求覆盖较新的查询。
-    if (revision === patientSearchRevision) patientSearchResults.value = results
+    if (revision === patientSearchRevision) {
+      patientSearchResults.value = results
+      if (departmentHead.value) queueDoctorFilter.value = ''
+    }
   } catch (error) {
     toast(error instanceof Error ? error.message : '患者搜索失败', 'error')
   } finally {
@@ -882,7 +1060,7 @@ async function audioDuration(file: File, fallbackDuration = 0) {
 }
 
 async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0, source: 'pick' | 'recorder' = 'pick') {
-  if (!currentVisit.value || locked.value) return
+  if (!currentVisit.value || locked.value) return false
   const accepted = new Set<File>()
   for (const file of Array.from(files || [])) {
     if (!RECORDING_EXTENSION_PATTERN.test(file.name)) {
@@ -901,7 +1079,8 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
     }
     accepted.add(file)
   }
-  if (!accepted.size) return
+  if (!accepted.size) return false
+  let uploaded = false
   for (const file of Array.from(files || [])) {
     if (!accepted.has(file)) continue
     const duration = await audioDuration(file, fallbackDuration)
@@ -912,6 +1091,7 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
     actionBusy.value = 'upload'
     try {
       await api.uploadRecording(currentVisit.value.id, file, duration)
+      uploaded = true
       addLog(`上传录音：${file.name}`)
     } catch (error) {
       toast(error instanceof Error ? error.message : '上传失败', 'error')
@@ -920,6 +1100,7 @@ async function uploadFiles(files: FileList | File[] | null, fallbackDuration = 0
   actionBusy.value = ''
   await loadAll(true)
   if (view.value === 'workbench') toast('录音已上传，可开始转写。')
+  return uploaded
 }
 
 async function handlePickedFiles(event: Event) {
@@ -1200,6 +1381,56 @@ function resetRecordingTimer() {
   recordingStartedAt = 0
 }
 
+async function startMicrophoneMeter(stream: MediaStream) {
+  stopMicrophoneMeter()
+  recordingSignalAvailable.value = true
+  try {
+    const context = new AudioContext()
+    const analyser = context.createAnalyser()
+    analyser.fftSize = 512
+    const source = context.createMediaStreamSource(stream)
+    source.connect(analyser)
+    microphoneAudioContext = context
+    microphoneAnalyser = analyser
+    await context.resume()
+    if (context.state !== 'running') throw new Error('麦克风电平检测未启动')
+    const samples = new Uint8Array(analyser.fftSize)
+    const updateLevel = () => {
+      if (microphoneAnalyser !== analyser || recordingState.value === 'idle') return
+      if (recordingState.value === 'paused' || recorder?.state !== 'recording') {
+        microphoneMeterFrame = window.requestAnimationFrame(updateLevel)
+        return
+      }
+      analyser.getByteTimeDomainData(samples)
+      let sumSquares = 0
+      for (const sample of samples) {
+        const normalized = (sample - 128) / 128
+        sumSquares += normalized * normalized
+      }
+      const rms = Math.sqrt(sumSquares / samples.length)
+      recordingPeakRms = Math.max(recordingPeakRms, rms)
+      recordingLevel.value = Math.min(1, rms * 16)
+      if (rms >= 0.003) recordingSignalDetected.value = true
+      microphoneMeterFrame = window.requestAnimationFrame(updateLevel)
+    }
+    updateLevel()
+  } catch {
+    recordingSignalAvailable.value = false
+    microphoneAnalyser = null
+    if (microphoneAudioContext) void microphoneAudioContext.close().catch(() => undefined)
+    microphoneAudioContext = null
+  }
+}
+
+function stopMicrophoneMeter() {
+  if (microphoneMeterFrame) window.cancelAnimationFrame(microphoneMeterFrame)
+  microphoneMeterFrame = 0
+  microphoneAnalyser = null
+  if (microphoneAudioContext) void microphoneAudioContext.close().catch(() => undefined)
+  microphoneAudioContext = null
+  recordingLevel.value = 0
+}
+
 async function startRecording() {
   if (!currentVisit.value || locked.value) return
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -1209,6 +1440,10 @@ async function startRecording() {
   try {
     recorderStream = await navigator.mediaDevices.getUserMedia({ audio: true })
     recordChunks = []
+    recordingSignalDetected.value = false
+    recordingSignalAvailable.value = true
+    recordingLevel.value = 0
+    recordingPeakRms = 0
     const supportedMimeType = [
       'audio/webm;codecs=opus',
       'audio/webm',
@@ -1218,8 +1453,9 @@ async function startRecording() {
       ? new MediaRecorder(recorderStream, { mimeType: supportedMimeType })
       : new MediaRecorder(recorderStream)
     recorder.ondataavailable = event => { if (event.data.size) recordChunks.push(event.data) }
-    recorder.onstop = () => {
+    recorder.onstop = async () => {
       pauseRecordingTimer()
+      stopMicrophoneMeter()
       recorderStream?.getTracks().forEach(track => track.stop())
       recorderStream = null
       recordingState.value = 'idle'
@@ -1227,13 +1463,22 @@ async function startRecording() {
       const extension = type.includes('mp4') ? 'm4a' : 'webm'
       const file = new File([new Blob(recordChunks, { type })], `${currentPatient.value?.name || '问诊'}_浏览器录音.${extension}`, { type })
       recorder = null
-      if (file.size) uploadFiles([file], recordingElapsedMs.value, 'recorder')
+      if (!file.size) {
+        toast('录音结束，但浏览器没有生成音频数据；请检查麦克风权限后重试。', 'error')
+        return
+      }
+      const uploaded = await uploadFiles([file], recordingElapsedMs.value, 'recorder')
+      if (uploaded && recordingSignalAvailable.value && recordingPeakRms < 0.003) {
+        toast('录音文件已上传，但采集时没有检测到麦克风声音；请检查麦克风输入或静音设置。', 'error')
+      }
     }
     recorder.start()
     recordingElapsedMs.value = 0
     recordingState.value = 'recording'
     startRecordingTimer()
+    void startMicrophoneMeter(recorderStream)
   } catch {
+    stopMicrophoneMeter()
     recorderStream?.getTracks().forEach(track => track.stop())
     recorderStream = null
     recorder = null
@@ -1518,49 +1763,154 @@ async function exportFromBottom() {
 }
 
 async function playRecording(item: Recording) {
-  if (!item.audio_url) return
-  if (playingId.value === item.id) {
+  if (!item.audio_url || audioLoadingId.value === item.id) return
+  if (playingId.value !== item.id) {
     stopAudio()
+    playingId.value = item.id
+    audioVolume.value = 1
+    audioPlaybackRate.value = 1
+  }
+
+  audioPlaybackError.value = ''
+  audioAutoplayBlocked.value = false
+  if (!audioPlaybackUrl.value) {
+    await loadRecordingAudio(item)
     return
   }
-  stopAudio()
-  playingId.value = item.id
+
+  const player = audioPlayer
+  if (!player) return
+  try {
+    if (audioEnded.value || player.ended) {
+      player.currentTime = 0
+      audioCurrentTime.value = 0
+      audioEnded.value = false
+    }
+    if (player.paused) await player.play()
+    else player.pause()
+  } catch (error) {
+    handleAudioPlayError(item, error)
+  }
+}
+
+async function loadRecordingAudio(item: Recording) {
+  if (audioLoadAbort || !item.audio_url) return
   const controller = new AbortController()
   audioLoadAbort = controller
+  audioLoadingId.value = item.id
+  audioPlaybackError.value = ''
   try {
-  // 音频端点需要鉴权。先获取字节可附加 Bearer Token，原生 Audio(src) 请求无法做到。
+    // The protected audio endpoint needs a Bearer header, so fetch the blob before playback.
     const blob = await api.audioBlob(item.id, controller.signal)
     if (controller.signal.aborted || playingId.value !== item.id) return
+    if (!blob.size) throw new Error('服务端返回了空音频文件。')
+    if (blob.type && !blob.type.startsWith('audio/')) {
+      throw new Error(`服务端返回的文件类型不是音频（${blob.type}）。`)
+    }
     audioObjectUrl = URL.createObjectURL(blob)
-    const player = new Audio(audioObjectUrl)
+    audioPlaybackUrl.value = audioObjectUrl
+    await nextTick()
+    if (controller.signal.aborted || playingId.value !== item.id) return
+    const player = audioElement.value
+    if (!player) throw new Error('音频播放器未能加载。')
     player.preload = 'auto'
+    player.volume = audioVolume.value
+    player.playbackRate = audioPlaybackRate.value
     audioPlayer = player
-    player.onended = () => {
-      if (audioPlayer === player) stopAudio()
+    try {
+      await player.play()
+    } catch (error) {
+      handleAudioPlayError(item, error)
     }
-    player.onerror = () => {
-      if (audioPlayer !== player) return
-      const mediaError = player.error
-      console.warn('[audio] playback failed', {
-        recordingId: item.id,
-        code: mediaError?.code,
-        message: mediaError?.message,
-        blobType: blob.type,
-        blobSize: blob.size
-      })
-      stopAudio()
-      toast('音频无法播放，请检查录音格式或后端音频接口。', 'error')
-    }
-    await player.play()
   } catch (error) {
     if (controller.signal.aborted) return
     console.warn('[audio] audio request failed', { recordingId: item.id, error })
-    if (playingId.value === item.id) {
-      stopAudio()
-      toast(error instanceof Error ? error.message : '音频无法播放。', 'error')
-    }
+    audioPlaybackError.value = error instanceof Error ? error.message : '音频加载失败，请重试。'
   } finally {
     if (audioLoadAbort === controller) audioLoadAbort = null
+    if (audioLoadingId.value === item.id) audioLoadingId.value = ''
+  }
+}
+
+function handleAudioPlayError(item: Recording, error: unknown) {
+  if (error instanceof DOMException && error.name === 'NotAllowedError') {
+    audioAutoplayBlocked.value = true
+    return
+  }
+  audioPlaybackError.value = error instanceof Error ? error.message : '浏览器无法播放此音频，请重试。'
+  console.warn('[audio] playback failed', { recordingId: item.id, error })
+}
+
+function updateAudioTime(currentTime: number, duration: number) {
+  if (Number.isFinite(currentTime)) audioCurrentTime.value = Math.max(0, currentTime)
+  if (Number.isFinite(duration) && duration > 0) audioMediaDuration.value = duration
+}
+
+function seekAudio(time: number) {
+  if (!audioPlayer || !Number.isFinite(time)) return
+  audioPlayer.currentTime = Math.max(0, Math.min(time, audioPlayer.duration || time))
+  audioCurrentTime.value = audioPlayer.currentTime
+  audioEnded.value = false
+}
+
+function setAudioVolume(volume: number) {
+  audioVolume.value = Math.max(0, Math.min(1, volume))
+  if (audioPlayer) audioPlayer.volume = audioVolume.value
+}
+
+function setAudioPlaybackRate(rate: number) {
+  const allowedRates = [1, 1.25, 1.5, 2]
+  audioPlaybackRate.value = allowedRates.includes(rate) ? rate : 1
+  if (audioPlayer) audioPlayer.playbackRate = audioPlaybackRate.value
+}
+
+function onAudioPlaying() {
+  audioIsPlaying.value = true
+  audioEnded.value = false
+  audioPlaybackError.value = ''
+  audioAutoplayBlocked.value = false
+}
+
+function onAudioPaused() {
+  audioIsPlaying.value = false
+}
+
+function onAudioEnded() {
+  audioIsPlaying.value = false
+  audioEnded.value = true
+  if (audioMediaDuration.value > 0) audioCurrentTime.value = audioMediaDuration.value
+}
+
+function onAudioMediaError() {
+  if (!audioPlayer?.error) return
+  const mediaError = audioPlayer.error
+  audioPlaybackError.value = `浏览器无法解码此音频（${mediaError.message || `错误 ${mediaError.code}`}），请重试。`
+  console.warn('[audio] media decode failed', {
+    recordingId: playingId.value,
+    code: mediaError.code,
+    message: mediaError.message
+  })
+}
+
+async function retryAudio(item: Recording) {
+  if (!audioPlaybackUrl.value) {
+    await loadRecordingAudio(item)
+    return
+  }
+  audioPlaybackError.value = ''
+  audioAutoplayBlocked.value = false
+  if (!audioPlayer) return
+  try {
+    if (audioPlayer.error) {
+      audioPlayer.pause()
+      audioPlayer.currentTime = 0
+      audioPlayer.load()
+    } else if (audioPlayer.ended) {
+      audioPlayer.currentTime = 0
+    }
+    await audioPlayer.play()
+  } catch (error) {
+    handleAudioPlayError(item, error)
   }
 }
 
@@ -1569,7 +1919,6 @@ function stopAudio() {
   audioLoadAbort = null
   if (audioPlayer) {
     audioPlayer.pause()
-    audioPlayer.onended = null
     audioPlayer.onerror = null
     audioPlayer.removeAttribute('src')
     audioPlayer.load()
@@ -1577,6 +1926,17 @@ function stopAudio() {
   if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl)
   audioObjectUrl = null
   audioPlayer = null
+  audioElement.value = null
+  audioLoadingId.value = ''
+  audioIsPlaying.value = false
+  audioEnded.value = false
+  audioCurrentTime.value = 0
+  audioMediaDuration.value = 0
+  audioVolume.value = 1
+  audioPlaybackRate.value = 1
+  audioPlaybackError.value = ''
+  audioAutoplayBlocked.value = false
+  audioPlaybackUrl.value = ''
   playingId.value = ''
 }
 
@@ -1584,6 +1944,7 @@ function stopRecorder() {
   pauseRecordingTimer()
   if (recorder && recorder.state !== 'inactive') recorder.stop()
   else {
+    stopMicrophoneMeter()
     recorderStream?.getTracks().forEach(track => track.stop())
     recorderStream = null
     recorder = null
@@ -1613,6 +1974,7 @@ onUnmounted(() => {
   stopRecorder()
   resetRecordingTimer()
   if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
+  queueResizeObserver?.disconnect()
   document.body.classList.remove('modal-open')
 })
 
@@ -1681,27 +2043,49 @@ defineExpose({ selectPatient })
       <template v-if="view !== 'audit' && view !== 'templates'">
       <section class="card queue">
         <div class="queue-head">
-          <div class="queue-title"><Icon name="users" />{{ departmentHead ? '全院接诊' : '今日接诊' }} <span class="badge">{{ queueCount }} 条</span>
+          <div class="queue-title"><Icon name="users" />{{ departmentHead ? '全院接诊' : '今日接诊' }} <span class="badge">{{ queueDisplayedCount }} 条</span>
             <div class="queue-stats"><span>待接诊 <b>{{ String(queueWaitingCount).padStart(2, '0') }}</b></span><i></i><span>接诊中 <b>{{ String(queueActiveCount).padStart(2, '0') }}</b></span><i></i><span>已完成 <b>{{ String(queueCompletedCount).padStart(2, '0') }}</b></span></div>
           </div>
           <div class="queue-search-wrap">
-            <input v-model="queueSearch" class="queue-search" placeholder="搜索姓名或编号" @keydown.enter.prevent="searchPatients" />
+            <input v-model="queueSearch" class="queue-search" placeholder="搜索患者姓名或编号" @keydown.enter.prevent="searchPatients" />
             <button type="button" class="btn small" :disabled="searchBusy" @click="searchPatients">{{ searchBusy ? '搜索中' : '搜索' }}</button>
+          </div>
+          <div v-if="departmentHead" class="queue-filters" aria-label="全院接诊筛选">
+            <select v-model="queueDoctorFilter" aria-label="按接诊医生筛选">
+              <option value="">全部医生</option>
+              <option v-for="[doctorId, doctorName] in queueDoctorOptions" :key="doctorId" :value="doctorId">{{ doctorName }}</option>
+            </select>
+            <select v-model="queueStatusFilter" aria-label="按接诊状态筛选">
+              <option value="OPEN">待处理（{{ queueOpenCount }}）</option>
+              <option value="ACTIVE">接诊中（{{ queueActiveCount }}）</option>
+              <option value="WAITING">待接诊（{{ queueWaitingCount }}）</option>
+              <option value="COMPLETED">已完成（{{ queueCompletedCount }}）</option>
+              <option value="ALL">全部记录（{{ selectedQueueVisitRows.length }}）</option>
+            </select>
           </div>
           <button v-if="!departmentHead" class="queue-add" :disabled="busy" @click="openNewPatientModal"><Icon name="plus" />新增患者</button>
         </div>
-        <div class="queue-cards">
+        <div ref="queueCardsElement" class="queue-cards" @scroll.capture.passive="onQueueScroll">
           <template v-if="departmentHead">
-          <button v-for="row in queueVisitRows" :key="row.visit.id" class="patient-tile visit-tile" :class="{ selected: row.visit.id === selectedVisitId }" @click="selectVisit(row.visit.id, row.patient.id)">
+          <div v-for="group in queueDoctorGroups" :key="group.id" class="doctor-queue-group" :data-visit-count="group.rows.length" :class="{ collapsed: collapsedDoctorGroups.has(group.id) }">
+          <button type="button" class="doctor-group-head" :aria-expanded="!collapsedDoctorGroups.has(group.id)" @click="toggleDoctorGroup(group.id)">
+            <span class="doctor-group-avatar">{{ group.name[0] || '医' }}</span>
+            <span class="doctor-group-name"><b>{{ group.name }}</b><small>{{ group.rows.length }} 条接诊 · 最近更新 {{ formatDateTime(group.latest) }}</small></span>
+            <span class="doctor-group-counts"><em v-if="group.active" class="active-count">接诊中 {{ group.active }}</em><em v-if="group.waiting" class="waiting-count">待接诊 {{ group.waiting }}</em><em v-if="group.completed" class="completed-count">已完成 {{ group.completed }}</em><span class="doctor-group-chevron">⌄</span></span>
+          </button>
+          <div v-if="!collapsedDoctorGroups.has(group.id)" class="doctor-group-items">
+          <button v-for="row in group.rows" :key="row.visit.id" class="patient-tile visit-tile" :class="{ selected: row.visit.id === selectedVisitId }" @click="selectVisit(row.visit.id, row.patient.id)">
             <span class="avatar" :class="avatarClass(row.patient)">{{ row.patient.name[0] }}</span>
             <span class="patient-tile-content">
               <span class="patient-name"><b>{{ row.patient.name }}</b><span>{{ row.patient.gender }} · {{ row.patient.age ?? '—' }} 岁</span></span>
               <span class="patient-meta" :title="`接诊编号 ${row.visit.visit_no || '—'}`">接诊编号 <strong>{{ row.visit.visit_no || '—' }}</strong></span>
-              <span class="patient-owner" :title="`接诊医生：${row.visit.doctor_name || '—'}`">接诊医生：{{ row.visit.doctor_name || '—' }}</span>
               <span class="patient-owner" :title="`最近更新：${formatDateTime(row.visit.last_activity_at || row.visit.created_at)}`">最近更新：{{ formatDateTime(row.visit.last_activity_at || row.visit.created_at) }}</span>
             </span>
             <span class="tile-status" :class="statusClass(row.visit)">{{ statusText(row.visit) }}</span>
           </button>
+          </div>
+          </div>
+          <div v-if="!queueDoctorGroups.length" class="queue-filter-empty"><Icon name="search" /><b>{{ queueStatusFilter === 'OPEN' ? '暂无待处理接诊' : '暂无匹配接诊' }}</b><span>可切换状态或清除筛选后查看其他记录</span></div>
           </template>
           <template v-else>
           <button v-for="patient in queuePatients" :key="patient.id" class="patient-tile" :class="{ selected: patient.id === selectedPatientId }" @click="selectPatient(patient.id)">
@@ -1720,9 +2104,15 @@ defineExpose({ selectPatient })
             </span>
           </button>
           </template>
-          <div v-if="(departmentHead ? !queueVisitRows.length : !queuePatients.length)" class="small-muted">暂无匹配接诊记录</div>
+          <div v-if="!departmentHead && !queuePatients.length" class="small-muted">暂无匹配接诊记录</div>
         </div>
-        <div class="queue-load-more">{{ (departmentHead ? queueVisitRows.length : queuePatients.length) > 6 ? '向下滚动查看更多' : '' }}</div>
+        <Transition name="queue-hint">
+          <div v-if="queueHasMore && !queueScrollAcknowledged" class="queue-load-more">
+            <button type="button" :aria-label="`继续向下浏览，约还有 ${queueHiddenCount} 条`" @click="scrollQueueFurther">
+              <span>继续向下浏览</span><small>约还有 {{ queueHiddenCount }} 条</small><Icon name="arrow-down" />
+            </button>
+          </div>
+        </Transition>
       </section>
 
       <section class="patient-summary">
@@ -1826,11 +2216,34 @@ defineExpose({ selectPatient })
                   <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
-                <div v-if="item.status !== 'PROCESSING'" class="audio-player">
-                  <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
-                  <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
-                </div>
+                <RecordingAudioPlayer
+                  v-if="item.status !== 'PROCESSING'"
+                  :recording="item"
+                  :active="playingId === item.id"
+                  :loading="isAudioLoading(item)"
+                  :loaded="playingId === item.id && !!audioPlaybackUrl"
+                  :playing="playingId === item.id && audioIsPlaying"
+                  :ended="playingId === item.id && audioEnded"
+                  :src="playingId === item.id ? audioPlaybackUrl : ''"
+                  :current-time="playingId === item.id ? audioCurrentTime : 0"
+                  :actual-duration="playingId === item.id ? audioMediaDuration : 0"
+                  :volume="playingId === item.id ? audioVolume : 1"
+                  :playback-rate="playingId === item.id ? audioPlaybackRate : 1"
+                  :error="playingId === item.id ? audioPlaybackError : ''"
+                  :autoplay-blocked="playingId === item.id && audioAutoplayBlocked"
+                  @toggle="playRecording(item)"
+                  @retry="retryAudio(item)"
+                  @seek="seekAudio"
+                  @volume="setAudioVolume"
+                  @rate="setAudioPlaybackRate"
+                  @audio-element="setAudioElement(item.id, $event)"
+                  @time-update="updateAudioTime"
+                  @loaded-metadata="updateAudioTime(audioCurrentTime, $event)"
+                  @playing="onAudioPlaying"
+                  @paused="onAudioPaused"
+                  @ended="onAudioEnded"
+                  @media-error="onAudioMediaError"
+                />
               </div>
               <div v-if="recordings.length" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
@@ -1992,8 +2405,8 @@ defineExpose({ selectPatient })
                   <div class="recorder-card-head"><div class="method-heading"><span class="method-icon recorder-method-icon"><Icon name="mic" /></span><div><h3>网页录音</h3><p>直接使用当前设备麦克风</p></div></div><span class="recorder-state-badge" :class="`state-${recordingState}`"><i></i>{{ actionBusy === 'upload' ? '正在保存' : recordingStateLabel }}</span></div>
                   <div class="recorder-live" :class="`state-${recordingState}`">
                     <div class="recorder-timer">{{ recordingTimeLabel }}</div>
-                    <div class="live-waveform" :aria-label="recordingStateLabel" role="img"><i v-for="n in 36" :key="n" :style="{ '--wave-delay': `${(n % 9) * 0.08}s`, '--wave-height': `${12 + ((n * 17) % 28)}px` }"></i></div>
-                    <p>{{ recordingState === 'recording' ? '正在采集麦克风声音…' : recordingState === 'paused' ? '录音已暂停，点击继续录音' : recordingElapsedMs ? '录音已结束，可重新录制' : '点击开始录音，浏览器会请求麦克风权限' }}</p>
+                    <div class="live-waveform" :aria-label="recordingSignalLabel" role="img"><i v-for="n in 36" :key="n" :style="{ height: recordingWaveHeight(n), opacity: recordingSignalDetected ? 1 : 0.3 }"></i></div>
+                    <p>{{ recordingState === 'paused' ? '录音已暂停，点击继续录音' : recordingSignalLabel }}</p>
                   </div>
                   <div class="record-controls recorder-controls">
                     <button class="btn recorder-main-btn" :class="{ primary: recordingState === 'idle', soft: recordingState === 'paused' }" :disabled="locked || actionBusy === 'upload'" @click="recordingState === 'idle' ? startRecording() : resumeRecording()"><Icon :name="recordingState === 'recording' ? 'pause' : recordingState === 'paused' ? 'play' : 'mic'" />{{ recordingState === 'recording' ? '暂停录音' : recordingState === 'paused' ? '继续录音' : '开始录音' }}</button>
@@ -2012,11 +2425,34 @@ defineExpose({ selectPatient })
                   <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
-                <div v-if="item.status !== 'PROCESSING'" class="audio-player">
-                  <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
-                  <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
-                </div>
+                <RecordingAudioPlayer
+                  v-if="item.status !== 'PROCESSING'"
+                  :recording="item"
+                  :active="playingId === item.id"
+                  :loading="isAudioLoading(item)"
+                  :loaded="playingId === item.id && !!audioPlaybackUrl"
+                  :playing="playingId === item.id && audioIsPlaying"
+                  :ended="playingId === item.id && audioEnded"
+                  :src="playingId === item.id ? audioPlaybackUrl : ''"
+                  :current-time="playingId === item.id ? audioCurrentTime : 0"
+                  :actual-duration="playingId === item.id ? audioMediaDuration : 0"
+                  :volume="playingId === item.id ? audioVolume : 1"
+                  :playback-rate="playingId === item.id ? audioPlaybackRate : 1"
+                  :error="playingId === item.id ? audioPlaybackError : ''"
+                  :autoplay-blocked="playingId === item.id && audioAutoplayBlocked"
+                  @toggle="playRecording(item)"
+                  @retry="retryAudio(item)"
+                  @seek="seekAudio"
+                  @volume="setAudioVolume"
+                  @rate="setAudioPlaybackRate"
+                  @audio-element="setAudioElement(item.id, $event)"
+                  @time-update="updateAudioTime"
+                  @loaded-metadata="updateAudioTime(audioCurrentTime, $event)"
+                  @playing="onAudioPlaying"
+                  @paused="onAudioPaused"
+                  @ended="onAudioEnded"
+                  @media-error="onAudioMediaError"
+                />
               </div>
               <div v-if="recordings.length && !readOnlyCurrentPatient" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
@@ -2041,11 +2477,34 @@ defineExpose({ selectPatient })
                   <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
-                <div v-if="item.status !== 'PROCESSING'" class="audio-player">
-                  <button class="play-btn" :aria-label="isPlaying(item) ? '暂停' : '播放'" @click="playRecording(item)"><Icon :name="isPlaying(item) ? 'pause' : 'play'" /></button>
-                  <div class="waveform" :class="{ playing: isPlaying(item) }"><i v-for="n in 64" :key="n" :style="{ height: `${4 + (Math.sin(n * 1.7) ** 2) * 18}px` }"></i></div>
-                  <span class="audio-time">{{ formatDuration(item.duration_ms) }}</span>
-                </div>
+                <RecordingAudioPlayer
+                  v-if="item.status !== 'PROCESSING'"
+                  :recording="item"
+                  :active="playingId === item.id"
+                  :loading="isAudioLoading(item)"
+                  :loaded="playingId === item.id && !!audioPlaybackUrl"
+                  :playing="playingId === item.id && audioIsPlaying"
+                  :ended="playingId === item.id && audioEnded"
+                  :src="playingId === item.id ? audioPlaybackUrl : ''"
+                  :current-time="playingId === item.id ? audioCurrentTime : 0"
+                  :actual-duration="playingId === item.id ? audioMediaDuration : 0"
+                  :volume="playingId === item.id ? audioVolume : 1"
+                  :playback-rate="playingId === item.id ? audioPlaybackRate : 1"
+                  :error="playingId === item.id ? audioPlaybackError : ''"
+                  :autoplay-blocked="playingId === item.id && audioAutoplayBlocked"
+                  @toggle="playRecording(item)"
+                  @retry="retryAudio(item)"
+                  @seek="seekAudio"
+                  @volume="setAudioVolume"
+                  @rate="setAudioPlaybackRate"
+                  @audio-element="setAudioElement(item.id, $event)"
+                  @time-update="updateAudioTime"
+                  @loaded-metadata="updateAudioTime(audioCurrentTime, $event)"
+                  @playing="onAudioPlaying"
+                  @paused="onAudioPaused"
+                  @ended="onAudioEnded"
+                  @media-error="onAudioMediaError"
+                />
               </div>
             </template>
             <div v-else class="step-guard archived">

@@ -14,6 +14,7 @@ vi.mock('../api', () => ({
     medicalRecord: vi.fn(),
     confirmations: vi.fn(),
     exports: vi.fn(),
+    audioBlob: vi.fn(),
     exportTemplates: vi.fn(),
     exportBlob: vi.fn(),
     exportPreviewBlob: vi.fn(),
@@ -227,6 +228,180 @@ describe('supplemental recording workflow', () => {
   })
 })
 
+describe('recording playback', () => {
+  it('does not abort an audio download when the play button is clicked twice while loading', async () => {
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    let resolveAudio!: (blob: Blob) => void
+    const pendingAudio = new Promise<Blob>(resolve => { resolveAudio = resolve })
+    vi.mocked(api.audioBlob).mockReturnValue(pendingAudio)
+
+    const firstClick = wrapper.get('.audio-item .play-btn').trigger('click')
+    await vi.waitFor(() => expect(api.audioBlob).toHaveBeenCalledTimes(1))
+    const requestSignal = vi.mocked(api.audioBlob).mock.calls[0][1]
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    expect(api.audioBlob).toHaveBeenCalledTimes(1)
+    expect(requestSignal?.aborted).toBe(false)
+    expect(wrapper.get('.audio-item .play-btn').attributes('disabled')).toBeDefined()
+
+    resolveAudio(new Blob(['audio'], { type: 'audio/wav' }))
+    await firstClick
+  })
+
+  it('keeps the custom controls in place and reuses loaded audio when paused or replayed', async () => {
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    await flushPromises()
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:recording')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play')
+      .mockRejectedValueOnce(new DOMException('User gesture required', 'NotAllowedError'))
+      .mockResolvedValue(undefined)
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+
+    expect(api.audioBlob).toHaveBeenCalledWith(doneRecording.id, expect.any(AbortSignal))
+    expect(wrapper.findAll('.recording-native-player')).toHaveLength(0)
+    expect(wrapper.get('.audio-engine').attributes('controls')).toBeUndefined()
+    expect(wrapper.findAll('.audio-player')).toHaveLength(1)
+    expect(wrapper.find('.audio-progress').exists()).toBe(true)
+    expect(wrapper.find('select[aria-label="播放速度：first.wav"]').exists()).toBe(true)
+    expect(wrapper.get('.audio-status').text()).toContain('音频已载入')
+    expect(play).toHaveBeenCalledTimes(1)
+
+    const player = wrapper.get('.audio-engine').element as HTMLAudioElement
+    await player.play()
+    player.dispatchEvent(new Event('pause'))
+    await player.play()
+    player.dispatchEvent(new Event('ended'))
+    expect(player.getAttribute('src')).toBe('blob:recording')
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+    await player.play()
+
+    expect(api.audioBlob).toHaveBeenCalledTimes(1)
+    expect(play).toHaveBeenCalledTimes(4)
+  })
+
+  it('allows playback to be retried after the audio request fails', async () => {
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    vi.mocked(api.audioBlob)
+      .mockRejectedValueOnce(new Error('网络暂时不可用'))
+      .mockResolvedValueOnce(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:retry')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('.audio-error').text()).toContain('网络暂时不可用')
+    await wrapper.get('.audio-retry').trigger('click')
+    await flushPromises()
+
+    expect(api.audioBlob).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('.audio-error').exists()).toBe(false)
+    expect(wrapper.find('.audio-player').exists()).toBe(true)
+  })
+
+  it('shows media duration and applies seek, volume, and playback rate to the audio engine', async () => {
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:controls')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+    const player = wrapper.get('.audio-engine').element as HTMLAudioElement
+    Object.defineProperties(player, {
+      duration: { configurable: true, value: 75 },
+      currentTime: { configurable: true, writable: true, value: 0 }
+    })
+    player.dispatchEvent(new Event('loadedmetadata'))
+    await flushPromises()
+
+    expect(wrapper.get('.audio-time').text()).toBe('00:00 / 01:15')
+    await wrapper.get('.audio-progress').setValue('25')
+    await wrapper.get('.audio-volume-control input').setValue('0.4')
+    await wrapper.get('.audio-rate-control select').setValue('1.5')
+
+    expect(player.currentTime).toBe(25)
+    expect(player.volume).toBe(0.4)
+    expect(player.playbackRate).toBe(1.5)
+  })
+
+  it('releases the previous recording when switching and releases the active blob on unmount', async () => {
+    const secondRecording: Recording = {
+      ...doneRecording, id: 'recording-2', recording_no: 'REC-002', file_name: 'second.wav', audio_url: '/audio/recording-2'
+    }
+    const wrapper = await mountWorkbench({ recordings: [doneRecording, secondRecording] })
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL')
+      .mockReturnValueOnce('blob:first')
+      .mockReturnValueOnce('blob:second')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    await wrapper.findAll('.audio-item .play-btn')[0].trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.audio-item .play-btn')[1].trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(api.audioBlob).mock.calls.map(([id]) => id)).toEqual([doneRecording.id, secondRecording.id])
+    expect(revoke).toHaveBeenCalledWith('blob:first')
+    expect((wrapper.get('.audio-engine').element as HTMLAudioElement).getAttribute('src')).toBe('blob:second')
+
+    wrapper.unmount()
+    expect(revoke).toHaveBeenCalledWith('blob:second')
+  })
+
+  it('releases cached audio when leaving the audio page', async () => {
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:leave-audio')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+    await wrapper.get('.step:nth-child(3)').trigger('click')
+
+    expect(revoke).toHaveBeenCalledWith('blob:leave-audio')
+    expect(wrapper.find('.audio-engine').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('releases cached audio when switching to another patient encounter', async () => {
+    const secondPatient: Patient = { ...patient, id: 'patient-2', patient_no: 'P-002', name: '另一位患者' }
+    const secondVisit: Visit = {
+      ...activeVisit, id: 'visit-2', visit_no: 'V-002', patient_id: secondPatient.id,
+      patient_name: secondPatient.name
+    }
+    const wrapper = await mountWorkbench({ patients: [patient, secondPatient], visits: [activeVisit, secondVisit] })
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:change-visit')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.queue-cards .patient-tile')[1].trigger('click')
+    await flushPromises()
+
+    expect(revoke).toHaveBeenCalledWith('blob:change-visit')
+    expect(wrapper.find('.audio-engine').exists()).toBe(false)
+    wrapper.unmount()
+  })
+})
+
 describe('transcript review navigation', () => {
   it('scrolls to a flagged utterance inside the dialogue region', async () => {
     const source = transcript()
@@ -276,6 +451,37 @@ describe('template management navigation', () => {
 })
 
 describe('department head read-only visit view', () => {
+  it('groups visits by doctor and defaults to actionable visits with doctor and status filters', async () => {
+    const otherPatient: Patient = { ...patient, id: 'patient-2', patient_no: 'P-002', name: '另一位患者' }
+    const otherDoctorVisit: Visit = {
+      ...activeVisit, id: 'visit-2', patient_id: otherPatient.id, doctor_id: 'doctor-2', doctor_name: '李医生',
+      visit_no: 'V-002', status: 'WAITING', last_activity_at: '2026-09-22T08:00:00Z'
+    }
+    const completedVisit: Visit = {
+      ...activeVisit, id: 'visit-3', visit_no: 'V-003', status: 'COMPLETED',
+      last_activity_at: '2026-09-23T08:00:00Z'
+    }
+    configure({ patients: [patient, otherPatient], visits: [activeVisit, otherDoctorVisit, completedVisit] })
+    const head: Doctor = { ...doctor, role: 'DEPARTMENT_HEAD' }
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor: head } })
+    await flushPromises()
+
+    expect(wrapper.findAll('.doctor-queue-group')).toHaveLength(2)
+    expect(wrapper.findAll('.visit-tile')).toHaveLength(2)
+    expect(wrapper.text()).toContain('测试医生')
+    expect(wrapper.text()).toContain('李医生')
+    expect(wrapper.text()).not.toContain('V-003')
+
+    await wrapper.get('select[aria-label="按接诊状态筛选"]').setValue('ALL')
+    expect(wrapper.findAll('.visit-tile')).toHaveLength(3)
+
+    await wrapper.get('select[aria-label="按接诊医生筛选"]').setValue('doctor-2')
+    expect(wrapper.findAll('.doctor-queue-group')).toHaveLength(1)
+    expect(wrapper.findAll('.visit-tile')).toHaveLength(1)
+    expect(wrapper.text()).toContain('另一位患者')
+    wrapper.unmount()
+  })
+
   it('keeps long visit metadata inside the department head queue tile', async () => {
     const longVisit: Visit = {
       ...activeVisit,
@@ -290,7 +496,8 @@ describe('department head read-only visit view', () => {
     const tile = wrapper.get('.visit-tile')
     expect(tile.find('.patient-tile-content').exists()).toBe(true)
     expect(tile.get('.patient-meta').attributes('title')).toContain(longVisit.visit_no)
-    expect(tile.get('.patient-owner').attributes('title')).toContain(longVisit.doctor_name)
+    expect(wrapper.get('.doctor-group-name b').text()).toContain(longVisit.doctor_name)
+    expect(tile.get('.patient-owner').attributes('title')).toContain('最近更新')
   })
 
   it('loads visit artifacts and exposes navigation without write controls', async () => {

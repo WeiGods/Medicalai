@@ -10,6 +10,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.transaction.CannotCreateTransactionException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
@@ -60,11 +61,50 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(503).body(new ErrorVO("DATABASE_UNAVAILABLE", "数据库暂不可用"));
     }
 
+    /**
+     * The browser may cancel an authenticated audio download when playback is
+     * stopped or replaced. The response is already being streamed at that
+     * point, so attempting to serialize an ErrorVO with the audio content type
+     * only creates a misleading secondary HttpMessageNotWritableException.
+     */
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    public ResponseEntity<Void> clientDisconnected(AsyncRequestNotUsableException e, HttpServletRequest request) {
+        LOG.debug("Client disconnected while streaming response: method={}, uri={}, message={}",
+                request.getMethod(), request.getRequestURI(), e.getMessage());
+        return ResponseEntity.noContent().build();
+    }
+
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorVO> unexpected(Exception e, HttpServletRequest request) {
+    public ResponseEntity<?> unexpected(Exception e, HttpServletRequest request) {
+        if (isClientDisconnect(e)) {
+            LOG.debug("Client disconnected while streaming response: method={}, uri={}, message={}",
+                    request.getMethod(), request.getRequestURI(), e.getMessage());
+            return ResponseEntity.noContent().build();
+        }
         LOG.error("Unhandled API error: method={}, uri={}, exceptionType={}, message={}",
                 request.getMethod(), request.getRequestURI(), e.getClass().getName(), e.getMessage(), e);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(new ErrorVO("INTERNAL_ERROR", "服务器处理失败，请查看后端日志"));
+    }
+
+    private boolean isClientDisconnect(Throwable error) {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 12; depth++, current = current.getCause()) {
+            String type = current.getClass().getName();
+            if (type.endsWith("AsyncRequestNotUsableException") || type.endsWith("ClientAbortException")) {
+                return true;
+            }
+            if (current instanceof java.io.IOException) {
+                String message = current.getMessage();
+                if (message != null) {
+                    String normalized = message.toLowerCase(java.util.Locale.ROOT);
+                    if (normalized.contains("broken pipe") || normalized.contains("connection reset")
+                            || normalized.contains("connection abort") || message.contains("中止了一个已建立的连接")) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 }

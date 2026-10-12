@@ -93,7 +93,42 @@ body.modal-open{overflow:hidden}
 
 @media(min-width:1100px){.main>.patient-summary,.main>.steps,.main>.workspace,.main>.info-banner{margin-left:298px;max-width:calc(100% - 298px)}.main>.workspace{width:calc(100% - 298px)}.main>.full-view{margin-left:298px;max-width:calc(100% - 298px)}.main>.queue{width:280px;margin-right:18px}.main>.queue + .patient-summary{margin-left:298px}.main>.page-heading{margin-left:0}}
 
-@media(min-width:1100px){.main>.queue .queue-cards{max-height:650px;overflow-y:auto;scrollbar-width:thin}.queue-load-more{text-align:center;color:#9aaba2;font-size:11px;padding:10px;border-top:1px solid var(--line)}}
+@media(min-width:1100px){.main>.queue .queue-cards{max-height:650px;overflow-y:auto;scrollbar-width:thin}}
+.queue-load-more{position:relative;z-index:2;flex:0 0 auto;text-align:center;margin-top:-2px;padding:9px 12px 10px;border-top:1px solid #edf2ef;background:linear-gradient(180deg,#ffffffdf,#fff 46%);transition:opacity .2s ease,transform .2s ease}
+.queue-load-more button{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:5px 10px;border:1px solid transparent;border-radius:999px;background:#f5faf7;color:#68877a;font-size:10px;line-height:1.4;cursor:pointer}
+.queue-load-more button:hover{border-color:#d8e9de;background:#edf7f1;color:#317e6c}
+.queue-load-more button small{font-size:9px;color:#94a69b}
+.queue-load-more button svg{width:13px;height:13px;color:#4c9a81;animation:queue-hint-bob 1.7s ease-in-out infinite}
+.queue-hint-enter-active,.queue-hint-leave-active{transition:opacity .2s ease,transform .2s ease}
+.queue-hint-enter-from,.queue-hint-leave-to{opacity:0;transform:translateY(6px)}
+@keyframes queue-hint-bob{0%,100%{transform:translateY(-1px)}50%{transform:translateY(3px)}}
+.queue-filters{display:grid;gap:8px;margin-top:11px}
+.queue-filters select{width:100%;height:30px;border:1px solid #dfe9e3;border-radius:6px;background:#fff;color:#557367;padding:5px 8px;font-size:10px}
+.queue-status-filter{display:flex;gap:4px;padding:3px;border-radius:7px;background:#f3f7f4}
+.queue-status-filter button{flex:1;border:0;border-radius:5px;background:transparent;color:#8a9c91;padding:5px 3px;font-size:9px;white-space:nowrap}
+.queue-status-filter button b{margin-left:2px;font-weight:600;color:#a6b4ac}
+.queue-status-filter button.active{background:#fff;color:var(--teal);box-shadow:0 1px 4px #23483b10}
+.queue-status-filter button.active b{color:var(--teal)}
+.doctor-queue-group{border:1px solid #e6eeea;border-radius:8px;background:#fbfdfc;overflow:hidden}
+.doctor-queue-group+.doctor-queue-group{margin-top:9px}
+.doctor-group-head{display:flex;align-items:center;gap:8px;width:100%;padding:10px 9px;border:0;border-bottom:1px solid #e8efeb;background:#f7fbf8;text-align:left}
+.doctor-group-head:hover{background:#f0f8f3}
+.doctor-group-avatar{display:grid;place-items:center;width:27px;height:27px;border-radius:50%;background:#e2f1eb;color:#438170;font-size:11px;font-weight:650;flex:0 0 auto}
+.doctor-group-name{display:grid;gap:2px;min-width:0;flex:1}
+.doctor-group-name b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#456659;font-size:11px;font-weight:650}
+.doctor-group-name small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#95a69d;font-size:8px}
+.doctor-group-counts{display:flex;align-items:center;gap:4px;flex:0 0 auto}
+.doctor-group-counts em{padding:2px 4px;border-radius:3px;background:#eaf5ef;color:#4e8b73;font-size:8px;font-style:normal;white-space:nowrap}
+.doctor-group-counts em.waiting-count{background:#fff4e5;color:#ae8244}
+.doctor-group-counts em.completed-count{background:#f0f3f1;color:#82918a}
+.doctor-group-chevron{color:#89a298;font-size:15px;line-height:10px;transform:rotate(0);transition:transform .18s ease;margin-left:2px}
+.doctor-queue-group.collapsed .doctor-group-chevron{transform:rotate(-90deg)}
+.doctor-group-items{display:grid;gap:7px;padding:8px;max-height:390px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.doctor-group-items .patient-tile{width:100%;min-width:0}
+.queue-filter-empty{display:grid;justify-items:center;gap:5px;padding:30px 12px;color:#95a79d;text-align:center}
+.queue-filter-empty svg{width:20px;height:20px;color:#b0c1b7;margin-bottom:2px}
+.queue-filter-empty b{font-size:11px;color:#6e897b;font-weight:600}
+.queue-filter-empty span{font-size:9px}
 
 /* 接诊开始和浏览器录音相关样式。 */
 .consultation-start-view{margin-bottom:22px;min-width:0}
@@ -181,7 +216,7 @@ body.modal-open{overflow:hidden}
 .live-waveform{display:flex;height:50px;align-items:center;justify-content:center;gap:3px;width:min(100%,300px);margin:18px auto 9px}
 .live-waveform i{display:block;width:4px;height:var(--wave-height);min-height:7px;border-radius:3px;background:linear-gradient(to top,#8fc8ac,#4da383);opacity:.35;transform-origin:center;transition:opacity .2s}
 .live-waveform i:nth-child(3n){background:#94c7b3}.live-waveform i:nth-child(4n){background:#c1decf}
-.live-waveform i{animation:live-wave 1.2s ease-in-out infinite alternate;animation-delay:var(--wave-delay)}
+.live-waveform i{transition:height .08s ease-out,opacity .12s ease-out}
 .recorder-live.state-idle .live-waveform i{animation-play-state:paused;opacity:.3}
 .recorder-live.state-paused .live-waveform i{animation-play-state:paused;opacity:.5}
 .recorder-live.state-recording .live-waveform i{opacity:1}
@@ -189,6 +224,33 @@ body.modal-open{overflow:hidden}
 .recorder-live.state-recording p{color:#5c9579}
 .recorder-controls{display:flex;align-items:center;justify-content:center;gap:9px;margin-top:14px;padding:0;border-top:0}
 .recorder-controls .btn{min-height:36px;padding:8px 13px;font-size:10px}
+.audio-loading-spinner{width:11px;height:11px;border-width:1.5px}
+.audio-player{position:relative;display:flex;align-items:center;gap:11px;min-width:0;margin-top:12px;padding:10px 12px;background:#f6f9f7;border:1px solid #edf3ef;border-radius:7px}
+.audio-player .audio-engine{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%);white-space:nowrap;opacity:0;pointer-events:none}
+.audio-player .play-btn{width:30px;height:30px;border-color:#d9e8df;color:var(--teal);cursor:pointer}
+.audio-player .play-btn svg{width:12px;height:12px}
+.audio-player-main{display:grid;gap:4px;flex:1;min-width:100px}
+.audio-progress-row{display:flex;align-items:center;gap:10px;min-width:0}
+.audio-progress,.audio-volume-control input{appearance:none;-webkit-appearance:none;height:4px;border:0;border-radius:99px;background:linear-gradient(to right,var(--teal) 0 var(--audio-progress,0%),#dce8e0 var(--audio-progress,0%) 100%);cursor:pointer;outline:none}
+.audio-progress{width:100%;min-width:36px}
+.audio-progress::-webkit-slider-thumb,.audio-volume-control input::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:11px;height:11px;border:2px solid #fff;border-radius:50%;background:var(--teal);box-shadow:0 0 0 1px #8bbba5}
+.audio-progress::-moz-range-thumb,.audio-volume-control input::-moz-range-thumb{width:8px;height:8px;border:2px solid #fff;border-radius:50%;background:var(--teal);box-shadow:0 0 0 1px #8bbba5}
+.audio-progress:focus-visible,.audio-volume-control input:focus-visible{outline:3px solid #91c9bf;outline-offset:5px}
+.audio-progress:disabled,.audio-volume-control input:disabled{cursor:not-allowed;opacity:.45}
+.audio-time{flex-shrink:0;color:#789083;font-size:9px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.audio-player-options{display:flex;align-items:center;gap:10px;flex-shrink:0}
+.audio-volume-control,.audio-rate-control{display:flex;align-items:center;gap:5px;color:#86998e;font-size:9px;white-space:nowrap}
+.audio-volume-control input{width:58px;background:linear-gradient(to right,var(--teal) 0 var(--audio-volume,100%),#dce8e0 var(--audio-volume,100%) 100%)}
+.audio-volume-value{width:25px;color:#71897b;font-size:8px;text-align:right;font-variant-numeric:tabular-nums}
+.audio-rate-control select{height:25px;padding:2px 4px;border:1px solid #dfe9e3;border-radius:4px;background:#fff;color:#587365;font-size:9px}
+.audio-rate-control select:disabled{opacity:.55}
+.audio-status{color:#899d90;font-size:9px;line-height:1.4}
+.audio-error{display:flex;align-items:center;gap:8px;color:#ad6c5d;font-size:9px;line-height:1.4}
+.audio-retry{padding:2px 7px;border:1px solid #edcfc7;border-radius:4px;background:#fff8f6;color:#a85f4e;font-size:9px}
+.audio-retry:hover{background:#fff0ec}
+.audio-player.is-playing .play-btn{background:#e8f4ed;border-color:#bcd8c8}
+.audio-player.has-error{background:#fffaf9;border-color:#f0ded9}
+@media(max-width:640px){.audio-player{display:grid;grid-template-columns:30px minmax(0,1fr);align-items:center;gap:8px 10px;padding:9px}.audio-player>.play-btn{grid-column:1;grid-row:1 / span 2;align-self:start}.audio-player-main{grid-column:2;grid-row:1;min-width:0}.audio-player-options{grid-column:2;grid-row:2;justify-content:flex-start;gap:12px}.audio-volume-control>span:first-child,.audio-volume-value{display:none}.audio-volume-control input{width:58px}.audio-rate-control>span{display:none}.audio-progress-row{gap:6px}.audio-time{font-size:8px}}
 .recorder-main-btn{min-width:118px}
 .recorder-main-btn.primary{background:var(--teal);border-color:var(--teal);color:#fff}
 .recorder-main-btn.soft{background:#eef8f2;border-color:#d2e9db;color:#438866}

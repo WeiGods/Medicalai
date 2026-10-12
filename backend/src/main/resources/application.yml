@@ -73,7 +73,7 @@ medicalai:
     # 公网 LLM 角色识别模型
     role-model: ${DASHSCOPE_ROLE_MODEL:qwen-plus}
     # AI 判断的角色置信度低于该值时，要求医生人工复核
-    role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:70}
+    role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:85}
     # 每批发送给角色识别模型的句段数量
     role-batch-size: ${DASHSCOPE_ROLE_BATCH_SIZE:40}
     # 公网信息提取由后端直连 DashScope，不经过 internal-ai 或 127.0.0.1:8000。
