@@ -108,6 +108,11 @@ const transcriptBody = ref<HTMLElement | null>(null)
 const recordingLevel = ref(0)
 const recordingSignalDetected = ref(false)
 const recordingSignalAvailable = ref(true)
+const audioInputDevices = ref<MediaDeviceInfo[]>([])
+const selectedAudioInputDeviceId = ref('')
+const recordingInputLabel = ref('')
+const audioInputHint = ref('')
+const audioInputRefreshBusy = ref(false)
 const avatarToneByPatientId = new Map<string, string>()
 let availableAvatarTones: string[] = []
 let lastAvatarTone = ''
@@ -126,6 +131,7 @@ let audioLoadAbort: AbortController | null = null
 let visitStateRevision = 0
 let patientSearchRevision = 0
 let queueResizeObserver: ResizeObserver | undefined
+let audioDeviceChangeTarget: MediaDevices | null = null
 const recordingState = ref<'idle' | 'recording' | 'paused'>('idle')
 const recordingSignalLabel = computed(() => {
   if (recordingState.value === 'recording' || recordingState.value === 'paused') {
@@ -169,6 +175,7 @@ watch(() => transcript.value?.snapshot_id, () => {
 
 watch(view, (next, previous) => {
   if (next !== previous) stopAudio()
+  if (next === 'audio') void refreshAudioInputDevices()
 })
 
 function updateQueueScrollState() {
@@ -1431,6 +1438,60 @@ function stopMicrophoneMeter() {
   recordingLevel.value = 0
 }
 
+function audioInputLabel(device: MediaDeviceInfo, index: number) {
+  return device.label.trim() || `麦克风 ${index + 1}`
+}
+
+async function refreshAudioInputDevices(requestPermission = false) {
+  const mediaDevices = navigator.mediaDevices
+  if (!mediaDevices?.enumerateDevices) {
+    audioInputHint.value = '当前浏览器不支持读取麦克风列表。'
+    return
+  }
+
+  audioInputRefreshBusy.value = true
+  audioInputHint.value = ''
+  try {
+    let devices = await mediaDevices.enumerateDevices()
+    // Keep the browser's "communications" alias: on Chromium it can point to a
+    // different Windows input than the ordinary system default.
+    let inputs = devices.filter(device => device.kind === 'audioinput'
+      && device.deviceId && device.deviceId !== 'default')
+    if (requestPermission && (!inputs.length || inputs.some(device => !device.label.trim()))) {
+      if (!mediaDevices.getUserMedia) throw new Error('当前浏览器无法请求麦克风权限。')
+      const permissionStream = await mediaDevices.getUserMedia({ audio: true })
+      permissionStream.getTracks().forEach(track => track.stop())
+      devices = await mediaDevices.enumerateDevices()
+      inputs = devices.filter(device => device.kind === 'audioinput'
+        && device.deviceId && device.deviceId !== 'default')
+    }
+
+    audioInputDevices.value = inputs
+    const selectedStillAvailable = inputs.some(device => device.deviceId === selectedAudioInputDeviceId.value)
+    if (selectedAudioInputDeviceId.value && !selectedStillAvailable && recordingState.value === 'idle') {
+      selectedAudioInputDeviceId.value = ''
+      audioInputHint.value = '之前选择的麦克风已不可用，已切回系统默认输入。'
+    } else if (!inputs.length) {
+      audioInputHint.value = '暂未发现可选麦克风；请连接设备并点击刷新。'
+    } else if (inputs.some(device => !device.label.trim())) {
+      audioInputHint.value = '部分麦克风名称被浏览器隐藏，请点击“刷新设备”并允许麦克风权限。'
+    } else {
+      audioInputHint.value = `已找到 ${inputs.length} 个麦克风输入设备。`
+    }
+  } catch (error) {
+    const name = error instanceof DOMException ? error.name : ''
+    audioInputHint.value = name === 'NotAllowedError'
+      ? '麦克风权限未允许，请在浏览器的网站设置中开启后重试。'
+      : error instanceof Error ? error.message : '读取麦克风列表失败，请重试。'
+  } finally {
+    audioInputRefreshBusy.value = false
+  }
+}
+
+function onAudioInputDeviceChange() {
+  void refreshAudioInputDevices()
+}
+
 async function startRecording() {
   if (!currentVisit.value || locked.value) return
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -1438,7 +1499,16 @@ async function startRecording() {
     return
   }
   try {
-    recorderStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const selectedDeviceId = selectedAudioInputDeviceId.value
+    recorderStream = await navigator.mediaDevices.getUserMedia({
+      audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true
+    })
+    const inputTrack = recorderStream.getAudioTracks()[0]
+    const activeDeviceId = inputTrack?.getSettings().deviceId
+    recordingInputLabel.value = inputTrack?.label
+      || audioInputDevices.value.find(device => device.deviceId === activeDeviceId)?.label
+      || (selectedDeviceId ? '所选麦克风' : '系统默认麦克风')
+    void refreshAudioInputDevices()
     recordChunks = []
     recordingSignalDetected.value = false
     recordingSignalAvailable.value = true
@@ -1461,14 +1531,25 @@ async function startRecording() {
       recordingState.value = 'idle'
       const type = recorder?.mimeType || 'audio/webm'
       const extension = type.includes('mp4') ? 'm4a' : 'webm'
-      const file = new File([new Blob(recordChunks, { type })], `${currentPatient.value?.name || '问诊'}_浏览器录音.${extension}`, { type })
+      const duration = recordingElapsedMs.value
+      const signalAvailable = recordingSignalAvailable.value
+      const peakRms = recordingPeakRms
+      const audioBlob = new Blob(recordChunks, { type })
+      recordChunks = []
+      const file = new File([audioBlob], `${currentPatient.value?.name || '问诊'}_浏览器录音.${extension}`, { type })
       recorder = null
+      resetRecordingTimer()
+      recordingElapsedMs.value = 0
+      recordingSignalDetected.value = false
+      recordingSignalAvailable.value = true
+      recordingInputLabel.value = ''
+      recordingPeakRms = 0
       if (!file.size) {
         toast('录音结束，但浏览器没有生成音频数据；请检查麦克风权限后重试。', 'error')
         return
       }
-      const uploaded = await uploadFiles([file], recordingElapsedMs.value, 'recorder')
-      if (uploaded && recordingSignalAvailable.value && recordingPeakRms < 0.003) {
+      const uploaded = await uploadFiles([file], duration, 'recorder')
+      if (uploaded && signalAvailable && peakRms < 0.003) {
         toast('录音文件已上传，但采集时没有检测到麦克风声音；请检查麦克风输入或静音设置。', 'error')
       }
     }
@@ -1477,13 +1558,18 @@ async function startRecording() {
     recordingState.value = 'recording'
     startRecordingTimer()
     void startMicrophoneMeter(recorderStream)
-  } catch {
+  } catch (error) {
     stopMicrophoneMeter()
     recorderStream?.getTracks().forEach(track => track.stop())
     recorderStream = null
     recorder = null
     resetRecordingTimer()
-    toast('无法访问麦克风，请检查浏览器权限。', 'error')
+    const name = error instanceof DOMException ? error.name : ''
+    toast(name === 'OverconstrainedError' || name === 'NotFoundError'
+      ? '所选麦克风不可用，请刷新设备列表或切换到其他输入。'
+      : name === 'NotReadableError'
+        ? '麦克风当前无法读取，请关闭占用它的程序后重试。'
+        : '无法访问麦克风，请检查浏览器权限。', 'error')
   }
 }
 
@@ -1960,6 +2046,8 @@ function updateField(key: string, event: Event) {
 }
 
 onMounted(async () => {
+  audioDeviceChangeTarget = navigator.mediaDevices || null
+  audioDeviceChangeTarget?.addEventListener?.('devicechange', onAudioInputDeviceChange)
   await Promise.all([loadAll(false), loadExportTemplates()])
   if (departmentHead.value && selectedVisitId.value && typeof api.visit === 'function') {
     try { await api.visit(selectedVisitId.value) } catch (error) {
@@ -1973,6 +2061,8 @@ onUnmounted(() => {
   stopAudio()
   stopRecorder()
   resetRecordingTimer()
+  audioDeviceChangeTarget?.removeEventListener?.('devicechange', onAudioInputDeviceChange)
+  audioDeviceChangeTarget = null
   if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
   queueResizeObserver?.disconnect()
   document.body.classList.remove('modal-open')
@@ -2217,7 +2307,6 @@ defineExpose({ selectPatient })
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <RecordingAudioPlayer
-                  v-if="item.status !== 'PROCESSING'"
                   :recording="item"
                   :active="playingId === item.id"
                   :loading="isAudioLoading(item)"
@@ -2402,7 +2491,19 @@ defineExpose({ selectPatient })
                   </div>
                 </div>
                 <div class="recorder-card" :class="`is-${recordingState}`">
-                  <div class="recorder-card-head"><div class="method-heading"><span class="method-icon recorder-method-icon"><Icon name="mic" /></span><div><h3>网页录音</h3><p>直接使用当前设备麦克风</p></div></div><span class="recorder-state-badge" :class="`state-${recordingState}`"><i></i>{{ actionBusy === 'upload' ? '正在保存' : recordingStateLabel }}</span></div>
+                  <div class="recorder-card-head"><div class="method-heading"><span class="method-icon recorder-method-icon"><Icon name="mic" /></span><div><h3>网页录音</h3><p>可选择本次录音使用的麦克风</p></div></div><span class="recorder-state-badge" :class="`state-${recordingState}`"><i></i>{{ actionBusy === 'upload' ? '正在保存' : recordingStateLabel }}</span></div>
+                  <div class="recording-input-control">
+                    <label for="recording-audio-input">输入设备</label>
+                    <select id="recording-audio-input" v-model="selectedAudioInputDeviceId" aria-label="网页录音输入设备" :disabled="recordingState !== 'idle' || actionBusy === 'upload' || audioInputRefreshBusy">
+                      <option value="">系统默认麦克风</option>
+                      <option v-for="(device, index) in audioInputDevices" :key="device.deviceId" :value="device.deviceId">{{ audioInputLabel(device, index) }}</option>
+                    </select>
+                    <button type="button" class="recording-input-refresh" :disabled="recordingState !== 'idle' || actionBusy === 'upload' || audioInputRefreshBusy" @click="refreshAudioInputDevices(true)">
+                      <Icon name="refresh" />{{ audioInputRefreshBusy ? '读取中' : '刷新设备' }}
+                    </button>
+                  </div>
+                  <p v-if="audioInputHint" class="recording-input-hint" role="status">{{ audioInputHint }}</p>
+                  <p v-if="recordingInputLabel" class="recording-input-hint recording-input-current">本次录音输入：{{ recordingInputLabel }}</p>
                   <div class="recorder-live" :class="`state-${recordingState}`">
                     <div class="recorder-timer">{{ recordingTimeLabel }}</div>
                     <div class="live-waveform" :aria-label="recordingSignalLabel" role="img"><i v-for="n in 36" :key="n" :style="{ height: recordingWaveHeight(n), opacity: recordingSignalDetected ? 1 : 0.3 }"></i></div>
@@ -2426,7 +2527,6 @@ defineExpose({ selectPatient })
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <RecordingAudioPlayer
-                  v-if="item.status !== 'PROCESSING'"
                   :recording="item"
                   :active="playingId === item.id"
                   :loading="isAudioLoading(item)"
@@ -2478,7 +2578,6 @@ defineExpose({ selectPatient })
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
                 <RecordingAudioPlayer
-                  v-if="item.status !== 'PROCESSING'"
                   :recording="item"
                   :active="playingId === item.id"
                   :loading="isAudioLoading(item)"

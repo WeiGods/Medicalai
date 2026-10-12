@@ -202,6 +202,15 @@ body.modal-open{overflow:hidden}
 .recorder-card.is-paused{border-color:#dfc998}
 .recorder-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:14px}
 .recorder-card-head .method-heading{margin-bottom:0}
+.recording-input-control{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;margin:-2px 0 5px}
+.recording-input-control>label{color:#748b7d;font-size:10px;white-space:nowrap}
+.recording-input-control select{width:100%;min-width:0;height:31px;padding:5px 8px;border:1px solid #dfe9e3;border-radius:6px;background:#fff;color:#587365;font-size:10px}
+.recording-input-control select:disabled{opacity:.6}
+.recording-input-refresh{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:31px;padding:5px 8px;border:1px solid #dfe9e3;border-radius:6px;background:#fff;color:#698778;font-size:9px;white-space:nowrap}
+.recording-input-refresh:hover:not(:disabled){background:#f3f9f5;border-color:#bdd8ca;color:var(--teal)}
+.recording-input-refresh svg{width:12px;height:12px}
+.recording-input-hint{min-height:14px;margin:0 0 7px;color:#91a197;font-size:9px;line-height:1.5}
+.recording-input-current{color:#548873}
 .recorder-state-badge{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border-radius:999px;background:#eef5f0;color:#8b9e92;white-space:nowrap;font-size:8px;font-weight:600}
 .recorder-state-badge i{width:6px;height:6px;border-radius:50%;background:#b4c1b8}
 .recorder-state-badge.state-recording{background:#e8f7ef;color:#3f8e68}
@@ -289,6 +298,8 @@ body.modal-open{overflow:hidden}
   .tile-status{padding:3px 6px;font-size:7px}
 }
 @media(max-width:430px){
+  .recording-input-control{grid-template-columns:minmax(0,1fr) auto;gap:6px}
+  .recording-input-control>label{grid-column:1/-1}
   .consultation-start-icon{width:62px;height:62px;border-radius:20px}
   .consultation-start-icon svg{width:26px;height:26px}
   .consultation-start-content h2{font-size:17px}

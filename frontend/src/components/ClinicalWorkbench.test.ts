@@ -9,6 +9,7 @@ vi.mock('../api', () => ({
     patients: vi.fn(),
     visits: vi.fn(),
     recordings: vi.fn(),
+    uploadRecording: vi.fn(),
     transcript: vi.fn(),
     clinicalExtraction: vi.fn(),
     medicalRecord: vi.fn(),
@@ -114,6 +115,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('patient avatar colors', () => {
@@ -229,6 +231,24 @@ describe('supplemental recording workflow', () => {
 })
 
 describe('recording playback', () => {
+  it('keeps audio playable while its transcription is processing', async () => {
+    const processingRecording = { ...doneRecording, status: 'PROCESSING' as const }
+    const wrapper = await mountWorkbench({ recordings: [processingRecording] })
+
+    expect(wrapper.get('.audio-item .badge').text()).toBe('转写中')
+    expect(wrapper.find('.audio-item .audio-player').exists()).toBe(true)
+
+    vi.mocked(api.audioBlob).mockResolvedValue(new Blob(['audio'], { type: 'audio/wav' }))
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:processing-recording')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    await wrapper.get('.audio-item .play-btn').trigger('click')
+    await flushPromises()
+
+    expect(api.audioBlob).toHaveBeenCalledWith(processingRecording.id, expect.any(AbortSignal))
+    expect(wrapper.find('.audio-item .audio-player').exists()).toBe(true)
+  })
+
   it('does not abort an audio download when the play button is clicked twice while loading', async () => {
     const wrapper = await mountWorkbench()
     await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
@@ -398,6 +418,159 @@ describe('recording playback', () => {
 
     expect(revoke).toHaveBeenCalledWith('blob:change-visit')
     expect(wrapper.find('.audio-engine').exists()).toBe(false)
+    wrapper.unmount()
+  })
+})
+
+describe('microphone input selection', () => {
+  it('requests permission before listing device names hidden by the browser', async () => {
+    const temporaryTrack = { stop: vi.fn() }
+    const temporaryStream = { getTracks: () => [temporaryTrack] } as unknown as MediaStream
+    const enumerateDevices = vi.fn()
+      .mockResolvedValueOnce([
+        { kind: 'audioinput', deviceId: 'usb-mic', label: '' },
+        { kind: 'audioinput', deviceId: 'communications', label: '' }
+      ])
+      .mockResolvedValueOnce([
+        { kind: 'audioinput', deviceId: 'usb-mic', label: '' },
+        { kind: 'audioinput', deviceId: 'communications', label: '' }
+      ])
+      .mockResolvedValueOnce([
+        { kind: 'audioinput', deviceId: 'usb-mic', label: 'USB Audio Device' },
+        { kind: 'audioinput', deviceId: 'communications', label: 'Communications - Microphone' }
+      ])
+    const getUserMedia = vi.fn().mockResolvedValue(temporaryStream)
+    const mediaDevices = { enumerateDevices, getUserMedia, addEventListener: vi.fn(), removeEventListener: vi.fn() }
+    const navigatorStub = { userAgent: 'happy-dom', mediaDevices } as unknown as Navigator
+    vi.stubGlobal('navigator', navigatorStub)
+
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('.recording-input-refresh').attributes('disabled')).toBeUndefined())
+    await wrapper.get('.recording-input-refresh').trigger('click')
+    await flushPromises()
+
+    expect(getUserMedia).toHaveBeenCalledWith({ audio: true })
+    expect(temporaryTrack.stop).toHaveBeenCalledOnce()
+    expect(wrapper.get('select[aria-label="网页录音输入设备"]').text()).toContain('USB Audio Device')
+    expect(wrapper.get('select[aria-label="网页录音输入设备"]').text()).toContain('Communications - Microphone')
+    wrapper.unmount()
+  })
+
+  it('opens the selected input device when recording starts', async () => {
+    const inputTrack = {
+      label: 'USB Audio Device',
+      getSettings: () => ({ deviceId: 'usb-mic' }),
+      stop: vi.fn()
+    }
+    const inputStream = {
+      getAudioTracks: () => [inputTrack],
+      getTracks: () => [inputTrack]
+    } as unknown as MediaStream
+    const mediaDevices = {
+      enumerateDevices: vi.fn().mockResolvedValue([
+        { kind: 'audioinput', deviceId: 'usb-mic', label: 'USB Audio Device' },
+        { kind: 'audioinput', deviceId: 'built-in-mic', label: 'Built-in Microphone' }
+      ]),
+      getUserMedia: vi.fn().mockResolvedValue(inputStream),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn()
+    }
+    const navigatorStub = { userAgent: 'happy-dom', mediaDevices } as unknown as Navigator
+    vi.stubGlobal('navigator', navigatorStub)
+
+    class TestMediaRecorder {
+      static isTypeSupported() { return true }
+      readonly mimeType = 'audio/webm;codecs=opus'
+      state: RecordingState = 'inactive'
+      ondataavailable: ((event: BlobEvent) => void) | null = null
+      onstop: ((event: Event) => void) | null = null
+      start() { this.state = 'recording' }
+      stop() { this.state = 'inactive' }
+      pause() { this.state = 'paused' }
+      resume() { this.state = 'recording' }
+    }
+    vi.stubGlobal('MediaRecorder', TestMediaRecorder)
+
+    const wrapper = await mountWorkbench()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('select[aria-label="网页录音输入设备"]').setValue('usb-mic')
+    await wrapper.get('.recorder-main-btn').trigger('click')
+    await flushPromises()
+
+    expect(mediaDevices.getUserMedia).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'usb-mic' } } })
+    expect(wrapper.text()).toContain('本次录音输入：USB Audio Device')
+    expect(wrapper.get('select[aria-label="网页录音输入设备"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('clears the live recording timer and signal state when a recording ends', async () => {
+    const track = { label: 'USB Audio Device', getSettings: () => ({ deviceId: 'usb-mic' }), stop: vi.fn() }
+    const stream = {
+      getAudioTracks: () => [track],
+      getTracks: () => [track]
+    } as unknown as MediaStream
+    const mediaDevices = {
+      enumerateDevices: vi.fn().mockResolvedValue([]),
+      getUserMedia: vi.fn().mockResolvedValue(stream),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn()
+    }
+    vi.stubGlobal('navigator', { userAgent: 'happy-dom', mediaDevices } as unknown as Navigator)
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1000)
+
+    class TestMediaRecorder {
+      static isTypeSupported() { return true }
+      readonly mimeType = 'audio/webm;codecs=opus'
+      state: RecordingState = 'inactive'
+      ondataavailable: ((event: BlobEvent) => void) | null = null
+      onstop: ((event: Event) => void) | null = null
+      start() { this.state = 'recording' }
+      stop() {
+        this.state = 'inactive'
+        this.ondataavailable?.({ data: new Blob(['captured-audio'], { type: this.mimeType }) } as BlobEvent)
+        this.onstop?.(new Event('stop'))
+      }
+      pause() { this.state = 'paused' }
+      resume() { this.state = 'recording' }
+    }
+    vi.stubGlobal('MediaRecorder', TestMediaRecorder)
+
+    const NativeURL = globalThis.URL
+    vi.stubGlobal('URL', Object.assign(class TestURL extends NativeURL {}, {
+      createObjectURL: vi.fn(() => 'blob:recording-duration'),
+      revokeObjectURL: vi.fn()
+    }))
+    class TestAudio {
+      duration = 2
+      onloadedmetadata: (() => void) | null = null
+      onerror: (() => void) | null = null
+      set preload(_value: string) {}
+      set src(_value: string) { queueMicrotask(() => this.onloadedmetadata?.()) }
+      removeAttribute() {}
+    }
+    vi.stubGlobal('Audio', TestAudio)
+    vi.mocked(api.uploadRecording).mockResolvedValue(doneRecording)
+
+    const wrapper = await mountWorkbench({ recordings: [uploadedRecording] })
+    expect(wrapper.text()).toContain('网页录音')
+    await wrapper.get('.recorder-main-btn').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.recorder-main-btn').text()).toContain('暂停录音')
+
+    now.mockReturnValue(33000)
+    await wrapper.get('.recorder-main-btn').trigger('click')
+    expect(wrapper.get('.recorder-timer').text()).toBe('00:32')
+    expect(wrapper.text()).toContain('本次录音输入：USB Audio Device')
+
+    await wrapper.get('.recorder-stop-btn').trigger('click')
+    await vi.waitFor(() => expect(api.uploadRecording).toHaveBeenCalledOnce())
+
+    expect(wrapper.get('.recorder-timer').text()).toBe('00:00')
+    expect(wrapper.get('.recorder-live').text()).toContain('点击开始录音')
+    expect(wrapper.find('.recording-input-current').exists()).toBe(false)
+    expect(api.uploadRecording).toHaveBeenCalledWith(activeVisit.id, expect.any(File), 2000)
     wrapper.unmount()
   })
 })
