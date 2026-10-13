@@ -449,10 +449,7 @@ public class ClinicalWorkflowService {
         }
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
-        if (requestedProvider != null && !requestedProvider.isBlank()
-                && LlmRoute.fromRequested(requestedProvider) != LlmRoute.DASHSCOPE) {
-            throw BusinessException.conflict("INTERNAL_LLM_UNAVAILABLE", "内网 LLM 未部署，角色识别请使用公网路由");
-        }
+        roleRouter.validateRequestedRoute(requestedProvider);
         LlmRoute route = roleRouter.roleRoute();
 
         List<Utterance> candidates = currentUtterances(visit.id()).stream()
