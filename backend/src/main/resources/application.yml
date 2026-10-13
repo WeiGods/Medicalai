@@ -31,6 +31,31 @@ medicalai:
   auth:
     # 鉴权模式；DEMO 表示演示登录
     mode: ${AUTH_MODE:DEMO}
+  llm:
+    # 角色识别 LLM 路由：DASHSCOPE=公网 LLM（默认）；LOCAL=内网本地 LLM（llama.cpp）
+    role-route: ${LLM_ROLE_ROUTE:DASHSCOPE}
+  local-llm:
+    # 是否启用内网本地 LLM（llama.cpp / OpenAI 兼容）通信适配器；默认关闭，开启后仅作为
+    # 角色识别 LOCAL 路由使用，绝不把内网内容改送公网
+    enabled: ${LOCAL_LLM_ENABLED:false}
+    # 内网本地 LLM 服务地址
+    endpoint: ${LOCAL_LLM_ENDPOINT:http://192.168.1.56:8080}
+    # 本地 LLM 的 API 密钥；llama.cpp 未启用鉴权时留空（留空则不发送 Authorization 头）
+    api-key: ${LOCAL_LLM_API_KEY:}
+    # 本地角色识别模型 ID
+    role-model: ${LOCAL_LLM_ROLE_MODEL:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}
+    # 本地 LLM 角色置信度低于该值时要求医生人工复核
+    role-review-threshold: ${LOCAL_LLM_ROLE_REVIEW_THRESHOLD:70}
+    # 每批发送给本地角色识别模型的句段数量
+    role-batch-size: ${LOCAL_LLM_ROLE_BATCH_SIZE:40}
+    # 连接本地 LLM 的超时时间，单位毫秒
+    connect-timeout-ms: ${LOCAL_LLM_CONNECT_TIMEOUT_MS:5000}
+    # 等待本地 LLM 普通响应的超时时间，单位毫秒
+    read-timeout-ms: ${LOCAL_LLM_READ_TIMEOUT_MS:120000}
+    # 本地 LLM 角色识别失败后的最大重试次数
+    role-retry-max-attempts: ${LOCAL_LLM_ROLE_RETRY_MAX_ATTEMPTS:2}
+    # 本地 LLM 重试前的等待时间，单位毫秒
+    role-retry-delay-ms: ${LOCAL_LLM_ROLE_RETRY_DELAY_MS:200}
   storage:
     # 本地录音文件的备用存储目录
     root: ${STORAGE_ROOT:./data/recordings}
