@@ -22,10 +22,20 @@ public class AiServiceClient {
     private final RestClient client;
     private final String baseUrl;
 
-    public AiServiceClient(@Value("${medicalai.internal-ai.base-url:${medicalai.ai.base-url:http://127.0.0.1:8000}}") String baseUrl) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public AiServiceClient(@Value("${medicalai.internal-ai.base-url:${medicalai.ai.base-url:http://127.0.0.1:8000}}") String baseUrl,
+                           @Value("${medicalai.internal-ai.connect-timeout-ms:5000}") long connectTimeoutMs,
+                           @Value("${medicalai.internal-ai.read-timeout-ms:120000}") long readTimeoutMs) {
         this.baseUrl = baseUrl;
-        this.client = RestClient.builder().baseUrl(baseUrl).build();
+        var http = java.net.http.HttpClient.newBuilder()
+                .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                .connectTimeout(java.time.Duration.ofMillis(Math.max(1, connectTimeoutMs))).build();
+        var factory = new JdkClientHttpRequestFactory(http);
+        factory.setReadTimeout(java.time.Duration.ofMillis(Math.max(1, readTimeoutMs)));
+        this.client = RestClient.builder().baseUrl(baseUrl).requestFactory(factory).build();
     }
+
+    public AiServiceClient(String baseUrl) { this(baseUrl, 5_000, 120_000); }
 
     public GenerateResponse generate(String snapshotHash, List<Map<String, Object>> dialogue, Map<String, Object> patient) {
         LOG.info("AI record generation started: endpoint=/internal/medical-record/generate, snapshotHash={}, dialogueItems={}, baseUrl={}",
@@ -92,10 +102,11 @@ public class AiServiceClient {
             for (Object value : items) {
                 if (!(value instanceof Map<?, ?> item)) return fallback;
                 Integer index = integer(item.get("index"));
-                String role = normalizeRole(String.valueOf(item.get("role")));
+                String role = String.valueOf(item.get("role")).strip().toUpperCase(java.util.Locale.ROOT);
                 Integer confidence = integer(item.get("confidence"));
                 String source = String.valueOf(item.get("source")).strip().toUpperCase(java.util.Locale.ROOT);
-                if (index == null || !fallback.containsKey(index) || confidence == null || confidence < 0 || confidence > 100
+                if (index == null || !fallback.containsKey(index) || !java.util.Set.of("DOCTOR", "PATIENT", "OTHER").contains(role)
+                        || confidence == null || confidence < 0 || confidence > 100
                         || !"LLM".equals(source) || result.put(index,
                         new DashScopeRoleClient.RoleAssignment(role, confidence, source)) != null) {
                     return fallback;

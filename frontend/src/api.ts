@@ -6,6 +6,22 @@ import type {
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
 
+export class ApiError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
+const routeErrorMessages: Record<string, string> = {
+  ASR_ROUTE_UNKNOWN: '历史接诊来源无法确认，请使用整份转写恢复入口。',
+  SOURCE_CHANGED: '转写已变化，旧模型结果已丢弃，请刷新后重试。',
+  ASR_ROUTE_MISMATCH: '本次接诊已使用另一条 ASR 路由，请使用原路由重试。',
+  LLM_ROUTE_MISMATCH: 'AI 处理路由必须与当前 ASR 来源一致，请刷新后重试。',
+  LLM_ROUTE_UNKNOWN: '请统一当前接诊的 ASR 路由并重新转写',
+  LLM_ROUTE_MIXED: '请统一当前接诊的 ASR 路由并重新转写'
+}
+
 async function request<T>(path: string, options: RequestInit = {}, json = true): Promise<T> {
   const headers = new Headers(options.headers)
   if (json && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
@@ -18,14 +34,16 @@ async function request<T>(path: string, options: RequestInit = {}, json = true):
   }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`
+    let code: string | undefined
     try {
       const text = await response.text()
       if (text.trim()) {
-        const body = JSON.parse(text) as { message?: string }
-        message = body.message || message
+        const body = JSON.parse(text) as { message?: string; code?: string }
+        code = body.code
+        message = body.message || (code && routeErrorMessages[code]) || message
       }
     } catch {}
-    throw new Error(message)
+    throw new ApiError(message, code)
   }
   // Spring's `void` handlers may return HTTP 200 with no body (for example,
   // deleting a recording). Reading JSON unconditionally makes that successful
@@ -98,6 +116,10 @@ export const api = {
       method: 'POST', body: JSON.stringify({ provider })
     }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
+  rebuildTranscript: (visitId: string, provider: AsrProvider, sourceSnapshotId: string) => request<AsrJob>(
+    `/api/v1/visits/${visitId}/recordings/rebuild-transcript`, {
+      method: 'POST', body: JSON.stringify({ provider, source_snapshot_id: sourceSnapshotId, acknowledge_draft_reset: true })
+    }),
   activeTranscription: (visitId: string) => request<AsrJob | null>(`/api/v1/visits/${visitId}/recordings/transcribe/active`),
   deleteRecording: (visitId: string, recordingId: string) => request<void>(`/api/v1/visits/${visitId}/recordings/${recordingId}`, { method: 'DELETE' }),
   transcript: (visitId: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`),

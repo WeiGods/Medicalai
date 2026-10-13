@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS visit (
     version int NOT NULL DEFAULT 0,
     created_by uuid REFERENCES doctor(id),
     updated_by uuid REFERENCES doctor(id),
+    processing_route varchar(32) CHECK (processing_route IN ('DASHSCOPE','LOCAL')),
+    recovery_route varchar(32) CHECK (recovery_route IN ('DASHSCOPE','LOCAL')),
     created_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now(),
     updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
@@ -465,6 +467,25 @@ ALTER TABLE visit ADD COLUMN IF NOT EXISTS patient_phone_snapshot varchar(64);
 ALTER TABLE visit ADD COLUMN IF NOT EXISTS doctor_name_snapshot varchar(128);
 ALTER TABLE visit ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES doctor(id);
 ALTER TABLE visit ADD COLUMN IF NOT EXISTS updated_by uuid REFERENCES doctor(id);
+ALTER TABLE visit ADD COLUMN IF NOT EXISTS processing_route varchar(32);
+ALTER TABLE visit ADD COLUMN IF NOT EXISTS recovery_route varchar(32);
+ALTER TABLE visit DROP CONSTRAINT IF EXISTS visit_recovery_route_check;
+ALTER TABLE visit ADD CONSTRAINT visit_recovery_route_check CHECK (recovery_route IN ('DASHSCOPE','LOCAL'));
+COMMENT ON COLUMN visit.recovery_route IS '整份异常转写恢复目标；首次成功前保留，成功锁定 processing_route 后清除';
+ALTER TABLE visit DROP CONSTRAINT IF EXISTS visit_processing_route_check;
+ALTER TABLE visit ADD CONSTRAINT visit_processing_route_check CHECK (processing_route IN ('DASHSCOPE','LOCAL'));
+-- 只回填可安全推导的成功录音来源；混合/未知历史数据保留 NULL，由业务路由校验阻断。
+UPDATE visit v SET processing_route=history.route
+FROM (
+    SELECT r.visit_id, CASE
+        WHEN bool_and(COALESCE(upper(btrim(r.asr_route)), '') IN ('','DASHSCOPE','DASHSCOPE_ROLE_V2')) THEN 'DASHSCOPE'
+        WHEN bool_and(COALESCE(upper(btrim(r.asr_route)), '')='LOCAL') THEN 'LOCAL'
+        ELSE NULL END AS route
+    FROM recording r
+    WHERE r.status='DONE' OR EXISTS (
+        SELECT 1 FROM asr_utterance u WHERE u.recording_id=r.id AND u.result_type='CANONICAL')
+    GROUP BY r.visit_id
+) history WHERE v.id=history.visit_id AND v.processing_route IS NULL AND v.recovery_route IS NULL AND history.route IS NOT NULL;
 ALTER TABLE visit DROP CONSTRAINT IF EXISTS fk_current_record;
 ALTER TABLE visit DROP COLUMN IF EXISTS current_record_id;
 ALTER TABLE patient ADD COLUMN IF NOT EXISTS id_no_masked varchar(64);
@@ -794,7 +815,8 @@ COMMENT ON COLUMN recording.size_bytes IS '文件大小，单位字节';
 COMMENT ON COLUMN recording.duration_ms IS '录音时长，单位毫秒';
 COMMENT ON COLUMN recording.sha256 IS '文件内容 SHA-256，用于完整性校验和去重';
 COMMENT ON COLUMN recording.status IS '录音状态：UPLOADED、PROCESSING、DONE、FAILED 等';
-COMMENT ON COLUMN recording.asr_route IS 'ASR 处理路由，例如 UPLOADED、DASHSCOPE';
+COMMENT ON COLUMN visit.processing_route IS '首次成功 ASR 锁定的接诊处理路由：DASHSCOPE 或 LOCAL，未成功前为 NULL';
+COMMENT ON COLUMN recording.asr_route IS 'ASR 实际来源：DASHSCOPE、DASHSCOPE_ROLE_V2 或 LOCAL，未开始转写为 NULL';
 COMMENT ON COLUMN recording.error_code IS '录音处理失败错误码';
 COMMENT ON COLUMN recording.error_message IS '录音处理失败详情';
 COMMENT ON COLUMN recording.created_at IS '录音记录创建时间';

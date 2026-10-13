@@ -34,6 +34,11 @@ class DashScopeRoleClientTest {
         var request=mapper.readTree(input.get());
         assertEquals("qwen-plus",request.path("model").asText());
         assertEquals("json_object",request.path("response_format").path("type").asText());
+        var resource = mapper.readTree(getClass().getResourceAsStream("/ai/role-assignment.json"));
+        assertEquals(resource.path("system").asText(), request.at("/messages/0/content").asText());
+        assertEquals(resource.path("instruction").asText() + mapper.writeValueAsString(List.of(
+                Map.of("index",0,"speaker_id",0,"text","哪里疼"),Map.of("index",1,"speaker_id",0,"text","头疼"))),
+                request.at("/messages/1/content").asText());
         assertFalse(request.toString().contains("enable_thinking"));
     }
     @Test void invalidOrMissingAssignmentsFallBackToOtherWithoutConfidence() throws Exception {

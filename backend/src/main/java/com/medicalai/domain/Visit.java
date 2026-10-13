@@ -7,14 +7,33 @@ public record Visit(UUID id, String visitNo, UUID patientId, UUID doctorId,
                     String status, String departmentName, String patientNameSnapshot,
                     String patientGenderSnapshot, Integer patientAgeSnapshot,
                     String doctorNameSnapshot, String chiefComplaint, int version, Instant startedAt,
-                    Instant completedAt, Instant createdAt) {
+                    Instant completedAt, Instant createdAt, String processingRoute, String recoveryRoute) {
+    public Visit(UUID id, String visitNo, UUID patientId, UUID doctorId,
+                 String status, String departmentName, String patientNameSnapshot,
+                 String patientGenderSnapshot, Integer patientAgeSnapshot,
+                 String doctorNameSnapshot, String chiefComplaint, int version, Instant startedAt,
+                 Instant completedAt, Instant createdAt, String processingRoute) {
+        this(id, visitNo, patientId, doctorId, status, departmentName, patientNameSnapshot,
+                patientGenderSnapshot, patientAgeSnapshot, doctorNameSnapshot, chiefComplaint,
+                version, startedAt, completedAt, createdAt, processingRoute, null);
+    }
     public Visit(UUID id, String visitNo, UUID patientId, UUID doctorId,
                  String status, String departmentName, String patientNameSnapshot,
                  String patientGenderSnapshot, Integer patientAgeSnapshot,
                  String doctorNameSnapshot, String chiefComplaint, int version, Instant createdAt) {
         this(id, visitNo, patientId, doctorId, status, departmentName, patientNameSnapshot,
                 patientGenderSnapshot, patientAgeSnapshot, doctorNameSnapshot, chiefComplaint, version,
-                null, null, createdAt);
+                null, null, createdAt, null);
+    }
+
+    public Visit(UUID id, String visitNo, UUID patientId, UUID doctorId,
+                 String status, String departmentName, String patientNameSnapshot,
+                 String patientGenderSnapshot, Integer patientAgeSnapshot,
+                 String doctorNameSnapshot, String chiefComplaint, int version, Instant startedAt,
+                 Instant completedAt, Instant createdAt) {
+        this(id, visitNo, patientId, doctorId, status, departmentName, patientNameSnapshot,
+                patientGenderSnapshot, patientAgeSnapshot, doctorNameSnapshot, chiefComplaint,
+                version, startedAt, completedAt, createdAt, null);
     }
 
     public Instant lastActivityAt() {

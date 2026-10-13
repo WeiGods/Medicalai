@@ -27,17 +27,22 @@ public class LlmRouteResolver {
         return routing(snapshot.id());
     }
 
-    /**
-     * AI 分析不再继承录音转写路由：本地推理只产出转写与句段，提取固定使用公网 Qwen-Plus。
-     */
     public LlmRouting analysisRouting(DialogueSnapshot snapshot) {
-        return new LlmRouting(LlmRoute.DASHSCOPE, List.of(LlmRoute.DASHSCOPE), false);
+        return routing(snapshot);
     }
 
     public LlmRouting routing(UUID snapshotId) {
         Set<LlmRoute> routes = new LinkedHashSet<>();
-        for (String value : recordings.snapshotAsrRoutes(snapshotId)) {
-            routes.add(LlmRoute.fromAsrRoute(value));
+        List<String> sources = recordings.snapshotAsrRoutes(snapshotId);
+        boolean missingRoute = sources.stream().anyMatch(value -> value == null || value.isBlank());
+        for (String value : sources) {
+            if (value != null && !value.isBlank()) routes.add(LlmRoute.fromAsrRoute(value));
+        }
+        // 老版本公网录音可能没有 asr_route；只有无本地/未知来源的历史数据可按公网兼容。
+        if (missingRoute && (routes.isEmpty() || routes.equals(Set.of(LlmRoute.DASHSCOPE)))) {
+            routes.add(LlmRoute.DASHSCOPE);
+        } else if (missingRoute) {
+            routes.add(LlmRoute.UNKNOWN);
         }
         if (routes.isEmpty() || routes.contains(LlmRoute.UNKNOWN)) {
             return new LlmRouting(LlmRoute.UNKNOWN, List.of(), false);
@@ -46,22 +51,18 @@ public class LlmRouteResolver {
             LlmRoute route = routes.iterator().next();
             return new LlmRouting(route, List.of(route), false);
         }
-        return new LlmRouting(LlmRoute.MIXED, List.of(LlmRoute.DASHSCOPE, LlmRoute.LOCAL), true);
+        return new LlmRouting(LlmRoute.MIXED, List.of(), false);
     }
 
-    /** 只有混合来源允许医生显式选择；单一路由不能被请求参数覆盖。 */
+    /** 单一路由跟随快照；混合或未知来源禁止把整份快照交给任意一路模型。 */
     public LlmRoute resolve(DialogueSnapshot snapshot, String requestedProvider) {
         LlmRouting routing = routing(snapshot);
         if (routing.sourceRoute() == LlmRoute.UNKNOWN) {
-            throw BusinessException.conflict("LLM_ROUTE_UNKNOWN", "当前快照无法识别公网或内网来源，请重新转写后再进行 AI 分析");
+            throw BusinessException.conflict("LLM_ROUTE_UNKNOWN", "当前快照来源无法确认，请统一当前接诊的 ASR 路由并重新转写");
         }
         if (routing.sourceRoute() == LlmRoute.MIXED) {
-            LlmRoute requested = LlmRoute.fromRequested(requestedProvider);
-            if (!requested.isCallable()) {
-                throw BusinessException.conflict("LLM_ROUTE_SELECTION_REQUIRED",
-                        "当前快照同时包含公网和内网转写，请明确选择本次 AI 分析路由");
-            }
-            return requested;
+            throw BusinessException.conflict("LLM_ROUTE_MIXED",
+                    "当前快照同时包含公网和本地来源，请统一当前接诊的 ASR 路由并重新转写");
         }
         if (requestedProvider != null && !requestedProvider.isBlank()
                 && LlmRoute.fromRequested(requestedProvider) != routing.sourceRoute()) {
@@ -72,12 +73,7 @@ public class LlmRouteResolver {
     }
 
     public LlmRoute resolveAnalysis(DialogueSnapshot snapshot, String requestedProvider) {
-        LlmRoute requested = LlmRoute.fromRequested(requestedProvider);
-        if (requested == LlmRoute.LOCAL || requested == LlmRoute.UNKNOWN) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "LLM_ROUTE_MISMATCH",
-                    "信息提取已固定使用公网 Qwen-Plus，不能选择内网路由");
-        }
-        return LlmRoute.DASHSCOPE;
+        return resolve(snapshot, requestedProvider);
     }
 
     public static String label(LlmRoute route) {

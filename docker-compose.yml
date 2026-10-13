@@ -13,8 +13,11 @@ services:
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       AI_SERVICE_BASE_URL: ${AI_SERVICE_BASE_URL:-http://ai:8000}
+      # 两个地址分别指向本地文本 AI 网关和本地 ASR 服务，允许独立部署。
       INTERNAL_AI_SERVICE_BASE_URL: ${INTERNAL_AI_SERVICE_BASE_URL:-http://ai:8000}
       LOCAL_ASR_BASE_URL: ${LOCAL_ASR_BASE_URL:-http://ai:8000}
+      # 仅兼容没有业务来源的旧调用；不能覆盖接诊 ASR 来源。
+      LLM_ROLE_ROUTE: ${LLM_ROLE_ROUTE:-DASHSCOPE}
       LOCAL_ASR_MODE: ${LOCAL_ASR_MODE:-offline}
       LOCAL_ASR_CONNECT_TIMEOUT_MS: ${LOCAL_ASR_CONNECT_TIMEOUT_MS:-5000}
       LOCAL_ASR_POLL_DELAY_MS: ${LOCAL_ASR_POLL_DELAY_MS:-3000}
@@ -73,6 +76,7 @@ services:
       ASR_MIN_RMS: ${ASR_MIN_RMS:-0.004}
       ASR_DROP_FILLER_MS: ${ASR_DROP_FILLER_MS:-0}
       HOTWORD_FILE: ${HOTWORD_FILE:-热词列表}
+      # 本地 OpenAI 兼容 LLM 的 /v1 地址；角色判断与提取共用，失败不切公网。
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-qwen-plus}

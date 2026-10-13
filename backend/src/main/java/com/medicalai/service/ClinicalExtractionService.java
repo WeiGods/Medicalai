@@ -91,20 +91,27 @@ public class ClinicalExtractionService {
                 .orElseGet(() -> empty(snapshot, routing));
     }
 
-    @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot) {
         return generate(visitId, doctorId, snapshot, routes.resolveAnalysis(snapshot, null));
     }
 
-    @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, LlmRoute route) {
         long startedAt = System.nanoTime();
         LlmRouting routing = routes.analysisRouting(snapshot);
+        if (routing.sourceRoute() == LlmRoute.MIXED || routing.sourceRoute() == LlmRoute.UNKNOWN) {
+            throw BusinessException.conflict(routing.sourceRoute() == LlmRoute.MIXED ? "LLM_ROUTE_MIXED" : "LLM_ROUTE_UNKNOWN",
+                    "请统一当前接诊的 ASR 路由并重新转写");
+        }
+        if (route != routing.sourceRoute()) {
+            throw BusinessException.conflict("LLM_ROUTE_MISMATCH", "信息提取路由必须与快照 ASR 来源一致");
+        }
+        extractions.validateSource(visitId, doctorId, snapshot.id(), snapshot.snapshotHash(), route.name());
         LOG.info("信息提取开始: visitId={}, snapshotHash={}, route={}", visitId, shortHash(snapshot.snapshotHash()), route);
         List<SnapshotTurn> turns;
         try {
             turns = snapshotTurns(snapshot);
         } catch (BusinessException error) {
+            if (Set.of("SOURCE_CHANGED", "VISIT_NOT_ACTIVE", "RECORD_CONFIRMED", "NOT_FOUND").contains(error.code())) throw error;
             LOG.warn("信息提取因快照无效失败: visitId={}, snapshotHash={}, route={}, code={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, error.code(), elapsedMs(startedAt));
             return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()));
@@ -142,6 +149,7 @@ public class ClinicalExtractionService {
             return toVO(saved, snapshot, routing);
         } catch (BusinessException error) {
             // 模型不可用同样保存为 FAILED，前端才能展示明确原因并允许医生原地重试；绝不改走模板兜底。
+            if (Set.of("SOURCE_CHANGED", "VISIT_NOT_ACTIVE", "RECORD_CONFIRMED", "NOT_FOUND").contains(error.code())) throw error;
             LOG.warn("信息提取失败: visitId={}, snapshotHash={}, route={}, code={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, error.code(), elapsedMs(startedAt));
             return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()));

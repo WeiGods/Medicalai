@@ -41,6 +41,8 @@ export interface Visit {
   version: number
   created_at: string
   last_activity_at: string
+  processing_route: AsrProvider | null
+  recovery_route?: AsrProvider | null
 }
 
 export type DemoRole = 'DOCTOR' | 'DEPARTMENT_HEAD'

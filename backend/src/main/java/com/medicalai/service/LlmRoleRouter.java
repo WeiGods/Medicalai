@@ -12,7 +12,7 @@ import org.springframework.stereotype.Service;
 /**
  * 角色识别 LLM 路由：ASR 的 MOSS 匿名推理结果在传给在线 LLM 做 speaker 识别前的
  * 最后一道路由。ASR 路由只决定文本、时间和声学说话人编号的来源，而角色识别走公网
- * LLM 还是内网本地 LLM，由 {@code medicalai.llm.role-route} 决定。
+ * LLM 还是内网本地 LLM，由当前 ASR/快照来源决定；全局配置仅保留历史兼容默认。
  */
 @Service
 public class LlmRoleRouter {
@@ -49,7 +49,12 @@ public class LlmRoleRouter {
     }
 
     public boolean isConfigured() {
-        return roleRoute == LlmRoute.LOCAL ? local.isConfigured() : dashscope.isConfigured();
+        return isConfigured(roleRoute);
+    }
+
+    public boolean isConfigured(LlmRoute route) {
+        return route != null && route.isCallable()
+                && (route == LlmRoute.LOCAL ? local != null && local.isConfigured() : dashscope.isConfigured());
     }
 
     /**
@@ -71,9 +76,29 @@ public class LlmRoleRouter {
     }
 
     public Map<Integer, DashScopeRoleClient.RoleAssignment> assignRoles(List<Map<String, Object>> turns) {
-        if (roleRoute == LlmRoute.LOCAL) {
-            if (!local.isConfigured()) {
+        return assignRoles(roleRoute, turns);
+    }
+
+    public Map<Integer, DashScopeRoleClient.RoleAssignment> assignRoles(LlmRoute route,
+                                                                          List<Map<String, Object>> turns) {
+        if (route == null || !route.isCallable()) {
+            throw BusinessException.conflict("LLM_ROUTE_UNKNOWN", "角色判断来源无法确认，不能调用模型");
+        }
+        if (route == LlmRoute.LOCAL) {
+            if (local == null || !local.isConfigured()) {
                 LOG.warn("角色识别路由为 LOCAL 但内网本地 LLM 未启用，返回降级角色（不会改走公网 LLM）");
+            }
+            if (local == null) {
+                java.util.Map<Integer, DashScopeRoleClient.RoleAssignment> fallback = new java.util.LinkedHashMap<>();
+                if (turns != null) {
+                    for (Map<String, Object> turn : turns) {
+                        Object value = turn == null ? null : turn.get("index");
+                        if (value instanceof Number n) {
+                            fallback.put(n.intValue(), DashScopeRoleClient.RoleAssignment.fallback());
+                        }
+                    }
+                }
+                return fallback;
             }
             return local.assignRoles(turns);
         }

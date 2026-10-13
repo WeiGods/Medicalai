@@ -28,11 +28,29 @@ public class ClinicalExtractionMapper {
         this.jdbc = jdbc;
     }
 
-    /** Reacquire the visit lock after the model call, before persisting any result rows. */
-    private void requireVisitForWrite(UUID visitId) {
-        boolean exists = !jdbc.query("SELECT id FROM visit WHERE id=? FOR UPDATE",
-                (rs, n) -> rs.getObject("id", UUID.class), visitId).isEmpty();
-        if (!exists) throw com.medicalai.exception.BusinessException.notFound();
+    /** Short transaction shared by preflight and both success/failure writes. */
+    @org.springframework.transaction.annotation.Transactional
+    public void validateSource(UUID visitId, UUID doctorId, UUID snapshotId, String snapshotHash, String route) {
+        var status = jdbc.query("SELECT status FROM visit WHERE id=? AND doctor_id=? FOR UPDATE",
+                (rs, n) -> rs.getString(1), visitId, doctorId);
+        if (status.isEmpty()) throw com.medicalai.exception.BusinessException.notFound();
+        if (!"ACTIVE".equals(status.getFirst())) throw com.medicalai.exception.BusinessException.conflict("VISIT_NOT_ACTIVE", "接诊已停止，已丢弃旧提取结果");
+        if (Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM medical_record WHERE visit_id=? AND status='CONFIRMED')", Boolean.class, visitId)))
+            throw com.medicalai.exception.BusinessException.conflict("RECORD_CONFIRMED", "病历已确认，不能写入提取结果");
+        if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM recording WHERE visit_id=? AND status<>'DONE')
+                    OR EXISTS(SELECT 1 FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING'))
+                    OR EXISTS(SELECT 1 FROM recording_session WHERE visit_id=? AND status IN ('OPEN','STOPPING'))
+                """, Boolean.class, visitId, visitId, visitId)))
+            throw com.medicalai.exception.BusinessException.conflict("SOURCE_CHANGED", "录音或转写正在变化，请完成后重新提取");
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM dialogue_snapshot d JOIN visit_transcript t ON t.visit_id=d.visit_id AND t.snapshot_id=d.id
+                    WHERE d.visit_id=? AND d.id=? AND d.snapshot_hash=? AND d.authority_status='ADOPTED')
+                """, Boolean.class, visitId, snapshotId, snapshotHash)))
+            throw com.medicalai.exception.BusinessException.conflict("SOURCE_CHANGED", "当前转写快照已变化，已丢弃旧提取结果");
+        var source = new com.medicalai.service.LlmRouteResolver(new RecordingMapper(jdbc)).routing(snapshotId).sourceRoute();
+        if (!source.isCallable() || !source.name().equals(route))
+            throw com.medicalai.exception.BusinessException.conflict("SOURCE_CHANGED", "快照来源已变化，已丢弃旧提取结果");
     }
 
     public Optional<Version> current(UUID visitId) {
@@ -52,16 +70,18 @@ public class ClinicalExtractionMapper {
                 """, VERSION, visitId, snapshotId, snapshotHash).stream().findFirst();
     }
 
+    @org.springframework.transaction.annotation.Transactional
     public Version insert(UUID visitId, UUID snapshotId, String snapshotHash, String status,
                           String contentJson, String qualityIssuesJson, String generatedBy, UUID doctorId) {
         return insert(visitId, snapshotId, snapshotHash, status, contentJson, qualityIssuesJson,
                 "UNKNOWN", generatedBy, doctorId);
     }
 
+    @org.springframework.transaction.annotation.Transactional
     public Version insert(UUID visitId, UUID snapshotId, String snapshotHash, String status,
                           String contentJson, String qualityIssuesJson, String providerRoute,
                           String generatedBy, UUID doctorId) {
-        requireVisitForWrite(visitId);
+        validateSource(visitId, doctorId, snapshotId, snapshotHash, providerRoute);
         UUID extractionId = jdbc.query("SELECT id FROM clinical_extraction WHERE visit_id=?",
                 (rs, n) -> rs.getObject("id", UUID.class), visitId).stream().findFirst().orElseGet(() -> {
                     UUID id = UUID.randomUUID();

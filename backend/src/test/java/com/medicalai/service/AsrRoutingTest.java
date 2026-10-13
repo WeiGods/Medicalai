@@ -30,14 +30,82 @@ class AsrRoutingTest {
     RecordingMapper.AsrJob job(String status,String provider) {
         return new RecordingMapper.AsrJob(jobId,visitId,null,null,status,0,null,null,provider);
     }
-    @Test void existingJobKeepsOriginalRoute() {
-        when(recordings.latestAsrJob(visitId)).thenReturn(Optional.of(job("RUNNING","DASHSCOPE")));
+    @Test void existingJobRejectsCrossRouteRequest() {
+        when(recordings.activeAsrJob(visitId)).thenReturn(Optional.of(job("RUNNING",AsrJobWorker.PUBLIC_ROLE_ROUTE)));
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"LOCAL")).code());
+        verify(recordings,never()).createAsrJob(any(),any());
+        verify(recordings,never()).requeueRetryableRecordings(any());
+    }
+    @Test void existingJobKeepsOriginalRouteForMatchingRequest() {
+        when(recordings.activeAsrJob(visitId)).thenReturn(Optional.of(job("RUNNING","DASHSCOPE")));
         when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("RUNNING","DASHSCOPE")));
-        var response = workflow.transcribe(visitId,doctorId,"LOCAL");
+        var response = workflow.transcribe(visitId,doctorId,"DASHSCOPE");
         assertEquals(jobId,response.jobId());
         assertEquals("DASHSCOPE",response.providerRoute());
         verify(recordings,never()).createAsrJob(any(),any());
         verify(recordings,never()).requeueRetryableRecordings(any());
+    }
+    @ParameterizedTest @ValueSource(strings={"DASHSCOPE","LOCAL"})
+    void lockedVisitRejectsOtherRouteAndAllowsImplicitRetry(String route) {
+        var visit = new Visit(visitId,"V1",UUID.randomUUID(),doctorId,"ACTIVE",null,null,null,null,null,null,1,
+                null,null,Instant.now(),route);
+        when(visits.find(eq(visitId),eq(doctorId),anyBoolean())).thenReturn(Optional.of(visit));
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"LOCAL".equals(route) ? "DASHSCOPE" : "LOCAL")).code());
+        when(recordings.latestAsrJob(visitId)).thenReturn(Optional.of(job("FAILED",route)));
+        when(recordings.list(visitId)).thenReturn(List.of(new Recording(UUID.randomUUID(),visitId,"R1","UPLOAD","key","a.wav","audio/wav",1L,1L,"UPLOADED",null,Instant.now())));
+        when(recordings.createAsrJob(visitId,"LOCAL".equals(route) ? route : AsrJobWorker.PUBLIC_ROLE_ROUTE)).thenReturn(jobId);
+        when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("PENDING",route)));
+        assertEquals(route,workflow.transcribe(visitId,doctorId,null).providerRoute());
+    }
+    @Test void implicitProviderFollowsActiveLocalJob() {
+        when(recordings.activeAsrJob(visitId)).thenReturn(Optional.of(job("RUNNING","LOCAL")));
+        when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("RUNNING","LOCAL")));
+        assertEquals("LOCAL",workflow.transcribe(visitId,doctorId,null).providerRoute());
+    }
+    @Test void historicalPublicVisitRejectsLocalRoute() {
+        when(visits.historicalProcessingRoute(visitId)).thenReturn("DASHSCOPE");
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"LOCAL")).code());
+    }
+    @Test void newerFailedJobCannotHideOlderActiveRoute() {
+        when(recordings.latestAsrJob(visitId)).thenReturn(Optional.of(job("FAILED","LOCAL")));
+        when(recordings.activeAsrJob(visitId)).thenReturn(Optional.of(job("RUNNING","DASHSCOPE")));
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"LOCAL")).code());
+        verify(recordings,never()).createAsrJob(any(),any());
+    }
+    @Test void unsafeHistoricalVisitRejectsProcessing() {
+        when(visits.historicalProcessingRoute(visitId)).thenReturn("UNKNOWN");
+        assertEquals("ASR_ROUTE_UNKNOWN",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"LOCAL")).code());
+        verify(recordings,never()).createAsrJob(any(),any());
+    }
+
+    @Test void recoveryTargetPinsImplicitAndExplicitRetriesBeforeFirstSuccess() {
+        var visit = new Visit(visitId,"V1",UUID.randomUUID(),doctorId,"ACTIVE",null,null,null,null,null,null,1,
+                null,null,Instant.now(),null,"LOCAL");
+        when(visits.find(eq(visitId),eq(doctorId),anyBoolean())).thenReturn(Optional.of(visit));
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.transcribe(visitId,doctorId,"DASHSCOPE")).code());
+        // requeueRetryableRecordings changes FAILED to UPLOADED before the pending list is read.
+        when(recordings.list(visitId)).thenReturn(List.of(new Recording(UUID.randomUUID(),visitId,"R1","UPLOAD","key","a.wav","audio/wav",1L,1L,"UPLOADED",null,Instant.now())));
+        when(recordings.createAsrJob(visitId,"LOCAL")).thenReturn(jobId);
+        when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("PENDING","LOCAL")));
+        assertEquals("LOCAL",workflow.transcribe(visitId,doctorId,null).providerRoute());
+        verify(recordings).requeueRetryableRecordings(visitId);
+    }
+    @ParameterizedTest @ValueSource(strings={"DASHSCOPE","LOCAL"})
+    void lockedVisitRejectsRetranscriptionWithOtherRoute(String route) {
+        var visit = new Visit(visitId,"V1",UUID.randomUUID(),doctorId,"ACTIVE",null,null,null,null,null,null,1,
+                null,null,Instant.now(),route);
+        when(visits.find(eq(visitId),eq(doctorId),anyBoolean())).thenReturn(Optional.of(visit));
+        assertEquals("ASR_ROUTE_MISMATCH",assertThrows(BusinessException.class,
+                () -> workflow.retranscribeRecording(visitId,UUID.randomUUID(),doctorId,
+                        "LOCAL".equals(route) ? "DASHSCOPE" : "LOCAL")).code());
+        verify(recordings,never()).requeueTranscribedRecording(any());
+        verify(recordings,never()).createAsrJob(any(),any(),any());
     }
     @Test void activeJobQueryRestoresQueuedTaskState() {
         var pending = job("PENDING", AsrJobWorker.PUBLIC_ROLE_ROUTE);

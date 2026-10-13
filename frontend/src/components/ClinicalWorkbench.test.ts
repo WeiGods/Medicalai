@@ -25,6 +25,9 @@ vi.mock('../api', () => ({
     managedTemplates: vi.fn(),
     saveTranscript: vi.fn(),
     retranscribeRecording: vi.fn(),
+    rebuildTranscript: vi.fn(),
+    reclassifyTranscriptRoles: vi.fn(),
+    generateClinicalExtraction: vi.fn(),
     transcribe: vi.fn(),
     deletePatient: vi.fn(),
     patientDeletionStatus: vi.fn()
@@ -44,7 +47,7 @@ const activeVisit: Visit = {
   id: 'visit-1', visit_no: 'V-001', patient_id: patient.id, doctor_id: doctor.id, status: 'ACTIVE',
   department_name: doctor.department_name, patient_name: patient.name, patient_gender: patient.gender,
   patient_age: patient.age, doctor_name: doctor.display_name, chief_complaint: null, version: 1,
-  created_at: '2026-09-21T08:00:00Z', last_activity_at: '2026-09-21T08:00:00Z'
+  created_at: '2026-09-21T08:00:00Z', last_activity_at: '2026-09-21T08:00:00Z', processing_route: null
 }
 
 const doneRecording: Recording = {
@@ -141,6 +144,81 @@ describe('patient avatar colors', () => {
     expect(new Set(tiles.map(tile => tone(tile.get('.avatar')))).size).toBe(3)
     expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.recent .avatar')))
     expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.patient-summary .avatar')))
+  })
+})
+
+describe('ASR source routing', () => {
+  it('keeps the recovery route pinned before first successful ASR', async () => {
+    const wrapper = await mountWorkbench({ visit: { ...activeVisit, recovery_route: 'LOCAL' }, recordings: [uploadedRecording] })
+    expect(wrapper.get('input[name="asr-provider"][value="LOCAL"]').element).toHaveProperty('checked', true)
+    expect(wrapper.get('input[name="asr-provider"][value="DASHSCOPE"]').element).toHaveProperty('disabled', true)
+    wrapper.unmount()
+  })
+
+  it('requires acknowledgement before rebuilding a mixed snapshot and submits the original snapshot', async () => {
+    vi.mocked(api.rebuildTranscript).mockImplementation(() => new Promise(() => undefined))
+    const wrapper = await mountWorkbench({ transcript: { ...transcript(), source_route: 'MIXED', available_routes: [] } })
+    const recovery = wrapper.findAll('button').find(button => button.text() === '统一路由并恢复整份转写')!
+    await recovery.trigger('click')
+    const submit = wrapper.findAll('button').find(button => button.text() === '确认整份恢复')!
+    expect(submit.element).toHaveProperty('disabled', true)
+    expect(wrapper.get('.modal-body').text()).toContain('保留全部原始录音')
+    await wrapper.get('input[name="rebuild-provider"][value="LOCAL"]').setValue(true)
+    await wrapper.get('.modal-body input[type="checkbox"]').setValue(true)
+    await submit.trigger('click')
+    expect(api.rebuildTranscript).toHaveBeenCalledWith(activeVisit.id, 'LOCAL', 'snapshot-1')
+    expect(api.transcribe).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('disables recovery while an older queued ASR task is still active', async () => {
+    const wrapper = await mountWorkbench({ transcript: { ...transcript(), source_route: 'UNKNOWN', available_routes: [] },
+      activeAsrJob: { job_id: 'older-job', status: 'PENDING', total_recordings: 1, completed_recordings: 0, error_message: null, transcript: null, provider_route: 'LOCAL' } })
+    const recovery = wrapper.findAll('button').find(button => button.text() === '统一路由并恢复整份转写')!
+    expect(recovery.element).toHaveProperty('disabled', true)
+    wrapper.unmount()
+  })
+  it.each(['LOCAL', 'DASHSCOPE'] as const)('locks ASR options and submits the %s visit route', async route => {
+    vi.mocked(api.transcribe).mockImplementation(() => new Promise(() => undefined))
+    const wrapper = await mountWorkbench({ visit: { ...activeVisit, processing_route: route }, recordings: [uploadedRecording] })
+    const other = route === 'LOCAL' ? 'DASHSCOPE' : 'LOCAL'
+    expect(wrapper.get(`input[name="asr-provider"][value="${route}"]`).element).toHaveProperty('checked', true)
+    expect(wrapper.get(`input[name="asr-provider"][value="${other}"]`).element).toHaveProperty('disabled', true)
+    await wrapper.get('.transcribe-action button').trigger('click')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, route)
+    wrapper.unmount()
+  })
+
+  it.each(['LOCAL', 'DASHSCOPE'] as const)('omits provider when extracting the %s snapshot', async route => {
+    vi.mocked(api.generateClinicalExtraction).mockImplementation(() => new Promise(() => undefined))
+    const snapshot = { ...transcript(), source_route: route, available_routes: [route] }
+    const wrapper = await mountWorkbench({ transcript: snapshot })
+    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
+    expect(wrapper.find('[aria-label="选择 AI 处理路由"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain(route === 'LOCAL' ? '本地处理' : '公网处理')
+    const generate = wrapper.findAll('button').find(button => button.text() === '生成信息提取')!
+    expect(generate.element).toHaveProperty('disabled', false)
+    await generate.trigger('click')
+    expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id)
+    wrapper.unmount()
+  })
+
+  it.each(['MIXED', 'UNKNOWN'] as const)('blocks role analysis and extraction for %s snapshots', async route => {
+    const snapshot: Transcript = { ...transcript(), source_route: route, available_routes: [], route_selection_required: false,
+      turns: [{ ...transcript().turns[0], role: 'UNKNOWN', role_source: 'UNKNOWN', role_review_required: true }] }
+    const wrapper = await mountWorkbench({ transcript: snapshot })
+    expect(wrapper.get('[role="alert"]').text()).toBe('请统一当前接诊的 ASR 路由并重新转写')
+    const reclassify = wrapper.findAll('button').find(button => button.text() === '开始 AI 判断')!
+    expect(reclassify.element).toHaveProperty('disabled', true)
+    await reclassify.trigger('click')
+    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
+    const generate = wrapper.findAll('button').find(button => button.text() === '生成信息提取')!
+    expect(generate.element).toHaveProperty('disabled', true)
+    await generate.trigger('click')
+    expect(wrapper.find('[aria-label="选择 AI 处理路由"]').exists()).toBe(false)
+    expect(api.reclassifyTranscriptRoles).not.toHaveBeenCalled()
+    expect(api.generateClinicalExtraction).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 })
 

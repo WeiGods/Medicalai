@@ -66,8 +66,8 @@ public class RecordingController {
     public AsrJobVO transcribe(@PathVariable("visitId") UUID visitId,
                              @RequestBody(required = false) TranscribeRequest request,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        String provider = request == null ? "DASHSCOPE" : request.provider();
-        if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
+        String provider = request == null ? null : request.provider();
+        if (provider != null && !provider.isBlank() && !java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider)) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
         }
         requireWrite(current);
@@ -79,8 +79,8 @@ public class RecordingController {
                                  @PathVariable("recordingId") UUID recordingId,
                                  @RequestBody(required = false) TranscribeRequest request,
                                  @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        String provider = request == null ? "DASHSCOPE" : request.provider();
-        if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
+        String provider = request == null ? null : request.provider();
+        if (provider != null && !provider.isBlank() && !java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider)) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
         }
         requireWrite(current);
@@ -88,6 +88,17 @@ public class RecordingController {
     }
 
     public record TranscribeRequest(String provider) {}
+
+    public record RebuildTranscriptRequest(String provider, UUID sourceSnapshotId, boolean acknowledgeDraftReset) {}
+
+    @PostMapping("/visits/{visitId}/recordings/rebuild-transcript")
+    public AsrJobVO rebuildTranscript(@PathVariable("visitId") UUID visitId,
+                                     @RequestBody RebuildTranscriptRequest request,
+                                     @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        requireWrite(current);
+        return workflow.rebuildTranscript(visitId, current.doctor().id(), request.provider(),
+                request.sourceSnapshotId(), request.acknowledgeDraftReset());
+    }
 
     @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")
     public AsrJobVO transcriptionStatus(@PathVariable("visitId") UUID visitId, @PathVariable("jobId") UUID jobId,

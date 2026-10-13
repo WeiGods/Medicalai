@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.medicalai.exception.BusinessException;
 
 /** 所有写入均在短数据库事务中由当前租约隔离。 */
 @Service
@@ -39,9 +40,31 @@ public class AsrJobStore {
         if (!recordings.lockAsrLease(job.id(), token)) throw new LeaseLostException();
     }
 
+    private void requireRoute(RecordingMapper.AsrJob job) {
+        var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
+        if (!Set.of("PENDING", "RUNNING").contains(current.status())
+                || LlmRoute.fromAsrRoute(current.providerRoute()) != LlmRoute.fromAsrRoute(job.providerRoute())) {
+            throw new LeaseLostException();
+        }
+        var visit = visits.find(job.visitId(), false).orElseThrow(BusinessException::notFound);
+        if (!"ACTIVE".equals(visit.status())) throw BusinessException.conflict("VISIT_NOT_ACTIVE", "接诊已停止，拒绝调用模型");
+        String route = AsrRoutePolicy.resolve(visit, visits, current.providerRoute());
+        if (recordings.hasConflictingAsrJob(job.visitId(), job.id(), route)) {
+            throw BusinessException.conflict("ASR_ROUTE_MISMATCH", "存在不同路由的活动 ASR 任务，请结束冲突任务后按统一路由重试");
+        }
+    }
+
+    /** Short transaction before every network stage, including resumed public jobs. */
+    @Transactional
+    public void validateForCall(RecordingMapper.AsrJob job, UUID token) {
+        fence(job, token);
+        requireRoute(job);
+    }
+
     @Transactional
     public Recording begin(RecordingMapper.AsrJob job, UUID token) {
         fence(job, token);
+        requireRoute(job);
         Recording recording = (job.recordingId() == null
                 ? recordings.findByVisitAndStatus(job.visitId(), "UPLOADED")
                 : recordings.findByVisitAndIdAndStatus(job.visitId(), job.recordingId(), "UPLOADED"))
@@ -55,6 +78,7 @@ public class AsrJobStore {
     @Transactional
     public UUID savePreview(RecordingMapper.AsrJob job, UUID token, UUID recordingId, List<AsrSegment> segments) {
         fence(job, token);
+        requireRoute(job);
         var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
         if (!Objects.equals(current.recordingId(), recordingId)) throw new LeaseLostException();
         if (segments == null || segments.isEmpty()) throw new IllegalStateException("ASR 返回空句段");
@@ -75,6 +99,7 @@ public class AsrJobStore {
     @Transactional
     public void submitted(RecordingMapper.AsrJob job, UUID token, UUID recordingId, String taskId) {
         fence(job, token);
+        requireRoute(job);
         recordings.updateAsrSubmission(job.id(), recordingId, taskId);
     }
 
@@ -88,7 +113,7 @@ public class AsrJobStore {
     public void fail(RecordingMapper.AsrJob job, UUID token, String message) {
         fence(job, token);
         var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
-        if (current.recordingId() != null) recordings.updateStatus(current.recordingId(), "FAILED", message.length() > 512 ? message.substring(0,512) : message);
+        if (current.recordingId() != null) recordings.failOwnedRecording(job.id(), message.length() > 512 ? message.substring(0,512) : message);
         recordings.markAsrFailed(job.id(), message);
     }
 
@@ -107,12 +132,25 @@ public class AsrJobStore {
          * 9.3 当本接诊的全部录音完成时，生成当前对话快照与展示文本并标记任务成功。
          */
         fence(job, token);
+        requireRoute(job);
         var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
         if (!Objects.equals(current.recordingId(), recordingId)) throw new LeaseLostException();
         if (turns.isEmpty() || turns.stream().anyMatch(t -> t.text() == null || t.text().isBlank()
                 || t.startMs() < 0 || t.endMs() < t.startMs())) throw new IllegalStateException("ASR 返回无效句段");
-        if (turns.stream().anyMatch(turn -> !Set.of("LLM", "FALLBACK", "MANUAL").contains(turn.roleSource()))) {
+        if (turns.stream().anyMatch(turn -> !Set.of("LLM", "FALLBACK").contains(turn.roleSource()))) {
             throw new IllegalStateException("ASR 角色判断未完成，拒绝以 AUTO 或 UNKNOWN 结果入库");
+        }
+        LlmRoute source = LlmRoute.fromAsrRoute(job.providerRoute());
+        if (!source.isCallable()) {
+            throw BusinessException.conflict("ASR_ROUTE_UNKNOWN", "ASR 任务来源无法确认，拒绝保存正式结果");
+        }
+        String route = source.name();
+        if (turns.stream().anyMatch(turn -> LlmRoute.fromAsrRoute(turn.roleProviderRoute()) != source)) {
+            throw BusinessException.conflict("LLM_ROUTE_MISMATCH", "角色判断路由与 ASR 任务来源不一致");
+        }
+        // 与句段、快照同一事务提交；条件更新失败时必须阻止正式结果落库。
+        if (!visits.lockProcessingRoute(job.visitId(), route)) {
+            throw BusinessException.conflict("ASR_ROUTE_MISMATCH", "接诊处理路由已变化，请刷新后使用原路由重试");
         }
         String rawJson = AsrRawResponse.sanitizedJson(rawResponse);
         if (rawJson != null) {

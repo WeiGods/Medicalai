@@ -9,6 +9,8 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.core.io.ByteArrayResource;
 
 class AsrJobWorkerTest {
@@ -17,13 +19,18 @@ class AsrJobWorkerTest {
     DashScopeAsrClient cloud=mock(DashScopeAsrClient.class);
     DashScopeRoleClient roles=mock(DashScopeRoleClient.class);
     AiServiceClient internal=mock(AiServiceClient.class);
+    LocalLlmRoleClient localRoles=mock(LocalLlmRoleClient.class);
     LocalAsrClient local=mock(LocalAsrClient.class);
     ScheduledExecutorService heartbeat=Executors.newSingleThreadScheduledExecutor();
-    LlmRoleRouter roleRouter=new LlmRoleRouter(roles);
+    // 全局默认故意为公网，LOCAL 任务必须仍然使用本地角色客户端。
+    LlmRoleRouter roleRouter=new LlmRoleRouter(roles,localRoles,"DASHSCOPE");
     AsrJobWorker worker=new AsrJobWorker(store,storage,cloud,local,roleRouter,heartbeat,600000);
     UUID id=UUID.randomUUID(),visit=UUID.randomUUID(),recordingId=UUID.randomUUID();
     Recording recording=new Recording(recordingId,visit,"R1","UPLOAD","key","a.wav","audio/wav",1L,100L,"UPLOADED",null,Instant.now());
-    @BeforeEach void configurePublicRoleLlm(){ lenient().when(roles.isConfigured()).thenReturn(true); }
+    @BeforeEach void configureRoleLlms(){
+        lenient().when(roles.isConfigured()).thenReturn(true);
+        lenient().when(localRoles.isConfigured()).thenReturn(true);
+    }
     @AfterEach void stop(){heartbeat.shutdownNow();}
     RecordingMapper.AsrJob pending(String route){
         var job=new RecordingMapper.AsrJob(id,visit,null,null,"PENDING",0,null,null,route);
@@ -31,56 +38,58 @@ class AsrJobWorkerTest {
         when(store.begin(eq(job),any())).thenReturn(recording);
         return job;
     }
-    @Test void localCompletionAssignsRolesByPublicLlm(){
+    @Test void localCompletionAssignsRolesByLocalLlm(){
         var job=pending("LOCAL");
         var audio=new ByteArrayResource(new byte[]{1});
         when(storage.load("key")).thenReturn(audio);
         when(local.transcribeDetailed(audio,"a.wav","audio/wav")).thenReturn(new AsrResult(
                 List.of(new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null)), null));
-        when(roles.assignRoles(any())).thenReturn(Map.of(
+        when(localRoles.assignRoles(any())).thenReturn(Map.of(
                 0,new DashScopeRoleClient.RoleAssignment("PATIENT",88,"LLM"),
                 1,new DashScopeRoleClient.RoleAssignment("OTHER",null,"FALLBACK")));
         worker.processLocal();
-        verifyNoInteractions(cloud);
+        verifyNoInteractions(cloud,roles);
         verifyNoInteractions(internal);
         verify(storage,never()).presignedUrl(any());
-        org.mockito.InOrder sequence = inOrder(store, roles);
+        org.mockito.InOrder sequence = inOrder(store, localRoles);
         sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(
                 new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null))));
-        sequence.verify(roles).assignRoles(any());
+        sequence.verify(localRoles).assignRoles(any());
         verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
-                new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88,"DASHSCOPE"),
-                new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null,"DASHSCOPE"))), isNull());
+                new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88,"LOCAL"),
+                new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null,"LOCAL"))), isNull());
     }
-    @Test void localJobSavesAsrPreviewBeforeFailingWhenPublicRoleLlmIsMissing(){
+    @Test void localJobCompletesWithFallbackWhenLocalRoleLlmIsMissing(){
         var job=pending("LOCAL");
         var audio=new ByteArrayResource(new byte[]{1});
         var segment=new AsrSegment("可预览的原始识别文字",0,100,2);
         when(storage.load("key")).thenReturn(audio);
         when(local.transcribeDetailed(audio,"a.wav","audio/wav"))
                 .thenReturn(new AsrResult(List.of(segment), null));
-        when(roles.isConfigured()).thenReturn(false);
+        when(localRoles.isConfigured()).thenReturn(false);
+        when(localRoles.assignRoles(any())).thenReturn(Map.of(0, DashScopeRoleClient.RoleAssignment.fallback()));
 
         worker.processLocal();
 
-        org.mockito.InOrder sequence=inOrder(local,store,roles);
+        org.mockito.InOrder sequence=inOrder(local,store,localRoles);
         sequence.verify(local).transcribeDetailed(audio,"a.wav","audio/wav");
         sequence.verify(store).savePreview(eq(job),any(),eq(recordingId),eq(List.of(segment)));
-        sequence.verify(roles).isConfigured();
-        sequence.verify(store).fail(eq(job),any(),contains("未配置 DASHSCOPE_API_KEY"));
-        verifyNoInteractions(cloud,internal);
-        verify(roles,never()).assignRoles(any());
-        verify(store,never()).complete(any(),any(),any(),any());
+        sequence.verify(localRoles).assignRoles(any());
+        sequence.verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
+                new RecordingMapper.Turn("OTHER",segment.text(),0,100,2,"FALLBACK",null,"LOCAL"))),isNull());
+        verifyNoInteractions(cloud,internal,roles);
+        verify(store,never()).fail(any(),any(),any());
     }
-    @Test void publicCompletionNeverCallsLocalService(){
-        var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);
+    @ParameterizedTest @ValueSource(strings={"DASHSCOPE","DASHSCOPE_ROLE_V2"})
+    void publicCompletionNeverCallsLocalService(String route){
+        var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),route);
         when(store.claim(eq(AsrJobWorker.PUBLIC_ROLE_ROUTE),any())).thenReturn(Optional.of(job));
         var task=new DashScopeAsrClient.Task("task","SUCCEEDED",null);
         when(cloud.query("task")).thenReturn(task);
         when(cloud.resultDetailed(task)).thenReturn(new AsrResult(List.of(new AsrSegment("哪里疼",0,100,null)), null));
         when(roles.assignRoles(any())).thenReturn(Map.of(0,new DashScopeRoleClient.RoleAssignment("DOCTOR",91,"LLM")));
         worker.processPublic();
-        verifyNoInteractions(local,storage,internal);
+        verifyNoInteractions(local,storage,internal,localRoles);
         org.mockito.InOrder sequence = inOrder(store, roles);
         sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(new AsrSegment("哪里疼",0,100,null))));
         sequence.verify(roles).assignRoles(any());
@@ -94,15 +103,28 @@ class AsrJobWorkerTest {
         when(storage.load("key")).thenReturn(audio);
         when(local.transcribeDetailed(audio, "a.wav", "audio/wav"))
                 .thenReturn(new AsrResult(List.of(segment), null));
-        when(roles.assignRoles(any())).thenThrow(new IllegalStateException("role model unavailable"));
+        when(localRoles.assignRoles(any())).thenThrow(new IllegalStateException("role model unavailable"));
 
         worker.processLocal();
 
-        org.mockito.InOrder sequence = inOrder(store, roles);
+        org.mockito.InOrder sequence = inOrder(store, localRoles);
         sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(segment)));
-        sequence.verify(roles).assignRoles(any());
+        sequence.verify(localRoles).assignRoles(any());
         sequence.verify(store).fail(eq(job), any(), contains("role model unavailable"));
         verify(store, never()).complete(any(), any(), any(), any());
+        verifyNoInteractions(roles,cloud);
+    }
+    @Test void publicRoleFailureCompletesWithPublicFallbackAndNeverCallsLocal() {
+        var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);
+        when(store.claim(eq(AsrJobWorker.PUBLIC_ROLE_ROUTE),any())).thenReturn(Optional.of(job));
+        var task=new DashScopeAsrClient.Task("task","SUCCEEDED",null);
+        when(cloud.query("task")).thenReturn(task);
+        when(cloud.resultDetailed(task)).thenReturn(new AsrResult(List.of(new AsrSegment("原文",0,100,null)),null));
+        when(roles.assignRoles(anyList())).thenReturn(Map.of(0,DashScopeRoleClient.RoleAssignment.fallback()));
+        worker.processPublic();
+        verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
+                new RecordingMapper.Turn("OTHER","原文",0,100,null,"FALLBACK",null,"DASHSCOPE"))),isNull());
+        verifyNoInteractions(local,localRoles,internal);
     }
     @Test void interruptedLocalJobFailsWithoutReplayingModel(){
         var job=new RecordingMapper.AsrJob(id,visit,recordingId,null,"RUNNING",1,null,Instant.now(),"LOCAL");

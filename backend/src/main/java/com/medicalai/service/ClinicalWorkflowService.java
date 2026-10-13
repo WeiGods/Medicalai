@@ -57,6 +57,8 @@ public class ClinicalWorkflowService {
     private ExportFileService exportFiles;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ExportTemplateService exportTemplates;
+    @org.springframework.beans.factory.annotation.Autowired
+    private TranscriptRecoveryStore transcriptRecoveryStore;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
@@ -234,10 +236,16 @@ public class ClinicalWorkflowService {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
-        Optional<RecordingMapper.AsrJob> active = recordings.latestAsrJob(visit.id())
-                .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
-        if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
-        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+        Optional<RecordingMapper.AsrJob> active = recordings.activeAsrJob(visit.id());
+        String requestedRoute = resolveAsrProvider(visit,
+                (provider == null || provider.isBlank()) && active.isPresent() ? active.get().providerRoute() : provider);
+        if (active.isPresent()) {
+            if (!requestedRoute.equals(normalizeAsrProvider(active.get().providerRoute()))) {
+                throw BusinessException.conflict("ASR_ROUTE_MISMATCH", "当前 ASR 任务正在使用另一条路由，请等待任务结束后重试");
+            }
+            return asrJob(visitId, doctorId, active.get().id());
+        }
+        if ("DASHSCOPE".equals(requestedRoute) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
         recordings.requeueRetryableRecordings(visit.id());
@@ -247,7 +255,7 @@ public class ClinicalWorkflowService {
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
         // 步骤 4：创建 PENDING ASR 任务；定时工作线程会按任务路由异步领取并处理。
-        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider));
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(requestedRoute));
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -257,6 +265,7 @@ public class ClinicalWorkflowService {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
+        String requestedRoute = resolveAsrProvider(visit, provider);
         Recording recording = recordings.find(recordingId, doctorId)
                 .filter(item -> visit.id().equals(item.visitId()))
                 .orElseThrow(BusinessException::notFound);
@@ -269,15 +278,26 @@ public class ClinicalWorkflowService {
         if (visits.hasOpenSession(visit.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊仍有录音操作进行中，暂不能重新转写");
         }
-        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+        if ("DASHSCOPE".equals(requestedRoute) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
         storage.assertAsrSubmissionReady();
         if (!recordings.requeueTranscribedRecording(recording.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_STATE_CHANGED", "录音状态已变化，请刷新后重试");
         }
-        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider), recording.id());
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(requestedRoute), recording.id());
         invalidateClinicalExtraction(visit.id());
+        return asrJob(visitId, doctorId, jobId);
+    }
+
+    public AsrJobVO rebuildTranscript(UUID visitId, UUID doctorId, String provider, UUID snapshotId, boolean acknowledged) {
+        var prepared = transcriptRecoveryStore.prepare(visitId, doctorId, provider, snapshotId, acknowledged);
+        if (prepared.existing() != null) return asrJob(visitId, doctorId, prepared.existing().id());
+        if ("DASHSCOPE".equals(prepared.route()) && (dashscopeApiKey == null || dashscopeApiKey.isBlank()))
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "请先配置公网 ASR 凭据");
+        // Do not hold a visit lock while verifying retained audio in object storage.
+        for (Recording audio : prepared.audio()) storage.assertAudioAvailable(audio.objectKey());
+        UUID jobId = transcriptRecoveryStore.rebuild(visitId, doctorId, snapshotId, prepared);
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -364,7 +384,6 @@ public class ClinicalWorkflowService {
         requireRecordEditable(visit.id());
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
                 new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
-        // 提取路由已固定为公网；转写可以来自内网，但分析必须使用可配置的公网模型。
         return extractionService().generate(visit.id(), doctorId, snapshot,
                 routes.resolveAnalysis(snapshot, requestedProvider));
     }
@@ -441,20 +460,9 @@ public class ClinicalWorkflowService {
     }
 
     public TranscriptVO reclassifyTranscriptRoles(UUID visitId, UUID doctorId, String requestedProvider) {
-        Visit visit = owned(visitId, doctorId, false);
-        requireActive(visit);
-        requireRecordEditable(visit.id());
-        if (isConfirmed(visit.id())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
-        }
-        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
-                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
-        roleRouter.validateRequestedRoute(requestedProvider);
-        LlmRoute route = roleRouter.roleRoute();
-
-        List<Utterance> candidates = currentUtterances(visit.id()).stream()
-                .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
-                .toList();
+        var prepared = roleReclassificationStore.prepare(visitId, doctorId, requestedProvider);
+        LlmRoute route = prepared.route();
+        List<Utterance> candidates = prepared.candidates();
         if (candidates.isEmpty()) return transcript(visitId, doctorId);
 
         List<Map<String, Object>> inputs = new ArrayList<>();
@@ -469,7 +477,7 @@ public class ClinicalWorkflowService {
             inputs.add(input);
         }
 
-        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleRouter.assignRoles(inputs);
+        Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = roleRouter.assignRoles(route, inputs);
         List<RecordingMapper.RoleUpdate> updates = new ArrayList<>();
         for (int index = 0; index < candidates.size(); index++) {
             DashScopeRoleClient.RoleAssignment assignment = assignments.get(index);
@@ -477,8 +485,7 @@ public class ClinicalWorkflowService {
             updates.add(new RecordingMapper.RoleUpdate(candidates.get(index).id(), assignment.role(),
                     assignment.source(), assignment.confidence(), route.name()));
         }
-        roleReclassificationStore.apply(visit.id(), doctorId, updates, route);
-        invalidateClinicalExtraction(visit.id());
+        roleReclassificationStore.apply(visitId, doctorId, prepared, updates);
         return transcript(visitId, doctorId);
     }
 
@@ -979,6 +986,17 @@ public class ClinicalWorkflowService {
 
     private String queueProvider(String provider) {
         return "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;
+    }
+
+    private String normalizeAsrProvider(String provider) {
+        if (provider == null || provider.isBlank()) return "DASHSCOPE";
+        if ("LOCAL".equalsIgnoreCase(provider)) return "LOCAL";
+        if ("DASHSCOPE".equalsIgnoreCase(provider) || AsrJobWorker.PUBLIC_ROLE_ROUTE.equalsIgnoreCase(provider)) return "DASHSCOPE";
+        throw new BusinessException(HttpStatus.BAD_REQUEST, "ASR_ROUTE_UNKNOWN", "不支持的 ASR 路由");
+    }
+
+    private String resolveAsrProvider(Visit visit, String provider) {
+        return AsrRoutePolicy.resolve(visit, visits, provider);
     }
 
     private String displayProvider(String providerRoute) {

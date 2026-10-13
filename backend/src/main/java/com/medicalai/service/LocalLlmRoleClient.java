@@ -29,14 +29,14 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
 
 /**
- * 内网本地 LLM（llama.cpp / OpenAI 兼容）的角色识别适配器。
+ * 本地角色识别适配器，医疗业务统一经内部 AI 网关调用本地模型。
  *
  * <p>这是通信适配器网络层新增的一路：把 ASR 的 MOSS 匿名推理结果发送到内网本地 LLM 进行
- * speaker 识别（角色判断），与公网 DashScope 客户端互为替代路由。同步角色识别走
- * {@code POST /v1/chat/completions}（与 DashScope 客户端同语义：分批、重试、降级 FALLBACK）；
+ * speaker 识别（角色判断），与公网 DashScope 客户端互为替代路由。生产角色识别走
+ * {@code POST /internal/transcript/assign-roles}，保留分批、重试、降级 FALLBACK；
  * 另提供 SSE 流式对话能力 {@link #streamChat}，供流式输出场景使用。
  *
- * <p>默认不启用（{@code medicalai.local-llm.enabled=false}）。未启用时 {@link #assignRoles}
+ * <p>直接构造的兼容客户端可通过 {@code medicalai.local-llm.enabled=false} 禁用。未启用时 {@link #assignRoles}
  * 只会返回降级结果 (OTHER, null, FALLBACK)，绝不静默改走公网、也绝不发出任何网络请求。
  */
 @Service
@@ -68,8 +68,28 @@ public class LocalLlmRoleClient implements RoleLlmClient {
     private final int batchSize;
     private final int retryMaxAttempts;
     private final Duration retryDelay;
+    /** Spring 业务实例必选网关；旧构造器仅供嵌入式兼容和独立 streamChat 使用。 */
+    private AiServiceClient gateway;
 
     @Autowired
+    public LocalLlmRoleClient(
+            AiServiceClient gateway,
+            ObjectMapper mapper,
+            @Value("${medicalai.local-llm.enabled:false}") boolean enabled,
+            @Value("${medicalai.local-llm.endpoint:http://192.168.1.56:8080}") String endpoint,
+            @Value("${medicalai.local-llm.api-key:}") String apiKey,
+            @Value("${medicalai.local-llm.role-model:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}") String model,
+            @Value("${medicalai.local-llm.role-review-threshold:70}") int reviewThreshold,
+            @Value("${medicalai.local-llm.role-batch-size:40}") int batchSize,
+            @Value("${medicalai.local-llm.connect-timeout-ms:5000}") long connectTimeoutMs,
+            @Value("${medicalai.local-llm.read-timeout-ms:120000}") long readTimeoutMs,
+            @Value("${medicalai.local-llm.role-retry-max-attempts:2}") int retryMaxAttempts,
+            @Value("${medicalai.local-llm.role-retry-delay-ms:200}") long retryDelayMs) {
+        this(mapper, enabled, endpoint, apiKey, model, reviewThreshold, batchSize,
+                connectTimeoutMs, readTimeoutMs, retryMaxAttempts, retryDelayMs);
+        this.gateway = java.util.Objects.requireNonNull(gateway);
+    }
+
     public LocalLlmRoleClient(
             ObjectMapper mapper,
             @Value("${medicalai.local-llm.enabled:false}") boolean enabled,
@@ -123,7 +143,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
             LOG.warn("本地LLM角色判断已跳过：模型={}，句段数={}，原因=句段索引无效", model, turns.size());
             return fallbackAssignments(indexes);
         }
-        if (!enabled) {
+        if (!isConfigured()) {
             LOG.warn("本地LLM角色判断已跳过：模型={}，句段数={}，原因=未启用（LOCAL_LLM_ENABLED=true 时接入内网路由）",
                     model, turns.size());
             return fallbackAssignments(indexes);
@@ -151,7 +171,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
 
     @Override
     public boolean isConfigured() {
-        return enabled;
+        return enabled || gateway != null;
     }
 
     /**
@@ -263,6 +283,17 @@ public class LocalLlmRoleClient implements RoleLlmClient {
 
     private Map<Integer, DashScopeRoleClient.RoleAssignment> requestAssignments(
             List<Map<String, Object>> turns, Set<Integer> indexes) throws JsonProcessingException {
+        if (gateway != null) {
+            Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = gateway.assignRoleAssignments(turns);
+            if (assignments == null || !assignments.keySet().equals(indexes)
+                    || assignments.values().stream().anyMatch(assignment -> assignment == null
+                    || !SOURCE_LLM.equals(assignment.source()) || !ALLOWED_ROLES.contains(assignment.role())
+                    || assignment.confidence() == null || assignment.confidence() < MIN_CONFIDENCE
+                    || assignment.confidence() > MAX_CONFIDENCE)) {
+                throw new InvalidRoleResponseException("本地 AI 网关未返回完整角色判断结果");
+            }
+            return assignments;
+        }
         var requestBuilder = client.post()
                 .uri("/v1/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)

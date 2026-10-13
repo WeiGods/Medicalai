@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api } from '../api'
 import '../routeSelection.css'
+import { api } from '../api'
 import Icon from './Icon.vue'
 import TemplateManagement from './TemplateManagement.vue'
 import RecordingAudioPlayer from './RecordingAudioPlayer.vue'
@@ -9,7 +9,7 @@ import AsrPreviewCard from './AsrPreviewCard.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
-import type { AsrJob, AsrPreviewRecording, AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, ExportTemplate, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
+import type { AsrJob, AsrPreviewRecording, AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, ExportTemplate, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
@@ -24,7 +24,7 @@ const previewFormat = ref<'PDF' | 'DOCX'>('PDF')
 
 type MainView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export' | 'audit' | 'templates'
 type WorkflowView = 'workbench' | 'audio' | 'transcript' | 'record' | 'export'
-type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'help' | 'activity' | 'delete-recording' | 'delete-patient' | null
+type ModalKind = 'new-patient' | 'cancel' | 'finish' | 'regenerate' | 'confirm' | 'supplemental-transcription' | 'retranscribe-recording' | 'rebuild-transcript' | 'help' | 'activity' | 'delete-recording' | 'delete-patient' | null
 type EditableUtteranceRole = 'DOCTOR' | 'PATIENT' | 'OTHER'
 type ManualPatientForm = { name: string; gender: string; age: number | '' | null; phone: string; idNo: string }
 type ManualPatientField = keyof ManualPatientForm
@@ -56,6 +56,7 @@ const busy = ref(false)
 const actionBusy = ref<'' | 'upload' | 'delete' | 'delete-patient' | 'transcribe' | 'generate' | 'extract' | 'confirm-extraction' | 'save' | 'role' | 'reclassify-roles' | 'confirm'>('')
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
+const hasActiveAsrTask = ref(false)
 const recordings = ref<Recording[]>([])
 const asrPreviews = ref<AsrPreviewRecording[]>([])
 const asrPreviewError = ref('')
@@ -78,8 +79,9 @@ const auditTotal = ref(0)
 const auditBusy = ref(false)
 const transcriptTab = ref<'dialogue' | 'edit' | 'facts'>('dialogue')
 const transcriptDraft = ref('')
-// 混合来源只能在当前快照上由医生一次性选择；快照变动后旧选择不能复用。
-const selectedLlmRoute = ref<LlmProvider | null>(null)
+// 恢复操作需要确认草稿清理，普通 AI 操作始终跟随快照来源。
+const rebuildChecked = ref(false)
+const rebuildSourceSnapshotId = ref('')
 const modal = ref<ModalKind>(null)
 const modalError = ref('')
 const confirmChecked = ref(false)
@@ -179,7 +181,6 @@ watch(modal, async value => {
 })
 
 watch(() => transcript.value?.snapshot_id, () => {
-  selectedLlmRoute.value = null
 })
 
 watch(view, (next, previous) => {
@@ -485,16 +486,22 @@ const exported = computed(() => !!record.value && exports.value.some(item =>
   item.version_no === record.value?.version_no && item.status === 'SUCCEEDED'))
 const sourceDirty = computed(() => !!record.value?.source_dirty)
 const locked = computed(() => readOnlyCurrentPatient.value || closed.value || confirmed.value || !!actionBusy.value)
-const llmRouting = computed(() => extraction.value || transcript.value)
-const routeSelectionRequired = computed(() => false)
+const llmRouting = computed(() => extraction.value?.snapshot_id === transcript.value?.snapshot_id && extraction.value?.snapshot_id
+  ? extraction.value : transcript.value)
 const sourceRouteLabel = computed(() => {
   const route = llmRouting.value?.source_route
-  return route === 'DASHSCOPE' ? '公网 LLM（DashScope）'
-    : route === 'LOCAL' ? '内网转写来源 · 分析走公网'
-    : route === 'MIXED' ? '混合转写来源 · 分析走公网'
+  return route === 'DASHSCOPE' ? '公网处理'
+    : route === 'LOCAL' ? '本地处理（ASR、角色判断、信息提取）'
+    : route === 'MIXED' || route === 'UNKNOWN' ? '请统一当前接诊的 ASR 路由并重新转写'
     : ''
 })
-const routeSelectionReady = computed(() => !routeSelectionRequired.value || !!selectedLlmRoute.value)
+const routeSelectionReady = computed(() => ['DASHSCOPE', 'LOCAL'].includes(String(llmRouting.value?.source_route || '')))
+const pinnedAsrRoute = computed(() => currentVisit.value?.processing_route || currentVisit.value?.recovery_route)
+const recoveryRequired = computed(() => !!transcript.value?.snapshot_id
+  && ['MIXED', 'UNKNOWN'].includes(String(transcript.value?.source_route)))
+const canRebuildTranscript = computed(() => recoveryRequired.value && active.value && !locked.value
+  && confirmations.value.length === 0 && !hasActiveAsrTask.value && recordingState.value === 'idle'
+  && !recordings.value.some(r => r.status === 'PROCESSING'))
 const workflowView = computed<WorkflowView>(() => {
   if (waiting.value) return 'workbench'
   if (!recordings.value.length || !allTranscribed.value) return 'audio'
@@ -691,6 +698,7 @@ async function refreshVisitState() {
   exports.value = exportList
   transcriptDraft.value = transcriptState.transcript
   activeAsrJob = activeJob
+  hasActiveAsrTask.value = !!activeJob && ['PENDING', 'RUNNING'].includes(activeJob.status)
   syncAsrPreviewPolling(visit.id, revision, recordingList, activeJob)
 }
 
@@ -702,6 +710,7 @@ function clearAsrPreviewPolling() {
   asrPreviewPollVisitId = ''
   asrPreviewPollRevision = 0
   activeAsrJob = null
+  hasActiveAsrTask.value = false
 }
 
 function syncAsrPreviewPolling(visitId: string, revision: number, recordingList: Recording[], job: AsrJob | null = activeAsrJob) {
@@ -753,6 +762,7 @@ function syncAsrPreviewPolling(visitId: string, revision: number, recordingList:
         ? activeJobResult.value?.status === 'PENDING' || activeJobResult.value?.status === 'RUNNING'
         : activeAsrJob?.status === 'PENDING' || activeAsrJob?.status === 'RUNNING'
       const previewSucceeded = previewResult.status === 'fulfilled'
+      hasActiveAsrTask.value = taskStillActive
       if (latestRecordings && previewSucceeded
           && !latestRecordings.some(item => item.status === 'PROCESSING') && !taskStillActive) {
         clearAsrPreviewPolling()
@@ -1299,13 +1309,18 @@ async function retranscribeSelectedRecording() {
 }
 
 watch(() => currentVisit.value?.id, (visitId, previousVisitId) => {
-  asrProvider.value = 'DASHSCOPE'
+  asrProvider.value = pinnedAsrRoute.value || 'DASHSCOPE'
+  rebuildChecked.value = false
   activeAsrProvider.value = null
   if (previousVisitId && visitId !== previousVisitId) {
     clearAsrPreviewPolling()
     asrPreviews.value = []
     asrPreviewError.value = ''
   }
+})
+
+watch(pinnedAsrRoute, route => {
+  if (route) asrProvider.value = route
 })
 
 function requestTranscription() {
@@ -1353,6 +1368,49 @@ async function startTranscription() {
   } finally {
     actionBusy.value = ''
   }
+}
+
+function openTranscriptRecovery() {
+  if (!canRebuildTranscript.value) return
+  rebuildChecked.value = false
+  rebuildSourceSnapshotId.value = transcript.value?.snapshot_id || ''
+  modalError.value = ''
+  modal.value = 'rebuild-transcript'
+}
+
+async function rebuildTranscript() {
+  if (!currentVisit.value || !canRebuildTranscript.value || !rebuildChecked.value) return
+  const visitId = currentVisit.value.id
+  actionBusy.value = 'transcribe'
+  try {
+    const job = await api.rebuildTranscript(visitId, asrProvider.value, rebuildSourceSnapshotId.value)
+    if (currentVisit.value?.id !== visitId) return
+    modal.value = null
+    activeAsrProvider.value = job.provider_route
+    await loadAll(true)
+    navigate('audio')
+    toast('整份恢复已提交，原始录音保留；完成后请重新核对转写、信息提取和病历。')
+    // Existing preview/job polling also restores this task after a page reload.
+    for (let attempt = 0; attempt < 240; attempt++) {
+      await new Promise(resolve => window.setTimeout(resolve, 3000))
+      if (currentVisit.value?.id !== visitId) return
+      const state = await api.transcribeStatus(visitId, job.job_id)
+      await loadAll(true)
+      if (state.status === 'SUCCEEDED') {
+        transcript.value = state.transcript
+        transcriptDraft.value = state.transcript?.transcript || ''
+        navigate('transcript')
+        toast('整份恢复完成，请重新核对全部结果。')
+        return
+      }
+      if (state.status === 'FAILED') throw new Error(state.error_message || '恢复失败，请在音频页按原路由重试')
+    }
+    throw new Error('恢复仍在处理中，请稍后查看任务状态')
+  } catch (error) {
+    if (currentVisit.value?.id === visitId) await loadAll(true)
+    modalError.value = error instanceof Error ? error.message : '整份恢复失败'
+    toast(modalError.value, 'error')
+  } finally { actionBusy.value = '' }
 }
 
 async function saveTranscript() {
@@ -1419,12 +1477,10 @@ async function confirmCurrentUtteranceRole(turn: Utterance | undefined) {
 }
 
 async function reclassifyTranscriptRoles() {
-  if (!currentVisit.value || !roleReviewCount.value || !turnsMatchTranscript.value || locked.value) return
+  if (!currentVisit.value || !roleReviewCount.value || !turnsMatchTranscript.value || locked.value || !routeSelectionReady.value) return
   actionBusy.value = 'reclassify-roles'
   try {
-    const updated = selectedLlmRoute.value
-      ? await api.reclassifyTranscriptRoles(currentVisit.value.id, selectedLlmRoute.value)
-      : await api.reclassifyTranscriptRoles(currentVisit.value.id)
+    const updated = await api.reclassifyTranscriptRoles(currentVisit.value.id)
     transcript.value = updated
     transcriptDraft.value = updated.transcript
     addLog('使用 AI 重新判断未人工确认的句段角色')
@@ -1703,10 +1759,10 @@ function stopRecording() {
 }
 
 async function generateClinicalExtraction() {
-  if (!currentVisit.value || locked.value) return
+  if (!currentVisit.value || locked.value || !routeSelectionReady.value) return
   actionBusy.value = 'extract'
   try {
-    extraction.value = await api.generateClinicalExtraction(currentVisit.value.id, 'DASHSCOPE')
+    extraction.value = await api.generateClinicalExtraction(currentVisit.value.id)
     transcriptTab.value = 'facts'
     if (extraction.value?.status === 'GENERATED') {
       addLog('生成可追溯信息提取结果')
@@ -2443,11 +2499,12 @@ defineExpose({ selectPatient })
               <div v-if="recordings.length" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
                   <legend>转写模型</legend>
-                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网 ASR</label>
-                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地 ASR</label>
+                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'DASHSCOPE'" />公网 ASR</label>
+                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'LOCAL'" />本地 ASR</label>
                 </fieldset>
-                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
+                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '本地 ASR、角色判断和信息提取' : '公网 ASR、角色判断和信息提取' }}；首次成功转写后锁定接诊路由，失败请使用原路由重试。</p>
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
+                <button v-if="recoveryRequired" class="btn small" :disabled="!canRebuildTranscript" @click="openTranscriptRecovery">统一路由并恢复整份转写</button>
               </div>
               <div v-if="recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" style="margin-top:13px">
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
@@ -2461,13 +2518,16 @@ defineExpose({ selectPatient })
             <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2>
               <div class="record-header-actions"><button class="text-btn" :disabled="!transcriptDraft" aria-label="复制转写文本" @click="copyTranscript"><Icon name="copy" /></button></div>
             </div>
+            <p v-if="transcript?.snapshot_id && !routeSelectionReady" class="modal-note" role="alert">请统一当前接诊的 ASR 路由并重新转写</p>
+            <p v-else-if="sourceRouteLabel" class="small-muted" style="padding:10px 18px">{{ sourceRouteLabel }}</p>
+            <div v-if="recoveryRequired && !readOnlyCurrentPatient" class="extraction-actions"><button class="btn small" :disabled="!canRebuildTranscript" @click="openTranscriptRecovery">统一路由并恢复整份转写</button><span v-if="confirmations.length" class="small-muted">有签署历史，不能清理恢复。</span></div>
             <template v-if="transcriptDraft">
               <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
                 <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
                 <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
                   <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
                 </div>
-             <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
+             <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
               </aside>
            <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -2501,7 +2561,7 @@ defineExpose({ selectPatient })
                 </template>
                 <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
              <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions">
-                  <span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div>
+                  <span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span>
                   <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button>
                   <button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
                 </div>
@@ -2665,11 +2725,12 @@ defineExpose({ selectPatient })
               <div v-if="recordings.length && !readOnlyCurrentPatient" class="asr-controls">
                 <fieldset :disabled="locked" class="asr-selector">
                   <legend>转写模型</legend>
-                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" />公网转写</label>
-                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" />本地转写</label>
+                  <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="asr-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'DASHSCOPE'" />公网转写</label>
+                  <label><input v-model="asrProvider" type="radio" value="LOCAL" name="asr-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'LOCAL'" />本地转写</label>
                 </fieldset>
-                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '使用本地模型转写录音' : '使用公网模型转写录音' }}；失败后可切换模型重试。</p>
+                <p class="small-muted">{{ asrProvider === 'LOCAL' ? '本地 ASR、角色判断和信息提取' : '公网 ASR、角色判断和信息提取' }}；首次成功转写后锁定接诊路由，失败请使用原路由重试。</p>
                 <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
+                <button v-if="recoveryRequired" class="btn small" :disabled="!canRebuildTranscript" @click="openTranscriptRecovery">统一路由并恢复整份转写</button>
               </div>
               <div v-if="!readOnlyCurrentPatient && recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
                 <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
@@ -2729,12 +2790,15 @@ defineExpose({ selectPatient })
       <div v-else-if="view === 'transcript'" class="full-view transcript-view">
         <section class="card">
           <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button v-if="canReturnToAudio" class="btn small" aria-label="返回录音上传" @click="navigate('audio')"><Icon name="arrow-left" />返回录音上传</button><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
+          <p v-if="transcript?.snapshot_id && !routeSelectionReady" class="modal-note" role="alert">请统一当前接诊的 ASR 路由并重新转写</p>
+          <p v-else-if="sourceRouteLabel" class="small-muted" style="padding:10px 18px">{{ sourceRouteLabel }}</p>
+          <div v-if="recoveryRequired && !readOnlyCurrentPatient" class="extraction-actions"><button class="btn small" :disabled="!canRebuildTranscript" @click="openTranscriptRecovery">统一路由并恢复整份转写</button><span v-if="confirmations.length" class="small-muted">有签署历史，不能清理恢复。</span></div>
           <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
             <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
             <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
               <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
             </div>
-            <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
+            <div class="role-attention-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><template v-if="!readOnlyCurrentPatient"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript || !routeSelectionReady" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
           </aside>
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
@@ -2763,7 +2827,7 @@ defineExpose({ selectPatient })
               <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact"><div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
             </template>
             <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-            <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><div v-if="routeSelectionRequired" class="route-selector" role="group" aria-label="选择 AI 处理路由"><button v-for="route in transcript?.available_routes" :key="route" type="button" class="route-option" :class="{ active: selectedLlmRoute === route }" @click="selectedLlmRoute = route">{{ route === 'DASHSCOPE' ? '公网' : '内网' }}</button></div><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
+            <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span v-if="sourceRouteLabel" class="small-muted">{{ sourceRouteLabel }}</span><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed || !routeSelectionReady" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
           </div>
           <div class="transcript-actions"><span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
             <button v-if="!readOnlyCurrentPatient && transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
@@ -2889,7 +2953,7 @@ defineExpose({ selectPatient })
     <div v-if="modal" class="modal-backdrop" role="presentation" @click.self="modal=null" @keydown.esc="modal=null">
       <div ref="modalDialog" class="modal-dialog" role="dialog" aria-modal="true" :aria-labelledby="`modal-title-${modal}`" tabindex="-1" @keydown.esc.stop="modal=null">
         <div class="modal-head">
-          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','supplemental-transcription':'重新转写确认','retranscribe-recording':'重新转写录音','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音','delete-patient':'删除患者及业务数据' })[modal] }}</h2>
+          <h2 :id="`modal-title-${modal}`">{{ ({ 'new-patient':'新增患者','cancel':'取消本次接诊','finish':'结束本次接诊','regenerate':'重新生成当前病历','confirm':'确认并签署病历','supplemental-transcription':'重新转写确认','retranscribe-recording':'重新转写录音','rebuild-transcript':'统一路由并恢复整份转写','help':'使用帮助','activity':'当前接诊动态','delete-recording':'删除录音','delete-patient':'删除患者及业务数据' })[modal] }}</h2>
           <button class="icon-btn" aria-label="关闭对话框" @click="modal=null"><Icon name="x" /></button>
         </div>
         <div class="modal-body">
@@ -2918,12 +2982,22 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'finish'"><p>{{ currentPatient?.name }} 的病历 <b>v{{ record?.version_no }}.0</b> 已签署并导出。</p><p>结束后本次接诊将归档。</p></template>
           <template v-else-if="modal === 'regenerate'"><p>将使用当前已采用的转写文本，覆盖 <b>接诊 {{ currentVisit?.visit_no }}</b> 的当前草稿内容，并创建新版本。</p><p>医生手动编辑的内容也会被替换，请确认已保存所需内容。</p></template>
           <template v-else-if="modal === 'supplemental-transcription'"><p>将把补传录音与已转写录音合并，重新生成本次接诊的完整转写文本。</p><p>当前手工编辑的转写文本和病历草稿将失效，需在新转写完成后重新生成并核对病历。</p></template>
-          <template v-else-if="modal === 'retranscribe-recording'"><p>将保留原录音文件，仅使用当前选择的 <b>{{ asrProvider === 'LOCAL' ? '本地' : '公网' }} ASR</b> 重新转写 <b>{{ recordingToRetranscribe?.file_name }}</b>。</p><p>当前手工编辑的转写文本、信息提取和病历草稿将失效，转写完成后必须重新核对并生成病历。</p><div class="modal-note">如需切换 ASR，请先返回录音上传页选择路由；该操作只允许在接诊进行中执行。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
+          <template v-else-if="modal === 'retranscribe-recording'"><p>将保留原录音文件，使用本接诊的 <b>{{ asrProvider === 'LOCAL' ? '本地' : '公网' }} ASR</b> 重新转写 <b>{{ recordingToRetranscribe?.file_name }}</b>。</p><p>当前手工编辑的转写文本、信息提取和病历草稿将失效，转写完成后必须重新核对并生成病历。</p><div class="modal-note">本接诊首次成功转写后不能切换 ASR 路由；该操作只允许在接诊进行中执行。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'confirm'">
             <p>患者 <b>{{ recordForm?.name }}</b> · 接诊 <b>{{ currentVisit?.visit_no }}</b> · 病历 <b>v{{ record?.version_no }}.0</b></p>
             <p>签署后将记录签署医生、时间及版本，并锁定当前病历；后续修改会创建新修订版并需重新签署。</p>
             <label class="confirm-check"><input v-model="confirmChecked" type="checkbox" /><span>我已核对病历内容，确认当前记录准确反映本次接诊情况。</span></label>
             <div class="modal-error">{{ modalError }}</div>
+          </template>
+          <template v-else-if="modal === 'rebuild-transcript'">
+            <p>将保留全部原始录音，清理当前转写、人工角色修订、信息提取及未签署病历草稿，再使用统一路由重新转写整份接诊。</p>
+            <p>本操作不能撤销草稿清理。已有签署历史的接诊不能执行恢复。</p>
+            <div class="asr-provider-options">
+              <label><input v-model="asrProvider" type="radio" value="DASHSCOPE" name="rebuild-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'DASHSCOPE'" />公网处理</label>
+              <label><input v-model="asrProvider" type="radio" value="LOCAL" name="rebuild-provider" :disabled="!!pinnedAsrRoute && pinnedAsrRoute !== 'LOCAL'" />本地处理</label>
+            </div>
+            <label class="confirm-check"><input v-model="rebuildChecked" type="checkbox" /><span>我确认清理未签署草稿，并在恢复完成后重新核对全部转写、信息提取及病历。</span></label>
+            <div v-if="modalError" class="modal-error">{{ modalError }}</div>
           </template>
           <template v-else-if="modal === 'delete-recording'"><p>确定删除录音 <b>{{ recordingToDelete?.file_name }}</b> 吗？</p><p>删除后录音对象和相关转写链路会物理清理，且不会写入删除审计，可重新上传正确录音。</p><p>当前手工编辑的转写文本、信息提取和病历草稿会失效，需重新转写、核对并生成病历。</p><div class="modal-note">该操作只允许在接诊进行中执行；已完成接诊不能删除录音。</div><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
           <template v-else-if="modal === 'delete-patient'"><p>即将删除患者 <b>{{ currentPatient?.name }}</b>（患者编号 <b>{{ currentPatient?.patient_no }}</b>，{{ currentPatient?.gender || '性别未记录' }}，{{ currentPatient?.age ?? '年龄未记录' }} 岁），共包含 <b>{{ currentPatientVisitCount }}</b> 条接诊记录。</p><p>患者和所有接诊业务数据将立即物理删除，包含录音、转写、信息提取、病历、导出记录及其业务文件；既有审计日志和此次删除记录会保留。</p><div class="modal-note">此操作无法撤销。外部文件暂时无法删除时，后台会继续重试。</div><label class="confirm-check"><input v-model="deletePatientChecked" type="checkbox" /><span>我已核对患者身份和接诊数量，确认永久删除该患者的全部业务数据。</span></label><div v-if="modalError" class="modal-error">{{ modalError }}</div></template>
@@ -2937,6 +3011,7 @@ defineExpose({ selectPatient })
           <template v-else-if="modal === 'regenerate'"><button class="btn" @click="modal=null">返回</button><button class="btn primary" :disabled="busy" @click="modal=null;generateRecord()"><Icon name="refresh" />重新生成</button></template>
           <template v-else-if="modal === 'supplemental-transcription'"><button class="btn" @click="modal=null">返回检查</button><button class="btn primary" aria-label="确认重新转写" :disabled="locked" @click="modal=null;startTranscription()"><Icon name="refresh" />继续转写</button></template>
           <template v-else-if="modal === 'retranscribe-recording'"><button class="btn" @click="modal=null">返回检查</button><button class="btn primary" aria-label="确认重新转写录音" :disabled="locked" @click="retranscribeSelectedRecording"><Icon name="refresh" />确认重新转写</button></template>
+          <template v-else-if="modal === 'rebuild-transcript'"><button class="btn" @click="modal=null">返回检查</button><button class="btn danger" :disabled="!rebuildChecked || !canRebuildTranscript" @click="rebuildTranscript">确认整份恢复</button></template>
           <template v-else-if="modal === 'confirm'"><button class="btn" @click="modal=null">返回核对</button><button class="btn primary" :disabled="busy || actionBusy === 'confirm'" @click="doConfirm"><Icon name="shield" />确认签署</button></template>
           <template v-else-if="modal === 'delete-recording'"><button class="btn" @click="modal=null">返回</button><button class="btn danger" :disabled="actionBusy === 'delete'" @click="deleteSelectedRecording"><Icon name="trash" />确认删除</button></template>
           <template v-else-if="modal === 'delete-patient'"><button class="btn" @click="modal=null; deletePatientChecked=false">取消</button><button class="btn danger" :disabled="!deletePatientChecked || actionBusy === 'delete-patient'" @click="deleteSelectedPatient"><Icon name="trash" />永久删除患者</button></template>

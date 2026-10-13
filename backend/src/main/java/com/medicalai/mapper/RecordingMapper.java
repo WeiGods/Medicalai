@@ -54,7 +54,7 @@ public class RecordingMapper {
                 INSERT INTO recording(id,visit_id,recording_no,source_type,object_key,file_name,mime_type,size_bytes,duration_ms,status,asr_route)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING *
                 """, RECORDING, r.id(), r.visitId(), r.recordingNo(), r.sourceType(), r.objectKey(),
-                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), "DASHSCOPE");
+                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), null);
     }
 
     public int delete(UUID id) {
@@ -112,6 +112,48 @@ public class RecordingMapper {
                 SELECT EXISTS(SELECT 1 FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'
                               AND status IN ('PENDING','RUNNING'))
                 """, Boolean.class, visitId));
+    }
+
+    public boolean hasConflictingAsrJob(UUID visitId, UUID jobId, String route) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM ai_job WHERE visit_id=? AND id<>?
+                  AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
+                  AND CASE WHEN upper(coalesce(provider_route,'DASHSCOPE')) IN ('DASHSCOPE','DASHSCOPE_ROLE_V2')
+                      THEN 'DASHSCOPE' ELSE upper(provider_route) END IS DISTINCT FROM ?)
+                """, Boolean.class, visitId, jobId, route));
+    }
+
+    /** A rejected legacy task must never fail a completed recording or another task's recording. */
+    public void failOwnedRecording(UUID jobId, String message) {
+        jdbc.update("""
+                UPDATE recording r SET status='FAILED',error_code='ASR_FAILED',error_message=?,
+                    updated_at=medicalai_local_now()
+                WHERE r.status='PROCESSING' AND EXISTS (
+                    SELECT 1 FROM ai_job j WHERE j.id=? AND j.recording_id=r.id AND j.status='RUNNING')
+                  AND NOT EXISTS (SELECT 1 FROM ai_job other WHERE other.recording_id=r.id AND other.id<>?
+                    AND other.job_type='ASR_TRANSCRIBE' AND other.status='RUNNING')
+                """, message, jobId, jobId);
+    }
+
+    public Optional<AsrJob> rebuildJob(UUID visitId, UUID snapshotId) {
+        return jdbc.query("SELECT id FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE' AND idempotency_key=?",
+                (rs, n) -> rs.getObject("id", UUID.class), visitId, rebuildKey(visitId, snapshotId))
+                .stream().findFirst().flatMap(id -> asrJob(id, visitId));
+    }
+
+    public UUID createRebuildJob(UUID visitId, UUID snapshotId, String provider) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,provider_route)
+                VALUES (?,'ASR_TRANSCRIBE',?,?,'PENDING',?)
+                """, id, visitId, rebuildKey(visitId, snapshotId), provider);
+        return id;
+    }
+
+    private String rebuildKey(UUID visitId, UUID snapshotId) { return "rebuild:" + visitId + ":" + snapshotId; }
+
+    public void resetRecordingRoutes(UUID visitId) {
+        jdbc.update("UPDATE recording SET asr_route=NULL WHERE visit_id=?", visitId);
     }
 
     /** 剥离转写任务对录音的外键引用，允许删除转写失败的录音。 */
@@ -179,7 +221,9 @@ public class RecordingMapper {
                     FROM ai_job j
                     WHERE j.job_type='ASR_TRANSCRIBE'
                       AND j.status IN ('PENDING','RUNNING')
-                      AND COALESCE(j.provider_route,'DASHSCOPE')=?
+                      AND CASE WHEN ?='DASHSCOPE_ROLE_V2'
+                          THEN COALESCE(j.provider_route,'DASHSCOPE') IN ('DASHSCOPE','DASHSCOPE_ROLE_V2')
+                          ELSE COALESCE(j.provider_route,'DASHSCOPE')=? END
                       AND (j.locked_at IS NULL OR j.locked_at < medicalai_local_clock() - interval '2 minutes')
                     ORDER BY j.created_at
                     FOR UPDATE SKIP LOCKED
@@ -194,7 +238,7 @@ public class RecordingMapper {
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
                         DatabaseDateTime.getInstant(rs, "started_at"),
-                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), provider, leaseToken);
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), provider, provider, leaseToken);
         return jobs.stream().findFirst();
     }
 
@@ -424,10 +468,10 @@ public class RecordingMapper {
     /** 快照来源表是路由唯一可信来源，编辑快照复制来源表后仍可保持同一处理边界。 */
     public List<String> snapshotAsrRoutes(UUID snapshotId) {
         return jdbc.query("""
-                SELECT DISTINCT COALESCE(r.asr_route,'')
+                SELECT DISTINCT CASE WHEN r.id IS NULL THEN 'UNKNOWN' ELSE COALESCE(r.asr_route,'') END
                 FROM dialogue_snapshot_source source
-                JOIN asr_utterance utterance ON utterance.id=source.utterance_id
-                JOIN recording r ON r.id=utterance.recording_id
+                LEFT JOIN asr_utterance utterance ON utterance.id=source.utterance_id
+                LEFT JOIN recording r ON r.id=utterance.recording_id
                 WHERE source.snapshot_id=?
                 ORDER BY 1
                 """, (rs, n) -> rs.getString(1), snapshotId);
