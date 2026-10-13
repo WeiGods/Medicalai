@@ -39,6 +39,19 @@ class AsrRoutingTest {
         verify(recordings,never()).createAsrJob(any(),any());
         verify(recordings,never()).requeueRetryableRecordings(any());
     }
+    @Test void activeJobQueryRestoresQueuedTaskState() {
+        var pending = job("PENDING", AsrJobWorker.PUBLIC_ROLE_ROUTE);
+        when(recordings.activeAsrJob(visitId)).thenReturn(Optional.of(pending));
+        when(recordings.list(visitId)).thenReturn(List.of());
+
+        var response = workflow.activeAsrJob(visitId, doctorId, DoctorRole.DOCTOR);
+
+        assertNotNull(response);
+        assertEquals(jobId, response.jobId());
+        assertEquals("PENDING", response.status());
+        assertEquals("DASHSCOPE", response.providerRoute());
+        assertEquals(0, response.completedRecordings());
+    }
     @ParameterizedTest @ValueSource(strings={"DASHSCOPE","LOCAL"})
     void retryCreatesTaskWithSelectedProvider(String provider) {
         String queueProvider = "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;

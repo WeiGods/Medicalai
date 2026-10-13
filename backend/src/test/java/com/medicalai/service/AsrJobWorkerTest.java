@@ -44,16 +44,33 @@ class AsrJobWorkerTest {
         verifyNoInteractions(cloud);
         verifyNoInteractions(internal);
         verify(storage,never()).presignedUrl(any());
+        org.mockito.InOrder sequence = inOrder(store, roles);
+        sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(
+                new AsrSegment("头疼",0,100,2),new AsrSegment("嗯",110,200,null))));
+        sequence.verify(roles).assignRoles(any());
         verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
                 new RecordingMapper.Turn("PATIENT","头疼",0,100,2,"LLM",88,"DASHSCOPE"),
                 new RecordingMapper.Turn("OTHER","嗯",110,200,null,"FALLBACK",null,"DASHSCOPE"))), isNull());
     }
-    @Test void localJobFailsBeforeInferenceWhenPublicRoleLlmIsMissing(){
+    @Test void localJobSavesAsrPreviewBeforeFailingWhenPublicRoleLlmIsMissing(){
         var job=pending("LOCAL");
+        var audio=new ByteArrayResource(new byte[]{1});
+        var segment=new AsrSegment("可预览的原始识别文字",0,100,2);
+        when(storage.load("key")).thenReturn(audio);
+        when(local.transcribeDetailed(audio,"a.wav","audio/wav"))
+                .thenReturn(new AsrResult(List.of(segment), null));
         when(roles.isConfigured()).thenReturn(false);
+
         worker.processLocal();
-        verifyNoInteractions(local,cloud,internal);
-        verify(store).fail(eq(job),any(),contains("未配置 DASHSCOPE_API_KEY"));
+
+        org.mockito.InOrder sequence=inOrder(local,store,roles);
+        sequence.verify(local).transcribeDetailed(audio,"a.wav","audio/wav");
+        sequence.verify(store).savePreview(eq(job),any(),eq(recordingId),eq(List.of(segment)));
+        sequence.verify(roles).isConfigured();
+        sequence.verify(store).fail(eq(job),any(),contains("未配置 DASHSCOPE_API_KEY"));
+        verifyNoInteractions(cloud,internal);
+        verify(roles,never()).assignRoles(any());
+        verify(store,never()).complete(any(),any(),any(),any());
     }
     @Test void publicCompletionNeverCallsLocalService(){
         var job=new RecordingMapper.AsrJob(id,visit,recordingId,"task","RUNNING",1,null,Instant.now(),AsrJobWorker.PUBLIC_ROLE_ROUTE);
@@ -64,8 +81,28 @@ class AsrJobWorkerTest {
         when(roles.assignRoles(any())).thenReturn(Map.of(0,new DashScopeRoleClient.RoleAssignment("DOCTOR",91,"LLM")));
         worker.processPublic();
         verifyNoInteractions(local,storage,internal);
+        org.mockito.InOrder sequence = inOrder(store, roles);
+        sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(new AsrSegment("哪里疼",0,100,null))));
+        sequence.verify(roles).assignRoles(any());
         verify(store).complete(eq(job),any(),eq(recordingId),eq(List.of(
                 new RecordingMapper.Turn("DOCTOR","哪里疼",0,100,null,"LLM",91,"DASHSCOPE"))), isNull());
+    }
+    @Test void roleAssignmentFailureLeavesPreviouslySavedPreviewAndDoesNotCompleteTranscript() {
+        var job = pending("LOCAL");
+        var audio = new ByteArrayResource(new byte[]{1});
+        var segment = new AsrSegment("原始识别文字", 0, 100, 1);
+        when(storage.load("key")).thenReturn(audio);
+        when(local.transcribeDetailed(audio, "a.wav", "audio/wav"))
+                .thenReturn(new AsrResult(List.of(segment), null));
+        when(roles.assignRoles(any())).thenThrow(new IllegalStateException("role model unavailable"));
+
+        worker.processLocal();
+
+        org.mockito.InOrder sequence = inOrder(store, roles);
+        sequence.verify(store).savePreview(eq(job), any(), eq(recordingId), eq(List.of(segment)));
+        sequence.verify(roles).assignRoles(any());
+        sequence.verify(store).fail(eq(job), any(), contains("role model unavailable"));
+        verify(store, never()).complete(any(), any(), any(), any());
     }
     @Test void interruptedLocalJobFailsWithoutReplayingModel(){
         var job=new RecordingMapper.AsrJob(id,visit,recordingId,null,"RUNNING",1,null,Instant.now(),"LOCAL");

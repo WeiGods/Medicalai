@@ -117,6 +117,16 @@ public class RecordingMapper {
     /** 剥离转写任务对录音的外键引用，允许删除转写失败的录音。 */
     public void detachAsrJobs(UUID recordingId) {
         jdbc.update("UPDATE ai_job SET recording_id=NULL WHERE recording_id=? AND job_type='ASR_TRANSCRIBE'", recordingId);
+        // A failed recording may already have an ASR preview and its processing session.
+        // Completed recordings have these rows removed by purgeVisitDerivedData first;
+        // keep sessions that still back historical snapshots.
+        jdbc.update("DELETE FROM asr_utterance WHERE recording_id=? AND result_type='PREVIEW'", recordingId);
+        jdbc.update("""
+                DELETE FROM recording_session session
+                WHERE session.recording_id=?
+                  AND NOT EXISTS (SELECT 1 FROM asr_utterance utterance WHERE utterance.session_id=session.id)
+                  AND NOT EXISTS (SELECT 1 FROM dialogue_snapshot snapshot WHERE snapshot.session_id=session.id)
+                """, recordingId);
     }
 
     public Recording updateStatus(UUID id, String status, String error) {
@@ -229,6 +239,7 @@ public class RecordingMapper {
 
     /** 使失败任务及修复前遗留的孤立 PROCESSING 记录能够显式重试。 */
     public void requeueRetryableRecordings(UUID visitId) {
+        // 保留上一次原文供用户查看；ASR 重试成功后 savePreview 会原子替换旧预览。
         jdbc.update("""
                 UPDATE recording SET status='UPLOADED',error_code=NULL,error_message=NULL,updated_at=medicalai_local_now()
                 WHERE visit_id=?
@@ -289,6 +300,21 @@ public class RecordingMapper {
                         rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId).stream().findFirst();
     }
 
+    /** 返回接诊中最近创建的 ASR 任务；用于页面恢复 PENDING/RUNNING 任务跟踪。 */
+    public Optional<AsrJob> activeAsrJob(UUID visitId) {
+        return jdbc.query("""
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
+                FROM ai_job
+                WHERE visit_id=? AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
+                ORDER BY created_at DESC LIMIT 1
+                """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
+                        rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
+                        rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
+                        DatabaseDateTime.getInstant(rs, "started_at"),
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId)
+                .stream().findFirst();
+    }
+
     public UUID createSession(UUID visitId, UUID recordingId) {
         UUID id = UUID.randomUUID();
         jdbc.update("""
@@ -299,6 +325,15 @@ public class RecordingMapper {
     }
 
     public List<UUID> insertUtterances(UUID visitId, UUID recordingId, UUID sessionId, List<Turn> turns) {
+        return insertUtterances(visitId, recordingId, sessionId, turns, "CANONICAL", true);
+    }
+
+    public List<UUID> insertPreviewUtterances(UUID visitId, UUID recordingId, UUID sessionId, List<Turn> turns) {
+        return insertUtterances(visitId, recordingId, sessionId, turns, "PREVIEW", false);
+    }
+
+    private List<UUID> insertUtterances(UUID visitId, UUID recordingId, UUID sessionId, List<Turn> turns,
+                                       String resultType, boolean current) {
         List<UUID> ids = new ArrayList<>();
         for (int i = 0; i < turns.size(); i++) {
             Turn t = turns.get(i);
@@ -307,10 +342,10 @@ public class RecordingMapper {
             jdbc.update("""
                     INSERT INTO asr_utterance(id,visit_id,recording_id,session_id,utterance_id,revision,result_type,
                                               text,role,speaker_id,role_source,role_confidence,role_provider_route,start_ms,end_ms,is_current)
-                    VALUES (?,?,?,?,?,?, 'CANONICAL', ?,?,?,?,?,?,?,?,true)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, id, visitId, recordingId, sessionId, "u-" + (i + 1), 0,
-                    t.text(), t.role(), t.speakerId(), t.roleSource(), t.roleConfidence(), t.roleProviderRoute(),
-                    t.startMs(), t.endMs());
+                    resultType, t.text(), t.role(), t.speakerId(), t.roleSource(), t.roleConfidence(), t.roleProviderRoute(),
+                    t.startMs(), t.endMs(), current);
         }
         return ids;
     }
@@ -399,16 +434,36 @@ public class RecordingMapper {
     }
 
     public Optional<Utterance> firstUtterance(UUID sessionId) {
-        return jdbc.query("SELECT * FROM asr_utterance WHERE session_id=? ORDER BY start_ms LIMIT 1",
+        return jdbc.query("SELECT * FROM asr_utterance WHERE session_id=? AND result_type='CANONICAL' ORDER BY start_ms LIMIT 1",
                 UTTERANCE, sessionId).stream().findFirst();
     }
 
     public List<Utterance> listByRecording(UUID recordingId) {
-        return jdbc.query("SELECT * FROM asr_utterance WHERE recording_id=? ORDER BY start_ms,id", UTTERANCE, recordingId);
+        return jdbc.query("SELECT * FROM asr_utterance WHERE recording_id=? AND result_type='CANONICAL' ORDER BY start_ms,id", UTTERANCE, recordingId);
+    }
+
+    public List<Utterance> listPreviewByRecording(UUID recordingId) {
+        return jdbc.query("SELECT * FROM asr_utterance WHERE recording_id=? AND result_type='PREVIEW' ORDER BY start_ms,id",
+                UTTERANCE, recordingId);
+    }
+
+    public void clearPreview(UUID recordingId) {
+        jdbc.update("DELETE FROM asr_utterance WHERE recording_id=? AND result_type='PREVIEW'", recordingId);
+        jdbc.update("""
+                DELETE FROM recording_session session
+                WHERE session.recording_id=?
+                  AND NOT EXISTS (SELECT 1 FROM asr_utterance utterance WHERE utterance.session_id=session.id)
+                  AND NOT EXISTS (SELECT 1 FROM dialogue_snapshot snapshot WHERE snapshot.session_id=session.id)
+                """, recordingId);
+    }
+
+    public Optional<UUID> previewSessionId(UUID recordingId) {
+        return jdbc.query("SELECT session_id FROM asr_utterance WHERE recording_id=? AND result_type='PREVIEW' ORDER BY created_at DESC LIMIT 1",
+                (rs, n) -> rs.getObject("session_id", UUID.class), recordingId).stream().findFirst();
     }
 
     public Optional<Utterance> utterance(UUID visitId, UUID utteranceId) {
-        return jdbc.query("SELECT * FROM asr_utterance WHERE id=? AND visit_id=?", UTTERANCE, utteranceId, visitId)
+        return jdbc.query("SELECT * FROM asr_utterance WHERE id=? AND visit_id=? AND result_type='CANONICAL'", UTTERANCE, utteranceId, visitId)
                 .stream().findFirst();
     }
 
@@ -416,7 +471,7 @@ public class RecordingMapper {
         return jdbc.update("""
                 UPDATE asr_utterance
                 SET role=?, role_source='MANUAL', role_confidence=NULL, role_provider_route='MANUAL'
-                WHERE id=? AND visit_id=?
+                    WHERE id=? AND visit_id=? AND result_type='CANONICAL'
                 """, role, utteranceId, visitId) == 1;
     }
 
@@ -427,7 +482,7 @@ public class RecordingMapper {
             updated += jdbc.update("""
                     UPDATE asr_utterance
                     SET role=?, role_source=?, role_confidence=?, role_provider_route=?
-                    WHERE id=? AND visit_id=? AND role_source <> 'MANUAL'
+                    WHERE id=? AND visit_id=? AND result_type='CANONICAL' AND role_source <> 'MANUAL'
                     """, update.role(), update.source(), update.confidence(), update.providerRoute(),
                     update.utteranceId(), visitId);
         }

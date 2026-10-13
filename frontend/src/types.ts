@@ -60,6 +60,27 @@ export interface Recording {
   created_at: string
 }
 
+/**
+ * Raw ASR output shown on the audio page while role analysis continues.
+ * These records are intentionally separate from canonical transcript turns.
+ */
+export interface AsrPreviewSegment {
+  utterance_id?: string | null
+  text: string
+  start_ms: number
+  end_ms: number
+  speaker_id?: number | null
+}
+
+export interface AsrPreviewRecording {
+  recording_id: string
+  recording_no: string | null
+  file_name: string | null
+  status?: string | null
+  error_message?: string | null
+  segments: AsrPreviewSegment[]
+}
+
 export interface Utterance {
   id?: string
   speaker_id?: number | null

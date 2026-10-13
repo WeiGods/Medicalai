@@ -2,13 +2,15 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ClinicalWorkbench from './ClinicalWorkbench.vue'
 import { api } from '../api'
-import type { ClinicalExtraction, Doctor, ExportTemplate, MedicalRecord, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
+import type { AsrJob, AsrPreviewRecording, ClinicalExtraction, Doctor, ExportTemplate, MedicalRecord, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
 
 vi.mock('../api', () => ({
   api: {
     patients: vi.fn(),
     visits: vi.fn(),
     recordings: vi.fn(),
+    asrPreviews: vi.fn(),
+    activeTranscription: vi.fn(),
     uploadRecording: vi.fn(),
     transcript: vi.fn(),
     clinicalExtraction: vi.fn(),
@@ -82,6 +84,8 @@ function record(draft = false, confirmed = false): MedicalRecord {
 function configure(options: {
   patients?: Patient[]
   recordings?: Recording[]
+  asrPreviews?: AsrPreviewRecording[]
+  activeAsrJob?: AsrJob | null
   transcript?: Transcript
   record?: MedicalRecord
   visit?: Visit
@@ -92,6 +96,8 @@ function configure(options: {
   vi.mocked(api.patients).mockResolvedValue(options.patients || [patient])
   vi.mocked(api.visits).mockResolvedValue(options.visits || [options.visit || activeVisit])
   vi.mocked(api.recordings).mockResolvedValue(options.recordings || [doneRecording])
+  vi.mocked(api.asrPreviews).mockResolvedValue(options.asrPreviews || [])
+  vi.mocked(api.activeTranscription).mockResolvedValue(options.activeAsrJob || null)
   vi.mocked(api.transcript).mockResolvedValue(options.transcript || transcript())
   vi.mocked(api.clinicalExtraction).mockResolvedValue(pendingExtraction)
   vi.mocked(api.medicalRecord).mockResolvedValue(options.record || record())
@@ -419,6 +425,144 @@ describe('recording playback', () => {
     expect(revoke).toHaveBeenCalledWith('blob:change-visit')
     expect(wrapper.find('.audio-engine').exists()).toBe(false)
     wrapper.unmount()
+  })
+})
+
+describe('ASR raw preview', () => {
+  it('loads and displays raw ASR segments on the audio page without changing canonical transcript', async () => {
+    const preview: AsrPreviewRecording = {
+      recording_id: doneRecording.id,
+      recording_no: doneRecording.recording_no,
+      file_name: doneRecording.file_name,
+      status: 'PROCESSING',
+      error_message: null,
+      segments: [{ utterance_id: 'preview-1', text: '原始识别文字', start_ms: 1250, end_ms: 2400, speaker_id: 2 }]
+    }
+    const wrapper = await mountWorkbench({ asrPreviews: [preview] })
+
+    expect(api.asrPreviews).toHaveBeenCalledWith(activeVisit.id)
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+
+    const card = wrapper.get('.asr-preview-card')
+    expect(card.text()).toContain('ASR 原文预览')
+    expect(card.text()).toContain('原始识别文字')
+    expect(card.text()).toContain('角色判断中')
+    expect(wrapper.find('.asr-preview-card').exists()).toBe(true)
+    await wrapper.get('.step:nth-child(3)').trigger('click')
+    expect(wrapper.get('.transcript-body').text()).toContain('头痛')
+    expect(wrapper.get('.transcript-body').text()).not.toContain('原始识别文字')
+  })
+
+  it('keeps the preview visible for a completed read-only visit', async () => {
+    const completedVisit = { ...activeVisit, status: 'COMPLETED' as const }
+    const preview: AsrPreviewRecording = {
+      recording_id: doneRecording.id,
+      recording_no: doneRecording.recording_no,
+      file_name: doneRecording.file_name,
+      status: 'DONE',
+      segments: [{ text: '已完成原文', start_ms: 0, end_ms: 900 }]
+    }
+    const wrapper = await mountWorkbench({ visit: completedVisit, visits: [completedVisit], asrPreviews: [preview] })
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    expect(wrapper.get('.asr-preview-card').text()).toContain('已完成原文')
+    expect(wrapper.get('.asr-preview-card').text()).toContain('已完成')
+  })
+
+  it('restores preview polling after loading a visit with an in-progress recording', async () => {
+    const processingRecording = { ...doneRecording, status: 'PROCESSING' as const }
+    const setInterval = vi.spyOn(window, 'setInterval')
+    const clearInterval = vi.spyOn(window, 'clearInterval')
+    const wrapper = await mountWorkbench({ recordings: [processingRecording], asrPreviews: [] })
+    const poll = setInterval.mock.calls.find(([, delay]) => delay === 3000)?.[0] as (() => Promise<void>) | undefined
+
+    expect(poll).toBeDefined()
+    expect(api.asrPreviews).toHaveBeenCalledTimes(1)
+    await poll?.()
+    await flushPromises()
+    expect(api.asrPreviews).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+    expect(clearInterval).toHaveBeenCalled()
+  })
+
+  it('restores polling for a queued PENDING job after a page reload', async () => {
+    const pendingJob: AsrJob = {
+      job_id: 'job-pending', provider_route: 'LOCAL', status: 'PENDING',
+      total_recordings: 1, completed_recordings: 0, error_message: null, transcript: null
+    }
+    const setInterval = vi.spyOn(window, 'setInterval')
+    const wrapper = await mountWorkbench({ recordings: [uploadedRecording], activeAsrJob: pendingJob })
+    const poll = setInterval.mock.calls.find(([, delay]) => delay === 3000)?.[0] as (() => Promise<void>) | undefined
+
+    expect(api.activeTranscription).toHaveBeenCalledWith(activeVisit.id)
+    expect(poll).toBeDefined()
+    await poll?.()
+    await flushPromises()
+    expect(api.activeTranscription).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('keeps polling after a terminal recording when the preview refresh fails', async () => {
+    const processingRecording = { ...doneRecording, status: 'PROCESSING' as const }
+    const setInterval = vi.spyOn(window, 'setInterval')
+    const clearInterval = vi.spyOn(window, 'clearInterval')
+    const wrapper = await mountWorkbench({ recordings: [processingRecording], asrPreviews: [] })
+    const poll = setInterval.mock.calls.find(([, delay]) => delay === 3000)?.[0] as (() => Promise<void>) | undefined
+    vi.mocked(api.recordings).mockResolvedValue([doneRecording])
+    vi.mocked(api.asrPreviews).mockRejectedValueOnce(new Error('preview temporarily unavailable'))
+    vi.mocked(api.activeTranscription).mockResolvedValue(null)
+
+    await poll?.()
+    await flushPromises()
+    expect(wrapper.get('.asr-preview-card').text()).toContain('preview temporarily unavailable')
+    expect(clearInterval).not.toHaveBeenCalled()
+
+    vi.mocked(api.asrPreviews).mockResolvedValue([])
+    await poll?.()
+    await flushPromises()
+    expect(clearInterval).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('isolates preview loading failures from the canonical visit data', async () => {
+    configure()
+    vi.mocked(api.asrPreviews).mockRejectedValue(new Error('preview service unavailable'))
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor } })
+    await flushPromises()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+
+    const card = wrapper.get('.asr-preview-card')
+    expect(card.text()).toContain('ASR 原文预览暂时无法加载：preview service unavailable')
+    expect(wrapper.text()).toContain('转写结果')
+    expect(api.transcript).toHaveBeenCalledWith(activeVisit.id)
+  })
+
+  it('clears the previous visit preview when switching patients', async () => {
+    const secondPatient: Patient = { ...patient, id: 'patient-2', patient_no: 'P-002', name: '另一位患者' }
+    const secondVisit: Visit = {
+      ...activeVisit, id: 'visit-2', visit_no: 'V-002', patient_id: secondPatient.id,
+      patient_name: secondPatient.name
+    }
+    const preview: AsrPreviewRecording = {
+      recording_id: doneRecording.id,
+      recording_no: doneRecording.recording_no,
+      file_name: doneRecording.file_name,
+      status: 'DONE',
+      segments: [{ text: '上一位患者的原文', start_ms: 0, end_ms: 900 }]
+    }
+    configure({ patients: [patient, secondPatient], visits: [activeVisit, secondVisit], asrPreviews: [preview] })
+    vi.mocked(api.asrPreviews).mockImplementation(async visitId => visitId === activeVisit.id ? [preview] : [])
+    const wrapper = mount(ClinicalWorkbench, { props: { doctor } })
+    await flushPromises()
+    await wrapper.get('button[aria-label="返回录音上传"]').trigger('click')
+    expect(wrapper.get('.asr-preview-card').text()).toContain('上一位患者的原文')
+
+    await wrapper.findAll('.queue-cards .patient-tile')[1].trigger('click')
+    await flushPromises()
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    expect(wrapper.get('.asr-preview-card').text()).not.toContain('上一位患者的原文')
+    expect(wrapper.find('.asr-preview-empty').exists()).toBe(true)
   })
 })
 

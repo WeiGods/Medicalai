@@ -51,6 +51,27 @@ public class AsrJobStore {
         return recording;
     }
 
+    /** 在角色判断前持久化 ASR 原文；该记录故意不参与正式转写和快照。 */
+    @Transactional
+    public UUID savePreview(RecordingMapper.AsrJob job, UUID token, UUID recordingId, List<AsrSegment> segments) {
+        fence(job, token);
+        var current = recordings.asrJob(job.id(), job.visitId()).orElseThrow(LeaseLostException::new);
+        if (!Objects.equals(current.recordingId(), recordingId)) throw new LeaseLostException();
+        if (segments == null || segments.isEmpty()) throw new IllegalStateException("ASR 返回空句段");
+        if (segments.stream().anyMatch(s -> s == null || s.text() == null || s.text().isBlank()
+                || s.startMs() < 0 || s.endMs() < s.startMs())) {
+            throw new IllegalStateException("ASR 返回无效句段");
+        }
+        List<RecordingMapper.Turn> preview = segments.stream()
+                .map(s -> new RecordingMapper.Turn("UNKNOWN", s.text(), s.startMs(), s.endMs(), s.speakerId(),
+                        "UNKNOWN", null, "UNKNOWN"))
+                .toList();
+        recordings.clearPreview(recordingId);
+        UUID sessionId = recordings.createSession(job.visitId(), recordingId);
+        recordings.insertPreviewUtterances(job.visitId(), recordingId, sessionId, preview);
+        return sessionId;
+    }
+
     @Transactional
     public void submitted(RecordingMapper.AsrJob job, UUID token, UUID recordingId, String taskId) {
         fence(job, token);
@@ -95,10 +116,12 @@ public class AsrJobStore {
         }
         String rawJson = AsrRawResponse.sanitizedJson(rawResponse);
         if (rawJson != null) {
-            // 原始响应仅用于后台审计；前端始终读取后面的标准化句段和展示文本。
+            // 原始 JSON 回包仅供后台使用；前端读取独立的预览句段或正式展示文本。
             recordings.saveAsrRawResponse(recordingId, rawJson, AsrRawResponse.sha256(rawJson), turns.size());
         }
-        UUID sessionId = recordings.createSession(job.visitId(), recordingId);
+        // savePreview 已经创建了与录音范围绑定的会话；兼容没有预览的旧任务/测试。
+        UUID sessionId = recordings.previewSessionId(recordingId).orElseGet(
+                () -> recordings.createSession(job.visitId(), recordingId));
         recordings.insertUtterances(job.visitId(), recordingId, sessionId, turns);
         recordings.updateStatus(recordingId, "DONE", null);
         // 新录音会改变后续快照，旧提取的证据不能再被病历生成复用。

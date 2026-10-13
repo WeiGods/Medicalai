@@ -1,6 +1,6 @@
 import type {
   AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
-  Recording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole, ExportTemplate,
+  Recording, AsrPreviewRecording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole, ExportTemplate,
   ExportTemplateRevision, PatientDeletionResult
 } from './types'
 
@@ -85,6 +85,7 @@ export const api = {
   cancelVisit: (id: string) => request<void>(`/api/v1/visits/${id}/cancel`, { method: 'POST' }),
 
   recordings: (visitId: string) => request<Recording[]>(`/api/v1/visits/${visitId}/recordings`),
+  asrPreviews: (visitId: string) => request<AsrPreviewRecording[]>(`/api/v1/visits/${visitId}/recordings/asr-preview`),
   uploadRecording: (visitId: string, file: File, durationMs: number) => {
     const body = new FormData()
     body.append('file', file)
@@ -97,6 +98,7 @@ export const api = {
       method: 'POST', body: JSON.stringify({ provider })
     }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
+  activeTranscription: (visitId: string) => request<AsrJob | null>(`/api/v1/visits/${visitId}/recordings/transcribe/active`),
   deleteRecording: (visitId: string, recordingId: string) => request<void>(`/api/v1/visits/${visitId}/recordings/${recordingId}`, { method: 'DELETE' }),
   transcript: (visitId: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`),
   saveTranscript: (visitId: string, transcript: string) => request<Transcript>(`/api/v1/visits/${visitId}/transcript`, {

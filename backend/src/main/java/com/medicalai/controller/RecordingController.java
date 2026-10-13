@@ -8,6 +8,7 @@ import com.medicalai.mapper.RecordingMapper;
 import com.medicalai.service.AudioStorageService;
 import com.medicalai.service.ClinicalWorkflowService;
 import com.medicalai.vo.AsrJobVO;
+import com.medicalai.vo.AsrPreviewRecordingVO;
 import com.medicalai.vo.RecordingVO;
 import java.util.List;
 import java.util.UUID;
@@ -36,6 +37,12 @@ public class RecordingController {
     public List<RecordingVO> list(@PathVariable("visitId") UUID visitId,
                                   @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return workflow.recordings(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
+    }
+
+    @GetMapping("/visits/{visitId}/recordings/asr-preview")
+    public List<AsrPreviewRecordingVO> asrPreviews(@PathVariable("visitId") UUID visitId,
+                                                 @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return workflow.asrPreviews(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
     }
 
     @PostMapping(value = "/visits/{visitId}/recordings", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -86,6 +93,12 @@ public class RecordingController {
     public AsrJobVO transcriptionStatus(@PathVariable("visitId") UUID visitId, @PathVariable("jobId") UUID jobId,
                                         @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
         return workflow.asrJob(visitId, current.doctor().id(), jobId, DoctorRole.from(current.doctor().role()));
+    }
+
+    @GetMapping("/visits/{visitId}/recordings/transcribe/active")
+    public AsrJobVO activeTranscriptionStatus(@PathVariable("visitId") UUID visitId,
+                                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
+        return workflow.activeAsrJob(visitId, current.doctor().id(), DoctorRole.from(current.doctor().role()));
     }
 
     @GetMapping("/recordings/{recordingId}/audio")

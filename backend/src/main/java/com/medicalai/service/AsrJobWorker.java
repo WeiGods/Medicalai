@@ -79,15 +79,17 @@ public class AsrJobWorker {
                 // 步骤 5（续）：将任务和一条录音切换为处理中，并获得本次录音的受控引用。
                 var recording = store.begin(job, token);
                 if ("LOCAL".equals(provider)) {
-                    if (!roleRouter.isConfigured()) {
-                        throw new IllegalStateException("公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理");
-                    }
                     // 步骤 6（本地）：同步调用本地 ASR，获得原始文本、时间戳和 speaker_id。
                     long asrStartedAt = System.nanoTime();
                     var result = local.transcribeDetailed(storage.load(recording.objectKey()), recording.fileName(), recording.mimeType());
                     LOG.info("本地ASR调用成功：任务ID={}，句段数={}，耗时毫秒={}",
                             job.id(), result.segments().size(), elapsedMs(asrStartedAt));
                     checkLease(lost);
+                    // 原文预览先提交，音频页可在角色 LLM 仍执行时读取；正式结果流程保持不变。
+                    store.savePreview(job, token, recording.id(), result.segments());
+                    if (!roleRouter.isConfigured()) {
+                        throw new IllegalStateException("公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理");
+                    }
                     // 步骤 8 至 9：角色 LLM 判断后，事务性写入原始 ASR 回包、逐句数据和转写快照。
                     store.complete(job, token, recording.id(), roleAssignedTurns(job, result.segments()), result.rawResponse());
                 } else {
@@ -141,6 +143,7 @@ public class AsrJobWorker {
         LOG.info("公网ASR结果已获取：任务ID={}，任务状态={}，句段数={}，耗时毫秒={}",
                 job.id(), task.status(), result.segments().size(), elapsedMs(resultStartedAt));
         checkLease(lost);
+        store.savePreview(job, token, job.recordingId(), result.segments());
         // 步骤 8 至 9：LLM 逐句分类后，以原子事务写入结果。
         store.complete(job, token, job.recordingId(), roleAssignedTurns(job, result.segments()), result.rawResponse());
     }

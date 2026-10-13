@@ -5,10 +5,11 @@ import '../routeSelection.css'
 import Icon from './Icon.vue'
 import TemplateManagement from './TemplateManagement.vue'
 import RecordingAudioPlayer from './RecordingAudioPlayer.vue'
+import AsrPreviewCard from './AsrPreviewCard.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
-import type { AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, ExportTemplate, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
+import type { AsrJob, AsrPreviewRecording, AsrProvider, AuditAction, AuditLog, AuditOperator, ClinicalExtraction, Confirmation, Doctor, ExportTemplate, LlmProvider, MedicalRecord, MedicalRecordContent, Patient, RecordExport, Recording, Transcript, Utterance, Visit } from '../types'
 
 const props = defineProps<{ doctor: Doctor }>()
 const emit = defineEmits<{ (event: 'logout'): void }>()
@@ -56,6 +57,8 @@ const actionBusy = ref<'' | 'upload' | 'delete' | 'delete-patient' | 'transcribe
 const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
+const asrPreviews = ref<AsrPreviewRecording[]>([])
+const asrPreviewError = ref('')
 const recordingToDelete = ref<Recording | null>(null)
 const recordingToRetranscribe = ref<Recording | null>(null)
 const transcript = ref<Transcript | null>(null)
@@ -129,6 +132,12 @@ let recordChunks: Blob[] = []
 let audioObjectUrl: string | null = null
 let audioLoadAbort: AbortController | null = null
 let visitStateRevision = 0
+let asrPreviewPollTimer: number | undefined
+let asrPreviewPollBusy = false
+let asrPreviewPollVisitId = ''
+let asrPreviewPollRevision = 0
+let asrPreviewPollCycle = 0
+let activeAsrJob: AsrJob | null = null
 let patientSearchRevision = 0
 let queueResizeObserver: ResizeObserver | undefined
 let audioDeviceChangeTarget: MediaDevices | null = null
@@ -650,16 +659,30 @@ async function refreshVisitState() {
     clearVisitArtifacts()
     return
   }
-  const [recordingList, transcriptState, extractionState, recordState, confirmationList, exportList] = await Promise.all([
+  const previewRequest = typeof api.asrPreviews === 'function'
+    ? api.asrPreviews(visit.id)
+      .then(previews => ({ previews, error: '' }))
+      .catch(error => ({ previews: null, error: error instanceof Error ? error.message : 'ASR 原文预览加载失败' }))
+    : Promise.resolve({ previews: [] as AsrPreviewRecording[], error: '' })
+  const activeJobRequest = typeof api.activeTranscription === 'function'
+    ? api.activeTranscription(visit.id).then(job => job || null).catch(() => null)
+    : Promise.resolve(null)
+  const [[recordingList, transcriptState, extractionState, recordState, confirmationList, exportList], previewResult, activeJob] = await Promise.all([
+    Promise.all([
     api.recordings(visit.id),
     api.transcript(visit.id),
     api.clinicalExtraction(visit.id),
     api.medicalRecord(visit.id),
     api.confirmations(visit.id),
     api.exports(visit.id)
+    ]),
+    previewRequest,
+    activeJobRequest
   ])
   if (revision !== visitStateRevision || currentVisit.value?.id !== visit.id) return
   recordings.value = recordingList
+  if (previewResult.previews) asrPreviews.value = previewResult.previews
+  asrPreviewError.value = previewResult.error
   transcript.value = transcriptState
   extraction.value = extractionState
   record.value = recordState
@@ -667,11 +690,85 @@ async function refreshVisitState() {
   confirmations.value = confirmationList
   exports.value = exportList
   transcriptDraft.value = transcriptState.transcript
+  activeAsrJob = activeJob
+  syncAsrPreviewPolling(visit.id, revision, recordingList, activeJob)
+}
+
+function clearAsrPreviewPolling() {
+  asrPreviewPollCycle += 1
+  if (asrPreviewPollTimer !== undefined) window.clearInterval(asrPreviewPollTimer)
+  asrPreviewPollTimer = undefined
+  asrPreviewPollBusy = false
+  asrPreviewPollVisitId = ''
+  asrPreviewPollRevision = 0
+  activeAsrJob = null
+}
+
+function syncAsrPreviewPolling(visitId: string, revision: number, recordingList: Recording[], job: AsrJob | null = activeAsrJob) {
+  // 提交按钮已有 jobId 状态轮询，并且每轮会刷新原文；避免同时启动第二套定时器。
+  if (actionBusy.value === 'transcribe') {
+    clearAsrPreviewPolling()
+    return
+  }
+  const hasProcessingRecording = recordingList.some(item => item.status === 'PROCESSING')
+  const hasActiveJob = job?.status === 'PENDING' || job?.status === 'RUNNING'
+  if (!hasProcessingRecording && !hasActiveJob) {
+    clearAsrPreviewPolling()
+    return
+  }
+  if (asrPreviewPollTimer !== undefined && asrPreviewPollVisitId !== visitId) clearAsrPreviewPolling()
+  asrPreviewPollVisitId = visitId
+  asrPreviewPollRevision = revision
+  if (asrPreviewPollTimer !== undefined) return
+  const pollCycle = asrPreviewPollCycle
+  asrPreviewPollTimer = window.setInterval(async () => {
+    const requestRevision = asrPreviewPollRevision
+    if (pollCycle !== asrPreviewPollCycle || asrPreviewPollBusy
+        || requestRevision !== visitStateRevision || currentVisit.value?.id !== visitId) return
+    asrPreviewPollBusy = true
+    try {
+      const [recordingResult, previewResult, activeJobResult] = await Promise.allSettled([
+        api.recordings(visitId),
+        typeof api.asrPreviews === 'function' ? api.asrPreviews(visitId) : Promise.resolve([]),
+        typeof api.activeTranscription === 'function' ? api.activeTranscription(visitId) : Promise.resolve(null)
+      ])
+      if (pollCycle !== asrPreviewPollCycle || requestRevision !== visitStateRevision || asrPreviewPollRevision !== requestRevision
+          || currentVisit.value?.id !== visitId) return
+      let latestRecordings: Recording[] | null = null
+      if (recordingResult.status === 'fulfilled') {
+        recordings.value = recordingResult.value
+        latestRecordings = recordingResult.value
+      }
+      if (previewResult.status === 'fulfilled') {
+        asrPreviews.value = previewResult.value
+        asrPreviewError.value = ''
+      } else {
+        const error = previewResult.reason
+        asrPreviewError.value = error instanceof Error ? error.message : 'ASR 原文预览刷新失败'
+      }
+      if (activeJobResult.status === 'fulfilled') activeAsrJob = activeJobResult.value || null
+      // A failed preview request must not end tracking. Stop only after both the
+      // task is terminal and no recording remains PROCESSING.
+      const taskStillActive = activeJobResult.status === 'fulfilled'
+        ? activeJobResult.value?.status === 'PENDING' || activeJobResult.value?.status === 'RUNNING'
+        : activeAsrJob?.status === 'PENDING' || activeAsrJob?.status === 'RUNNING'
+      const previewSucceeded = previewResult.status === 'fulfilled'
+      if (latestRecordings && previewSucceeded
+          && !latestRecordings.some(item => item.status === 'PROCESSING') && !taskStillActive) {
+        clearAsrPreviewPolling()
+      }
+    } finally {
+      if (pollCycle === asrPreviewPollCycle) asrPreviewPollBusy = false
+    }
+  }, 3000)
 }
 
 function clearVisitArtifacts() {
   visitStateRevision += 1
+  clearAsrPreviewPolling()
   recordings.value = []
+  asrPreviews.value = []
+  asrPreviewError.value = ''
   transcript.value = null
   extraction.value = null
   record.value = null
@@ -802,6 +899,9 @@ async function selectPatient(patientId: string) {
   }
   stopAudio()
   visitStateRevision += 1
+  clearAsrPreviewPolling()
+  asrPreviews.value = []
+  asrPreviewError.value = ''
   selectedPatientId.value = patientId
   if (departmentHead.value) {
     if (!visits.value.some(visit => visit.id === selectedVisitId.value && visit.patient_id === patientId)) {
@@ -1198,9 +1298,14 @@ async function retranscribeSelectedRecording() {
   }
 }
 
-watch(() => currentVisit.value?.id, () => {
+watch(() => currentVisit.value?.id, (visitId, previousVisitId) => {
   asrProvider.value = 'DASHSCOPE'
   activeAsrProvider.value = null
+  if (previousVisitId && visitId !== previousVisitId) {
+    clearAsrPreviewPolling()
+    asrPreviews.value = []
+    asrPreviewError.value = ''
+  }
 })
 
 function requestTranscription() {
@@ -2061,6 +2166,7 @@ onUnmounted(() => {
   stopAudio()
   stopRecorder()
   resetRecordingTimer()
+  clearAsrPreviewPolling()
   audioDeviceChangeTarget?.removeEventListener?.('devicechange', onAudioInputDeviceChange)
   audioDeviceChangeTarget = null
   if (patientDeletionPollTimer !== undefined) window.clearInterval(patientDeletionPollTimer)
@@ -2349,6 +2455,8 @@ defineExpose({ selectPatient })
             </div>
           </section>
 
+          <AsrPreviewCard :previews="asrPreviews" :error="asrPreviewError" />
+
           <section class="card">
             <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2>
               <div class="record-header-actions"><button class="text-btn" :disabled="!transcriptDraft" aria-label="复制转写文本" @click="copyTranscript"><Icon name="copy" /></button></div>
@@ -2615,6 +2723,7 @@ defineExpose({ selectPatient })
             </div>
           </div>
         </section>
+        <AsrPreviewCard :previews="asrPreviews" :error="asrPreviewError" />
       </div>
 
       <div v-else-if="view === 'transcript'" class="full-view transcript-view">

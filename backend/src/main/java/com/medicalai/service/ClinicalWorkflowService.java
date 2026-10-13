@@ -122,6 +122,17 @@ public class ClinicalWorkflowService {
     }
 
     @Transactional(readOnly = true)
+    public List<AsrPreviewRecordingVO> asrPreviews(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
+        return recordings.list(visit.id()).stream()
+                .map(recording -> new AsrPreviewRecordingVO(recording.id(), recording.recordingNo(),
+                        recording.fileName(), recording.status(), recording.errorMessage(),
+                        recordings.listPreviewByRecording(recording.id()).stream()
+                                .map(AsrPreviewRecordingVO.Segment::from).toList()))
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
     public Recording readableRecording(UUID recordingId, UUID doctorId, DoctorRole role) {
         Recording recording = recordings.findById(recordingId).orElseThrow(BusinessException::notFound);
         readable(recording.visitId(), doctorId, role);
@@ -285,6 +296,18 @@ public class ClinicalWorkflowService {
         TranscriptVO result = "SUCCEEDED".equals(job.status()) ? transcript(visitId, doctorId, role) : null;
         return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), result,
                 displayProvider(job.providerRoute()));
+    }
+
+    /** 页面恢复时查询当前接诊仍在执行的 ASR 任务；终态任务不返回。 */
+    @Transactional(readOnly = true)
+    public AsrJobVO activeAsrJob(UUID visitId, UUID doctorId, DoctorRole role) {
+        Visit visit = readable(visitId, doctorId, role);
+        return recordings.activeAsrJob(visit.id()).map(job -> {
+            List<Recording> all = recordings.list(visit.id());
+            int completed = (int) all.stream().filter(r -> "DONE".equals(r.status())).count();
+            return new AsrJobVO(job.id(), job.status(), all.size(), completed, job.lastError(), null,
+                    displayProvider(job.providerRoute()));
+        }).orElse(null);
     }
 
     @Transactional(readOnly = true)
