@@ -252,3 +252,5 @@ mvn -q package       # 打包
 | `curl http://192.168.1.78:8000/health` 返回 404 | 内网 AI 服务的健康检查是 `GET /healthz`，不是 `/health` |
 | 同一段对话换路由后角色口径不一致 | 仓库里角色识别有两条独立实现：本适配器（Java 直连 `.56`）与 `.78` 网关的 `/internal/transcript/assign-roles`（Python，当前无 Java 调用方、提示词也不同）。同一时间只用一条，别让两者并存 |
 | 每批耗时明显偏高 | 先确认 `enable_thinking` 已关闭；再检查 `role-batch-size` 是否过大（单批越长，单批失败时降级的句段越多） |
+| 后端日志「内网信息提取 LLM 结构化语法降级…httpStatus=500」，提取面板曾报「内网信息提取模型返回异常（HTTP 500）」 | `.56` 的 llama.cpp 故障：推理退化成只输出 `/`（连原始 `/completion` 也一样），strict `json_schema` + 关思考时该 token 撞上语法采样器 → `Unexpected empty grammar stack after accepting piece: / (14)`。客户端已自动改用 `json_object` 重发一次，但**救不了退化推理**；服务端排查顺序、验收命令与修复选项见 [llm56-grammar-500-server-handoff.md](llm56-grammar-500-server-handoff.md)，现场自检用 `tools/llm56_grammar_500_repro.py` |
+| 转写/提取「接口返回 200 但结果为空或报未返回有效 JSON」 | 别把 HTTP 200 当成功：`.56` 退化态下 `你好` 也是 200，内容是 `/` 串。先跑 `tools/llm56_grammar_500_repro.py`（退出码 2 = 推理已退化） |

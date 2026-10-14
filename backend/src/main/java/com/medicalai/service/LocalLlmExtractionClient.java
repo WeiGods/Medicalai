@@ -37,6 +37,8 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
     private static final Logger LOG = LoggerFactory.getLogger(LocalLlmExtractionClient.class);
     private static final String ROUTE_LABEL = "内网";
     private static final String JOB_ID = "local-llm-extract";
+    /** 语法采样降级用的宽松响应格式：不注入 Schema，字段完整性仍由上层校验。 */
+    private static final Map<String, Object> JSON_OBJECT_RESPONSE_FORMAT = Map.of("type", "json_object");
     private static final int MIN_MAX_TOKENS = 512;
     private static final int MAX_MAX_TOKENS = 32768;
     private static final int MAX_RETRY_MAX_ATTEMPTS = 3;
@@ -99,12 +101,15 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
                 ClinicalExtractionLlmClient.turnCharacters(turns), maxTokens);
 
         Exception failure = null;
-        for (int attempt = 1; attempt <= retryMaxAttempts; attempt++) {
+        boolean strictSchema = true;
+        int attempt = 0;
+        while (true) {
+            attempt++;
             try {
-                return extractOnce(snapshotHash, turns, startedAt, attempt);
+                return extractOnce(snapshotHash, turns, startedAt, attempt, strictSchema);
             } catch (BusinessException error) {
                 // 解析失败也重试一次：本地小模型偶发输出残缺，重试常能拿到合规 JSON。
-                if (!"EXTRACTION_INVALID_RESPONSE".equals(error.code()) || attempt == retryMaxAttempts) {
+                if (!"EXTRACTION_INVALID_RESPONSE".equals(error.code()) || attempt >= retryMaxAttempts) {
                     LOG.warn("内网信息提取 LLM 失败: route=LOCAL, model={}, snapshotHash={}, code={}, elapsedMs={}",
                             model, shortHash(snapshotHash), error.code(), elapsedMs(startedAt));
                     throw error;
@@ -112,7 +117,18 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
                 failure = error;
             } catch (Exception error) {
                 failure = error;
-                if (!shouldRetry(error) || attempt == retryMaxAttempts) {
+                if (strictSchema && isServerGrammarFailure(error)) {
+                    // llama.cpp 的 strict json_schema 语法采样器缺陷（实测构建 b10772）：注入 Schema 后
+                    // 服务端会以 5xx 返回 "Unexpected empty grammar stack after accepting piece: / (14)"，
+                    // 温度 0 下同一报文必然复现且秒失败，原样重试没有意义。
+                    // 改用宽松 json_object 语法再试一次：字段完整性仍由 ClinicalExtractionService 校验；
+                    // 这次降级换的是请求形态而不是重复同一请求，因此不占用重试次数。
+                    strictSchema = false;
+                    LOG.warn("内网信息提取 LLM 结构化语法降级: route=LOCAL, model={}, snapshotHash={}, httpStatus={}, 改用 response_format=json_object 重试",
+                            model, shortHash(snapshotHash), httpStatus(error));
+                    continue;
+                }
+                if (!shouldRetry(error) || attempt >= retryMaxAttempts) {
                     break;
                 }
             }
@@ -131,7 +147,8 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
     }
 
     private AiServiceClient.ExtractionResponse extractOnce(String snapshotHash, List<Map<String, Object>> turns,
-                                                           long startedAt, int attempt) throws JsonProcessingException {
+                                                           long startedAt, int attempt, boolean strictSchema)
+            throws JsonProcessingException {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("model", model);
         request.put("messages", List.of(
@@ -139,9 +156,7 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
                 Map.of("role", "user", "content", ClinicalExtractionLlmClient.userMessage(mapper, turns))));
         request.put("max_tokens", maxTokens);
         request.put("temperature", 0);
-        request.put("response_format", Map.of("type", "json_schema",
-                "json_schema", Map.of("name", SCHEMA_NAME, "strict", true,
-                        "schema", ClinicalExtractionLlmClient.schema(mapper))));
+        request.put("response_format", strictSchema ? strictResponseFormat() : JSON_OBJECT_RESPONSE_FORMAT);
         if (disableThinking) {
             // 角色识别与提取都不需要思考过程；关掉可把每批耗时压到 1/2～1/3。
             request.put("chat_template_kwargs", Map.of("enable_thinking", false));
@@ -154,12 +169,30 @@ public class LocalLlmExtractionClient implements ClinicalExtractionLlmClient {
         }
         JsonNode response = requestBuilder.retrieve().body(JsonNode.class);
         Map<String, Object> extraction = ClinicalExtractionLlmClient.parse(mapper, response, ROUTE_LABEL);
-        LOG.info("内网信息提取 LLM 响应: route=LOCAL, model={}, snapshotHash={}, fields={}, promptTokens={}, completionTokens={}, attempt={}, elapsedMs={}",
-                model, shortHash(snapshotHash), ClinicalExtractionLlmClient.populatedFields(extraction),
+        LOG.info("内网信息提取 LLM 响应: route=LOCAL, model={}, snapshotHash={}, responseFormat={}, fields={}, promptTokens={}, completionTokens={}, attempt={}, elapsedMs={}",
+                model, shortHash(snapshotHash), strictSchema ? "json_schema" : "json_object",
+                ClinicalExtractionLlmClient.populatedFields(extraction),
                 response == null ? 0 : response.path("usage").path("prompt_tokens").asInt(0),
                 response == null ? 0 : response.path("usage").path("completion_tokens").asInt(0),
                 attempt, elapsedMs(startedAt));
         return new AiServiceClient.ExtractionResponse(JOB_ID, "SUCCEEDED", snapshotHash, model, extraction);
+    }
+
+    /** 与公网路由共用同一份严格 JSON Schema（默认请求形态）。 */
+    private Map<String, Object> strictResponseFormat() {
+        return Map.of("type", "json_schema",
+                "json_schema", Map.of("name", SCHEMA_NAME, "strict", true,
+                        "schema", ClinicalExtractionLlmClient.schema(mapper)));
+    }
+
+    /**
+     * 服务端语法采样失败：只有 5xx 才值得换成 json_object 再试。
+     *
+     * <p>4xx 保持快速失败语义（例如上下文超长、模型名错误），避免把整段提示词重复处理一遍。
+     */
+    private static boolean isServerGrammarFailure(Exception error) {
+        return error instanceof RestClientResponseException responseException
+                && responseException.getStatusCode().is5xxServerError();
     }
 
     private boolean shouldRetry(Exception error) {

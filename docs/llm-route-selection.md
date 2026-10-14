@@ -126,10 +126,28 @@ POST /api/v1/visits/{visitId}/clinical-extraction/generate
 2. **模型质量**：实测内网 27B/PQ2 会把"青霉素过敏"同时填进 `allergy_history` 与 `medication_history`。
    字段区分度不如公网 qwen-plus，建议用界面上的公网/内网按钮**对同一份转写各判一次做对比**。
 3. **不做模板降级**：提取失败一律保存 `FAILED` 版本并显示原因，绝不写模板兜底内容。
-4. **`.78` 网关的两个端点已不再被后端调用**：`AiServiceClient.extract`
-   （`/internal/clinical-extraction/generate`）与 `assignRoleAssignments`
-   （`/internal/transcript/assign-roles`）在内网路由改为直连 `.56` 后已无调用方（保留代码，未删除；
-   `AiServiceClient.generate` 同样无调用方）。
+4. **【已废弃 / deprecated】`.78` 网关的三个 LLM 端点不再被后端调用**：
+   `AiServiceClient.generate`（`/internal/medical-record/generate`）、
+   `AiServiceClient.extract`（`/internal/clinical-extraction/generate`）与
+   `AiServiceClient.assignRoleAssignments`（`/internal/transcript/assign-roles`）在内网路由改为直连 `.56` 后
+   **已无任何生产调用方**（`ClinicalWorkflowService` 注入了 `AiServiceClient` 但从不调用；
+   `LlmRoleRouter` 的第二个构造参数即 `ignoredInternalClient`）。
+   **不要再给它们新增调用方**，也不要在这三个端点上做功能扩展——只保留缺陷兜底（如 strict Schema 5xx 时降级为
+   `json_object`，见 `ai_service/server.py` 的 `_post_chat_completion_with_schema_degrade`）。
+   注意别误删整个 `ai_service`：**本地 ASR（`/ws/asr` 实时、`/internal/asr/transcribe` 离线）仍在役**，
+   由 `LocalAsrClient` 经 `AI_SERVICE_BASE_URL`（`192.168.1.78:8000`）调用。
+5. **`.56` 本地模型曾出现「只输出 `/`」的推理退化，并会以 strict `json_schema` 的 500 暴露出来**：
+   实测 `b10772-e8fd209c9` 在故障态下，连原始 `POST /completion`（绕过 chat 模板、reasoning 与语法约束）
+   都只返回 `/` 串（Qwen 词表 id 14），而 strict `json_schema` + `chat_template_kwargs.enable_thinking=false`
+   会让语法采样器抛 `got exception: Unexpected empty grammar stack after accepting piece: / (14)`
+   并以 **HTTP 500** 返回。温度 0 下同一报文必然复现（前缀命中缓存时 0.16 s 即失败），
+   **原样重试没有意义**，调 `repeat_penalty`/`frequency_penalty`/`dry`/`temperature` 也无效。
+   判据不是 HTTP 状态：**200 也可能是 `/` 串**，必须看 `content` 是否为可用 JSON。
+   诊断脚本 `tools/llm56_grammar_500_repro.py`（退出码 2 = 推理已退化，0 = 语法缺陷复现，1 = 正常）；
+   服务端处理步骤见 [llm56-grammar-500-server-handoff.md](llm56-grammar-500-server-handoff.md)。
+   内网提取客户端在 strict Schema 收到 5xx 时会**自动降级一次**：改用
+   `response_format={"type":"json_object"}` 重发，字段完整性仍由 `ClinicalExtractionService` 校验，
+   日志记「内网信息提取 LLM 结构化语法降级」；这只能把 5xx 变成可控的成功/解析失败，救不了退化推理。
 
 ## 验证
 

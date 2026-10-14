@@ -141,6 +141,75 @@ class LocalLlmExtractionClientTest {
         assertEquals(1, requests.get());
     }
 
+    /** 400（例如上下文超长）保持快速失败：不把整段提示词换成 json_object 再处理一遍。 */
+    @Test void badRequestIsNotDegradedToJsonObject() {
+        var mapper=new ObjectMapper();var requests=new AtomicInteger();
+        var formats=new java.util.concurrent.CopyOnWriteArrayList<String>();
+        server.createContext("/v1/chat/completions", exchange -> {
+            formats.add(mapper.readTree(exchange.getRequestBody().readAllBytes()).path("response_format").path("type").asText());
+            requests.incrementAndGet();
+            byte[] output="{\"error\":{\"message\":\"the request exceeds the available context size\"}}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type","application/json");
+            exchange.sendResponseHeaders(400,output.length);exchange.getResponseBody().write(output);exchange.close();
+        });
+        assertThrows(BusinessException.class,()->client(mapper,true,"").extract("hash",List.of(turn())));
+        assertEquals(1, requests.get());
+        assertEquals(List.of("json_schema"), formats);
+    }
+
+    /**
+     * llama.cpp 语法采样器缺陷（b10772 实测）：strict json_schema + enable_thinking=false 时，
+     * 临床文本里的 “/” 会让服务端以 500 返回 "Unexpected empty grammar stack"。
+     * 温度 0 下同一报文必然复现，重发 strict 报文没有任何意义，必须换成 json_object 才有救。
+     */
+    @Test void strictSchemaGrammarFailureDegradesToJsonObjectOnce() throws Exception {
+        var mapper=new ObjectMapper();var requests=new AtomicInteger();
+        var formats=new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var secondRequest=new AtomicReference<JsonNode>();
+        String serverError="{\"error\":{\"code\":500,\"message\":\"got exception: "
+                +"Unexpected empty grammar stack after accepting piece: / (14)\",\"type\":\"server_error\"}}";
+        server.createContext("/v1/chat/completions", exchange -> {
+            JsonNode request=mapper.readTree(exchange.getRequestBody().readAllBytes());
+            formats.add(request.path("response_format").path("type").asText());
+            String body;int status;
+            if (requests.incrementAndGet()==1) {
+                status=500;body=serverError;
+            } else {
+                secondRequest.set(request);status=200;
+                body=mapper.writeValueAsString(Map.of("choices",List.of(Map.of("message",
+                        Map.of("content",answer("{\"chief_complaint\":null}"))))));
+            }
+            byte[] output=body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type","application/json");
+            exchange.sendResponseHeaders(status,output.length);exchange.getResponseBody().write(output);exchange.close();
+        });
+        var response=client(mapper,true,"").extract("hash-grammar",List.of(turn()));
+        assertEquals("SUCCEEDED", response.status());
+        assertEquals(2, requests.get(), "strict schema 遇 5xx 只应换成 json_object 再试一次，不重复同一报文");
+        assertEquals(List.of("json_schema","json_object"), formats);
+        assertEquals(4096, secondRequest.get().path("max_tokens").asInt(), "降级只改 response_format");
+        assertFalse(secondRequest.get().path("chat_template_kwargs").path("enable_thinking").asBoolean(true));
+        assertEquals(ClinicalExtractionLlmClient.SYSTEM_PROMPT,
+                secondRequest.get().at("/messages/0/content").asText());
+    }
+
+    @Test void grammarFailureOnBothFormatsIsReportedWithHttpStatus() {
+        var mapper=new ObjectMapper();var requests=new AtomicInteger();
+        String serverError="{\"error\":{\"code\":500,\"message\":\"got exception: "
+                +"Unexpected empty grammar stack after accepting piece: / (14)\",\"type\":\"server_error\"}}";
+        server.createContext("/v1/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();requests.incrementAndGet();
+            byte[] output=serverError.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type","application/json");
+            exchange.sendResponseHeaders(500,output.length);exchange.getResponseBody().write(output);exchange.close();
+        });
+        BusinessException error=assertThrows(BusinessException.class,
+                ()->client(mapper,true,"").extract("hash",List.of(turn())));
+        assertEquals("LOCAL_LLM_EXTRACTION_UNAVAILABLE", error.code());
+        assertTrue(error.getMessage().contains("HTTP 500"));
+        assertEquals(2, requests.get(), "json_object 也失败时按重试上限收尾");
+    }
+
     @Test void connectionFailureIsReportedWithEndpointHint() {
         var mapper=new ObjectMapper();
         var unreachable=new LocalLlmExtractionClient(mapper,true,"http://127.0.0.1:1","", "local-model",
