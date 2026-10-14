@@ -23,6 +23,7 @@ public class LocalAsrClient {
     private static final Logger LOG = LoggerFactory.getLogger(LocalAsrClient.class);
     private final RestClient client;
     private final String mode;
+    private final String baseUrl;
 
     @Autowired
     public LocalAsrClient(@Value("${medicalai.local-asr.base-url:${medicalai.ai.base-url:http://127.0.0.1:8000}}") String baseUrl,
@@ -34,6 +35,7 @@ public class LocalAsrClient {
         var factory = new JdkClientHttpRequestFactory(http);
         factory.setReadTimeout(Duration.ofMillis(Math.max(1, readTimeout)));
         client = RestClient.builder().baseUrl(baseUrl).requestFactory(factory).build();
+        this.baseUrl = baseUrl == null ? "" : baseUrl.strip();
         this.mode = mode == null || mode.isBlank() ? "offline" : mode.strip().toLowerCase();
     }
 
@@ -44,6 +46,8 @@ public class LocalAsrClient {
     public List<AsrSegment> transcribe(Resource audio, String filename, String mimeType) {
         return transcribeDetailed(audio, filename, mimeType).segments();
     }
+
+    public boolean isConfigured() { return !baseUrl.isBlank(); }
 
     public AsrResult transcribeDetailed(Resource audio, String filename, String mimeType) {
         try {

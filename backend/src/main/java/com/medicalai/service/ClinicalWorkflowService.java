@@ -54,6 +54,8 @@ public class ClinicalWorkflowService {
     private final TranscriptRoleReclassificationStore roleReclassificationStore;
     private final AuditLogService auditLogs;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private AiRouteSettingsService aiRouteSettings;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ExportFileService exportFiles;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ExportTemplateService exportTemplates;
@@ -242,7 +244,17 @@ public class ClinicalWorkflowService {
         requireRecordEditable(visit.id());
         Optional<RecordingMapper.AsrJob> active = recordings.latestAsrJob(visit.id())
                 .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
-        if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
+        if (active.isPresent()) {
+            // 幂等返回活动任务前仍要校验旧客户端携带的路由字段，避免用一个看似成功的响应
+            // 掩盖“请求路由与本次接诊已固化路由不一致”的错误。
+            String activeAsrRoute = normalizeRoute(active.get().providerRoute());
+            if (AsrJobWorker.PUBLIC_ROLE_ROUTE.equals(activeAsrRoute)) activeAsrRoute = "DASHSCOPE";
+            validateRequestedRoute(activeAsrRoute, normalizeRoute(provider), normalizeRoute(roleProvider));
+            return asrJob(visitId, doctorId, active.get().id());
+        }
+        String effectiveRoute = resolveAndLockVisitRoute(visit, doctorId, provider, roleProvider);
+        provider = effectiveRoute;
+        roleProvider = effectiveRoute;
         if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
@@ -283,6 +295,9 @@ public class ClinicalWorkflowService {
         if (visits.hasOpenSession(visit.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊仍有录音操作进行中，暂不能重新转写");
         }
+        String effectiveRoute = resolveAndLockVisitRoute(visit, doctorId, provider, roleProvider);
+        provider = effectiveRoute;
+        roleProvider = effectiveRoute;
         if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
@@ -349,8 +364,10 @@ public class ClinicalWorkflowService {
         // source_route 仍然表示"这条转写是哪条 ASR 路由产出的"；而 available_routes / default_route
         // 描述的是**角色识别**当前能走哪些 LLM 路由（能力驱动），两者语义不同，不能混用。
         LlmRouting asrRouting = routes.routing(snapshot.get());
-        List<LlmRoute> roleRoutes = roleRouter.availableRoutes();
-        LlmRoute preferredRoleRoute = roleRouter.preferredRoute();
+        List<LlmRoute> roleRoutes = visit.aiRoute() == null ? roleRouter.availableRoutes()
+                : List.of(LlmRoute.fromRequested(visit.aiRoute()));
+        LlmRoute preferredRoleRoute = visit.aiRoute() == null ? roleRouter.preferredRoute()
+                : LlmRoute.fromRequested(visit.aiRoute());
         return new TranscriptVO(snapshot.get().id().toString(), snapshot.get().snapshotVersion(),
                 snapshot.get().snapshotHash(), snapshot.get().authorityStatus(), text, edited, dirty, turns,
                 asrRouting.sourceRoute().name(), roleRoutes.stream().map(Enum::name).toList(),
@@ -384,8 +401,8 @@ public class ClinicalWorkflowService {
         requireRecordEditable(visit.id());
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
                 new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
-        // 提取路由同样能力驱动：医生可以在公网与内网提取模型之间显式选择。
-        return extractionService().generate(visit.id(), doctorId, snapshot, requestedProvider);
+        String route = resolveVisitRouteForAnalysis(visit, requestedProvider, false);
+        return extractionService().generate(visit.id(), doctorId, snapshot, route);
     }
 
     @Transactional
@@ -468,8 +485,7 @@ public class ClinicalWorkflowService {
         }
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
                 .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
-        // 路由能力驱动：显式指定的路由必须当前可用，不指定则跟随 LLM_ROLE_ROUTE 的默认值。
-        LlmRoute route = roleRouter.resolveRequestedRoute(requestedProvider);
+        LlmRoute route = resolveVisitRoleRoute(visit, requestedProvider);
 
         List<Utterance> candidates = currentUtterances(visit.id()).stream()
                 .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
@@ -998,6 +1014,125 @@ public class ClinicalWorkflowService {
 
     private String queueProvider(String provider) {
         return "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;
+    }
+
+    /**
+     * 首次提交转写时固化全局 AI 环境。
+     *
+     * <p>这里不能只相信进入方法时读取到的 {@code visit}：两个并发请求可能同时看到
+     * {@code ai_route IS NULL}，而只有一个请求真正抢到固化写入。若忽略 UPDATE 的返回值，
+     * 另一个请求仍会继续按自己的路由创建任务，最终造成 visit.ai_route 与 ai_job 路由不一致。
+     * 因此失去竞争时必须重新读取已固化的值并按它继续（旧客户端传入不一致值则明确拒绝）。
+     */
+    private String resolveAndLockVisitRoute(Visit visit, UUID doctorId, String requestedAsr, String requestedRole) {
+        requestedAsr = normalizeRoute(requestedAsr);
+        requestedRole = normalizeRoute(requestedRole);
+        String route = normalizeRoute(visit.aiRoute());
+        if (route == null || route.isBlank()) {
+            // 迁移前已经有转写结果的接诊没有 ai_route。单一路由可以从不可变快照安全推断，
+            // 不能因为全局设置后来切换，就让重转写/补传悄悄改走另一条路由。
+            route = historicalSingleRoute(visit.id());
+            if (route == null) {
+                route = aiRouteSettings == null ? (requestedAsr == null ? "DASHSCOPE" : requestedAsr)
+                        : aiRouteSettings.currentRoute();
+                route = normalizeRoute(route);
+            }
+            validateRequestedRoute(route, requestedAsr, requestedRole);
+            if (visits.lockAiRouteIfUnset(visit.id(), doctorId, route).isEmpty()) {
+                // 另一个并发请求已经完成固化；永远以数据库中的获胜值为准。
+                route = visits.find(visit.id(), doctorId, false)
+                        .map(item -> normalizeRoute(item.aiRoute())).orElse(null);
+                if (route == null) {
+                    throw new BusinessException(HttpStatus.CONFLICT, "AI_ROUTE_LOCK_FAILED",
+                            "接诊处理环境固化失败，请刷新后重试");
+                }
+                validateRequestedRoute(route, requestedAsr, requestedRole);
+            }
+            return route;
+        }
+        validateRequestedRoute(route, requestedAsr, requestedRole);
+        return route;
+    }
+
+    private String resolveVisitRouteForAnalysis(Visit visit, String requested, boolean role) {
+        String locked = normalizeRoute(visit.aiRoute());
+        requested = normalizeRoute(requested);
+        if (locked != null && !locked.isBlank()) {
+            if (requested != null && !locked.equals(requested)) {
+                throw new BusinessException(HttpStatus.CONFLICT, "AI_ROUTE_MISMATCH", "本次接诊已固定使用" + displayProvider(locked) + "，不能切换路由");
+            }
+            return locked;
+        }
+        // 历史数据可能没有 ai_route，但已有转写快照。此类接诊不能因新的全局设置
+        // 改变再次分析时的路由；单一路由沿用快照来源，混合快照才使用兼容参数。
+        Optional<DialogueSnapshot> snapshot = recordings.latestSnapshot(visit.id());
+        if (snapshot.isPresent()) {
+            LlmRoute historical = routes.routing(snapshot.get()).sourceRoute();
+            if (historical.isCallable()) return historical.name();
+            if (historical == LlmRoute.MIXED && requested != null) return requested;
+            throw BusinessException.conflict(historical == LlmRoute.MIXED
+                    ? "LLM_ROUTE_SELECTION_REQUIRED" : "LLM_ROUTE_UNKNOWN",
+                    historical == LlmRoute.MIXED
+                            ? "历史快照同时包含公网和本地转写，请明确指定分析路由"
+                            : "当前历史快照无法识别 AI 路由，请重新转写后再进行 AI 分析");
+        }
+        return requested;
+    }
+
+    private LlmRoute resolveVisitRoleRoute(Visit visit, String requested) {
+        String locked = normalizeRoute(visit.aiRoute());
+        requested = normalizeRoute(requested);
+        if (locked != null && !locked.isBlank()) {
+            if (requested != null && !locked.equals(requested)) {
+                throw new BusinessException(HttpStatus.CONFLICT, "AI_ROUTE_MISMATCH", "本次接诊已固定使用" + displayProvider(locked) + "，不能切换角色识别路由");
+            }
+            return roleRouter.resolveRequestedRoute(locked);
+        }
+        Optional<DialogueSnapshot> snapshot = recordings.latestSnapshot(visit.id());
+        if (snapshot.isPresent()) {
+            LlmRoute historical = routes.routing(snapshot.get()).sourceRoute();
+            if (historical.isCallable()) {
+                return roleRouter.resolveRequestedRoute(historical.name());
+            }
+            if (historical == LlmRoute.MIXED && requested != null) {
+                return roleRouter.resolveRequestedRoute(requested);
+            }
+            throw BusinessException.conflict(historical == LlmRoute.MIXED
+                    ? "LLM_ROUTE_SELECTION_REQUIRED" : "LLM_ROUTE_UNKNOWN",
+                    historical == LlmRoute.MIXED
+                            ? "历史快照同时包含公网和本地转写，请明确指定角色识别路由"
+                            : "当前历史快照无法识别 AI 路由，请重新转写后再进行角色识别");
+        }
+        return roleRouter.resolveRequestedRoute(requested);
+    }
+
+    /** 返回迁移前单一路由历史接诊的安全推断；混合/未知来源不能静默选择公网。 */
+    private String historicalSingleRoute(UUID visitId) {
+        Optional<DialogueSnapshot> snapshot = recordings.latestSnapshot(visitId);
+        if (snapshot.isEmpty()) return null;
+        LlmRoute historical = routes.routing(snapshot.get()).sourceRoute();
+        if (historical.isCallable()) return historical.name();
+        throw BusinessException.conflict(historical == LlmRoute.MIXED
+                ? "LLM_ROUTE_SELECTION_REQUIRED" : "LLM_ROUTE_UNKNOWN",
+                historical == LlmRoute.MIXED
+                        ? "历史接诊包含混合 AI 路由，不能在统一路由模式下重新处理"
+                        : "历史接诊无法识别 AI 路由，请重新建立接诊后再处理");
+    }
+
+    private void validateRequestedRoute(String route, String requestedAsr, String requestedRole) {
+        if (requestedAsr != null && !route.equals(requestedAsr)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "AI_ROUTE_MISMATCH",
+                    "本次接诊已固定使用" + displayProvider(route) + "，不能切换到" + displayProvider(requestedAsr));
+        }
+        if (requestedRole != null && !route.equals(requestedRole)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "AI_ROUTE_MISMATCH",
+                    "本次接诊已固定使用" + displayProvider(route) + "，不能切换角色识别路由");
+        }
+    }
+
+    private static String normalizeRoute(String value) {
+        if (value == null || value.isBlank()) return null;
+        return value.strip().toUpperCase(Locale.ROOT);
     }
 
     private String displayProvider(String providerRoute) {

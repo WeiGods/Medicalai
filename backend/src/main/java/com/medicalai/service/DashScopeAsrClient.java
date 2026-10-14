@@ -101,6 +101,8 @@ public class DashScopeAsrClient {
         }
     }
 
+    public boolean isConfigured() { return apiKey != null && !apiKey.isBlank(); }
+
     /** 查询 DashScope 异步转写任务的当前状态。 */
     public Task query(String taskId) {
         requireApiKey();

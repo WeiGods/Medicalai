@@ -100,6 +100,24 @@ CREATE TABLE IF NOT EXISTS visit (
     updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
 );
 
+-- 全系统统一的 AI 处理环境；接诊首次提交转写时会把该值固化到 visit.ai_route。
+CREATE TABLE IF NOT EXISTS ai_route_setting (
+    id smallint PRIMARY KEY CHECK (id = 1),
+    route varchar(32) NOT NULL CHECK (route IN ('DASHSCOPE','LOCAL')),
+    updated_by uuid REFERENCES doctor(id),
+    updated_at timestamp(0) without time zone NOT NULL DEFAULT medicalai_local_now()
+);
+INSERT INTO ai_route_setting(id, route)
+VALUES (1, 'DASHSCOPE')
+ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE visit ADD COLUMN IF NOT EXISTS ai_route varchar(32);
+-- 保持为单条普通 DDL，避免 Spring 的 schema.sql 执行器将函数体内的分号
+-- 错误拆分成多个语句。服务层同时会校验路由只能是 DASHSCOPE 或 LOCAL。
+ALTER TABLE visit DROP CONSTRAINT IF EXISTS visit_ai_route_check;
+ALTER TABLE visit ADD CONSTRAINT visit_ai_route_check
+    CHECK (ai_route IS NULL OR ai_route IN ('DASHSCOPE','LOCAL'));
+
 CREATE TABLE IF NOT EXISTS recording (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     visit_id uuid NOT NULL REFERENCES visit(id),

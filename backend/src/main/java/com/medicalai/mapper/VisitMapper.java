@@ -15,7 +15,8 @@ public class VisitMapper {
             rs.getString("patient_name_snapshot"),rs.getString("patient_gender_snapshot"),
             rs.getObject("patient_age_snapshot",Integer.class),rs.getString("doctor_name_snapshot"),
             rs.getString("chief_complaint"),rs.getInt("version"),DatabaseDateTime.getInstant(rs,"started_at"),
-            DatabaseDateTime.getInstant(rs,"completed_at"),DatabaseDateTime.getInstant(rs,"created_at"));
+            DatabaseDateTime.getInstant(rs,"completed_at"),DatabaseDateTime.getInstant(rs,"created_at"),
+            rs.getString("ai_route"));
     private final JdbcTemplate jdbc;
 
     public VisitMapper(JdbcTemplate jdbc) { this.jdbc=jdbc; }
@@ -112,6 +113,15 @@ public class VisitMapper {
                   updated_at=medicalai_local_now(),updated_by=?,version=version+1
                 WHERE id=? AND doctor_id=? RETURNING *
                 """,ROW,status,status,status,status,doctorId,id,doctorId);
+    }
+
+    /** 首次提交转写时固化接诊路由；并发请求只有一个能写入。 */
+    public Optional<Visit> lockAiRouteIfUnset(UUID id, UUID doctorId, String route) {
+        return jdbc.query("""
+                UPDATE visit SET ai_route=?, updated_at=medicalai_local_now(), updated_by=?, version=version+1
+                WHERE id=? AND doctor_id=? AND ai_route IS NULL
+                RETURNING *
+                """, ROW, route, doctorId, id, doctorId).stream().findFirst();
     }
 
     /** 按外键安全顺序删除一次已取消接诊的全部持久化产物。 */

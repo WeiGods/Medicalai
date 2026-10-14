@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ClinicalWorkbench from './ClinicalWorkbench.vue'
 import { api } from '../api'
-import type { AsrJob, AsrPreviewRecording, ClinicalExtraction, Doctor, ExportTemplate, MedicalRecord, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
+import type { AiRouteSettings, AsrJob, AsrPreviewRecording, ClinicalExtraction, Doctor, ExportTemplate, MedicalRecord, Patient, RecordExport, Recording, Transcript, Visit } from '../types'
 
 vi.mock('../api', () => ({
   api: {
@@ -28,6 +28,8 @@ vi.mock('../api', () => ({
     transcribe: vi.fn(),
     reclassifyTranscriptRoles: vi.fn(),
     generateClinicalExtraction: vi.fn(),
+    aiRouteSettings: vi.fn(),
+    updateAiRouteSettings: vi.fn(),
     deletePatient: vi.fn(),
     patientDeletionStatus: vi.fn()
   }
@@ -57,6 +59,13 @@ const doneRecording: Recording = {
 
 const uploadedRecording: Recording = {
   ...doneRecording, id: 'recording-2', recording_no: 'REC-002', file_name: 'supplement.wav', status: 'UPLOADED'
+}
+
+const aiRouteSettings: AiRouteSettings = {
+  route: 'DASHSCOPE', asr_available: true, role_available: true, extraction_available: true,
+  unavailable_capabilities: [], public_asr_available: true, public_role_available: true,
+  public_extraction_available: true, local_asr_available: true, local_role_available: true,
+  local_extraction_available: true
 }
 
 function transcript(edited = false): Transcript {
@@ -109,6 +118,7 @@ function configure(options: {
   vi.mocked(api.exports).mockResolvedValue(options.exports || [])
   vi.mocked(api.exportTemplates).mockResolvedValue(options.templates || [])
   vi.mocked(api.managedTemplates).mockResolvedValue([])
+  vi.mocked(api.aiRouteSettings).mockResolvedValue(aiRouteSettings)
 }
 
 async function mountWorkbench(options?: Parameters<typeof configure>[0]) {
@@ -196,7 +206,7 @@ describe('supplemental recording workflow', () => {
 
     await wrapper.get('button[aria-label="确认重新转写"]').trigger('click')
     expect(api.transcribe).toHaveBeenCalledTimes(1)
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id)
   })
 
   it('requires confirmation before re-transcribing supplemental audio when a draft exists', async () => {
@@ -215,10 +225,10 @@ describe('supplemental recording workflow', () => {
     await wrapper.get('.transcribe-action button').trigger('click')
 
     expect(wrapper.text()).not.toContain('重新转写确认')
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id)
   })
 
-  it('re-transcribes an existing audio file with the selected ASR provider after confirmation', async () => {
+  it('re-transcribes an existing audio file with the visit route after confirmation', async () => {
     vi.mocked(api.retranscribeRecording).mockImplementation(() => new Promise(() => undefined))
     const wrapper = await mountWorkbench({ recordings: [doneRecording], transcript: transcript(true) })
 
@@ -229,7 +239,7 @@ describe('supplemental recording workflow', () => {
     expect(api.retranscribeRecording).not.toHaveBeenCalled()
 
     await wrapper.get('button[aria-label="确认重新转写录音"]').trigger('click')
-    expect(api.retranscribeRecording).toHaveBeenCalledWith(activeVisit.id, doneRecording.id, 'DASHSCOPE', 'DASHSCOPE')
+    expect(api.retranscribeRecording).toHaveBeenCalledWith(activeVisit.id, doneRecording.id)
   })
 
   it('allows an active draft to expose deletion for a transcribed audio file', async () => {
@@ -763,21 +773,16 @@ describe('llm route selection', () => {
     }
   }
 
-  it('shows the role-recognition route selector and reclassifies with the selected provider', async () => {
+  it('uses the unified visit route for role recognition without a selector', async () => {
     const routed = routedTranscript()
     vi.mocked(api.reclassifyTranscriptRoles).mockResolvedValue(routed)
     const wrapper = await mountWorkbench({ transcript: routed })
 
-    const options = wrapper.get('.route-selector').findAll('.route-option')
-    expect(options).toHaveLength(2)
-    expect(options[0].classes()).toContain('active')
-    expect(options[1].classes()).not.toContain('active')
-
-    await options[1].trigger('click')
+    expect(wrapper.find('.route-selector').exists()).toBe(false)
     await wrapper.get('.role-attention-action').trigger('click')
     await flushPromises()
 
-    expect(api.reclassifyTranscriptRoles).toHaveBeenCalledWith(activeVisit.id, 'LOCAL')
+    expect(api.reclassifyTranscriptRoles).toHaveBeenCalledWith(activeVisit.id)
   })
 
   it('keeps the route selector hidden when only one route is available', async () => {
@@ -786,23 +791,22 @@ describe('llm route selection', () => {
     expect(wrapper.find('.route-selector').exists()).toBe(false)
   })
 
-  it('sends the role-recognition route chosen on the audio page as role_provider', async () => {
+  it('shows only the unified route on the audio page', async () => {
     vi.mocked(api.transcribe).mockImplementation(() => new Promise(() => undefined))
     const wrapper = await mountWorkbench({
       recordings: [uploadedRecording],
       transcript: { ...transcript(), default_route: 'LOCAL' }
     })
 
-    expect(wrapper.findAll('input[name="role-llm-provider"]')).toHaveLength(2)
-    expect((wrapper.get('input[name="role-llm-provider"][value="LOCAL"]').element as HTMLInputElement).checked).toBe(true)
-
-    await wrapper.get('input[name="role-llm-provider"][value="DASHSCOPE"]').setValue(true)
+    expect(wrapper.findAll('input[name="role-llm-provider"]')).toHaveLength(0)
+    expect(wrapper.findAll('input[name="asr-provider"]')).toHaveLength(0)
+    expect(wrapper.text()).toContain('本次接诊 AI 处理环境：公网')
     await wrapper.get('.transcribe-action button').trigger('click')
 
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id)
   })
 
-  it('generates the extraction with the provider selected from the extraction routes', async () => {
+  it('generates extraction with the unified route and no extraction selector', async () => {
     const routedExtraction: ClinicalExtraction = {
       ...pendingExtraction, available_routes: ['DASHSCOPE', 'LOCAL'], route_selection_required: true, default_route: 'LOCAL'
     }
@@ -810,14 +814,10 @@ describe('llm route selection', () => {
     const wrapper = await mountWorkbench({ extraction: routedExtraction })
 
     await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
-    const options = wrapper.get('.extraction-actions .route-selector').findAll('.route-option')
-    expect(options).toHaveLength(2)
-    expect(options[1].classes()).toContain('active')
-
-    await options[0].trigger('click')
+    expect(wrapper.find('.extraction-actions .route-selector').exists()).toBe(false)
     await wrapper.get('.extraction-actions > button.btn').trigger('click')
 
-    expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE')
+    expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id)
   })
 })
 

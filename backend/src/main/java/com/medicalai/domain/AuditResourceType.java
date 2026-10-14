@@ -7,5 +7,6 @@ public enum AuditResourceType {
     RECORDING,
     MEDICAL_RECORD,
     RECORD_EXPORT,
-    PATIENT
+    PATIENT,
+    SETTINGS
 }

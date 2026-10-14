@@ -54,7 +54,8 @@ public class RecordingMapper {
                 INSERT INTO recording(id,visit_id,recording_no,source_type,object_key,file_name,mime_type,size_bytes,duration_ms,status,asr_route)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING *
                 """, RECORDING, r.id(), r.visitId(), r.recordingNo(), r.sourceType(), r.objectKey(),
-                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), "DASHSCOPE");
+                // 上传时尚未发生 ASR 调用，不能预填公网路由；实际提交任务时由 beginAsrRecording 写入。
+                r.fileName(), r.mimeType(), r.sizeBytes(), r.durationMs(), r.status(), null);
     }
 
     public int delete(UUID id) {

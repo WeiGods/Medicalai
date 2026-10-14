@@ -62,6 +62,15 @@ public class AuditLogService {
                 abbreviate(patientNo, 64), null));
     }
 
+    public void recordAiRouteChanged(UUID doctorId, String previous, String current, List<String> unavailable) {
+        String detail = "修改 AI 处理环境：" + previous + " → " + current;
+        if (unavailable != null && !unavailable.isEmpty()) {
+            detail += "；当前不可用：" + String.join("、", unavailable);
+        }
+        record(doctorId, null, AuditAction.AI_ROUTE_CHANGED, null, AuditResourceType.SETTINGS,
+                AuditResult.SUCCESS, detail, null);
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordMedicalRecordExport(UUID doctorId, UUID visitId, UUID exportId, String format,
                                           AuditResult result, UUID patientId, String patientName,

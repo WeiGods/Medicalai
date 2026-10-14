@@ -166,6 +166,9 @@ public class AsrJobWorker {
         LlmRoute route = roleRoute(job);
         long roleStartedAt = System.nanoTime();
         // 角色判断必须与医生选择的路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
+        if (!roleRouter.isAvailable(route)) {
+            throw new IllegalStateException(roleUnavailableMessage(route));
+        }
         var assignedRoles = roleRouter.assignRoles(route, input);
         Map<Integer, DashScopeRoleClient.RoleAssignment> roles = assignedRoles == null
                 ? Map.of() : assignedRoles;

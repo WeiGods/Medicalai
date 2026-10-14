@@ -1,7 +1,7 @@
 import type {
   AsrProvider, AsrJob, Confirmation, Doctor, LoginResult, LlmProvider, MedicalRecord, Patient, RecordExport,
   Recording, AsrPreviewRecording, Transcript, Visit, ClinicalExtraction, AuditAction, AuditLogPage, AuditOperator, DemoRole, ExportTemplate,
-  ExportTemplateRevision, PatientDeletionResult
+  ExportTemplateRevision, PatientDeletionResult, AiRouteSettings, AiRoute
 } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
@@ -64,6 +64,10 @@ export const api = {
   patients: (keyword = '') => request<Patient[]>(`/api/v1/patients${keyword ? `?keyword=${encodeURIComponent(keyword)}` : ''}`),
   visits: () => request<Visit[]>('/api/v1/visits'),
   visit: (visitId: string) => request<Visit>(`/api/v1/visits/${visitId}`),
+  aiRouteSettings: () => request<AiRouteSettings>('/api/v1/settings/ai-route'),
+  updateAiRouteSettings: (route: AiRoute) => request<AiRouteSettings>('/api/v1/settings/ai-route', {
+    method: 'PUT', body: JSON.stringify({ route })
+  }),
   createPatient: (payload: { name: string; gender: string; age: number | null; phone?: string; idNo?: string }) => request<Patient>('/api/v1/patients', {
     method: 'POST',
     body: JSON.stringify({
@@ -95,11 +99,11 @@ export const api = {
   /**
    * provider 是 ASR 路由；roleProvider 是角色识别 LLM 路由，null 表示跟随后端默认配置。
    */
-  transcribe: (visitId: string, provider: AsrProvider, roleProvider?: LlmProvider | null) => request<AsrJob>(
+  transcribe: (visitId: string, provider?: AsrProvider | null, roleProvider?: LlmProvider | null) => request<AsrJob>(
     `/api/v1/visits/${visitId}/recordings/transcribe`, {
       method: 'POST', body: JSON.stringify({ provider, role_provider: roleProvider ?? null })
     }),
-  retranscribeRecording: (visitId: string, recordingId: string, provider: AsrProvider, roleProvider?: LlmProvider | null) => request<AsrJob>(
+  retranscribeRecording: (visitId: string, recordingId: string, provider?: AsrProvider | null, roleProvider?: LlmProvider | null) => request<AsrJob>(
     `/api/v1/visits/${visitId}/recordings/${recordingId}/retranscribe`, {
       method: 'POST', body: JSON.stringify({ provider, role_provider: roleProvider ?? null })
     }),

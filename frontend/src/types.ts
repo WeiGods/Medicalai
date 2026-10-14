@@ -41,6 +41,8 @@ export interface Visit {
   version: number
   created_at: string
   last_activity_at: string
+  ai_route?: LlmProvider | null
+  ai_route_locked?: boolean
 }
 
 export type DemoRole = 'DOCTOR' | 'DEPARTMENT_HEAD'
@@ -95,6 +97,33 @@ export interface Utterance {
 }
 
 export type LlmProvider = 'DASHSCOPE' | 'LOCAL'
+
+export type AiRoute = LlmProvider
+
+export interface AiRouteSettings {
+  route: AiRoute
+  asr_available: boolean
+  role_available: boolean
+  extraction_available: boolean
+  asr_message?: string | null
+  role_message?: string | null
+  extraction_message?: string | null
+  updated_by?: string | null
+  updated_at?: string | null
+  unavailable_capabilities: string[]
+  public_asr_available?: boolean
+  public_role_available?: boolean
+  public_extraction_available?: boolean
+  public_asr_message?: string | null
+  public_role_message?: string | null
+  public_extraction_message?: string | null
+  local_asr_available?: boolean
+  local_role_available?: boolean
+  local_extraction_available?: boolean
+  local_asr_message?: string | null
+  local_role_message?: string | null
+  local_extraction_message?: string | null
+}
 
 export interface Transcript {
   snapshot_id: string | null

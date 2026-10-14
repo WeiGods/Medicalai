@@ -99,7 +99,8 @@ public class RecordingController {
     private static final java.util.Set<String> PROVIDERS = java.util.Set.of("DASHSCOPE", "LOCAL");
 
     private static String asrProvider(String provider) {
-        String value = provider == null ? "DASHSCOPE" : provider;
+        if (provider == null || provider.isBlank()) return null;
+        String value = provider.strip().toUpperCase(java.util.Locale.ROOT);
         if (!PROVIDERS.contains(value)) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
         }
