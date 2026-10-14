@@ -34,10 +34,12 @@ medicalai:
   llm:
     # 角色识别 LLM 路由：DASHSCOPE=公网 LLM（默认）；LOCAL=内网本地 LLM（llama.cpp）
     role-route: ${LLM_ROLE_ROUTE:DASHSCOPE}
+    # 信息提取 LLM 路由：DASHSCOPE=公网 LLM（默认）；LOCAL=内网本地 LLM（llama.cpp）
+    extraction-route: ${LLM_EXTRACTION_ROUTE:DASHSCOPE}
   local-llm:
     # 是否启用内网本地 LLM（llama.cpp / OpenAI 兼容）通信适配器；默认关闭，开启后仅作为
     # 角色识别 LOCAL 路由使用，绝不把内网内容改送公网
-    enabled: ${LOCAL_LLM_ENABLED:false}
+    enabled: ${LOCAL_LLM_ENABLED:true}
     # 内网本地 LLM 服务地址
     endpoint: ${LOCAL_LLM_ENDPOINT:http://192.168.1.56:8080}
     # 本地 LLM 的 API 密钥；llama.cpp 未启用鉴权时留空（留空则不发送 Authorization 头）
@@ -48,6 +50,21 @@ medicalai:
     role-review-threshold: ${LOCAL_LLM_ROLE_REVIEW_THRESHOLD:70}
     # 每批发送给本地角色识别模型的句段数量
     role-batch-size: ${LOCAL_LLM_ROLE_BATCH_SIZE:40}
+    # 角色识别请求是否关闭本地模型思考（chat_template_kwargs.enable_thinking=false）；
+    # 角色判断只需要 JSON 结果，思考 token 会成倍拉长每批耗时，故默认关闭
+    role-disable-thinking: ${LOCAL_LLM_DISABLE_THINKING:true}
+    # 是否启用内网本地 LLM 的**信息提取**；未显式配置时跟随 medicalai.local-llm.enabled
+    # （链到属性而不是环境变量，这样用 --medicalai.local-llm.enabled=true 或 IDE VM option 开启角色识别时，
+    #   提取也会一并开启，不会出现"角色走了内网、提取还关着"的错觉）
+    extraction-enabled: ${LOCAL_LLM_EXTRACTION_ENABLED:${medicalai.local-llm.enabled:false}}
+    # 本地信息提取模型 ID
+    extraction-model: ${LOCAL_LLM_EXTRACTION_MODEL:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}
+    # 本地信息提取的最大输出 token 数（12 个字段带证据，需要足够空间）
+    extraction-max-tokens: ${LOCAL_LLM_EXTRACTION_MAX_TOKENS:4096}
+    # 等待本地信息提取的时间上限，单位毫秒；比角色识别长，因为输出更长
+    extraction-read-timeout-ms: ${LOCAL_LLM_EXTRACTION_READ_TIMEOUT_MS:180000}
+    # 信息提取请求是否关闭本地模型思考；未显式配置时跟随上面角色识别的开关
+    extraction-disable-thinking: ${LOCAL_LLM_EXTRACTION_DISABLE_THINKING:${LOCAL_LLM_DISABLE_THINKING:true}}
     # 连接本地 LLM 的超时时间，单位毫秒
     connect-timeout-ms: ${LOCAL_LLM_CONNECT_TIMEOUT_MS:5000}
     # 等待本地 LLM 普通响应的超时时间，单位毫秒

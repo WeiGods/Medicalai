@@ -1,5 +1,8 @@
 # 角色识别 LLM 通信适配器（local-llm-role-adapter）
 
+> 路由选择（界面上的"公网 / 内网"按钮、转写时指定角色路由、信息提取的同类选择）见
+> [llm-route-selection.md](llm-route-selection.md)；本文件只讲角色识别这条路由本身。
+
 ## 定位
 
 MedicalAI 后端里的**角色识别（speaker 识别）**是把 ASR（MOSS 匿名推理结果）得到的
@@ -37,7 +40,66 @@ MedicalAI 后端里的**角色识别（speaker 识别）**是把 ASR（MOSS 匿�
   （按 `role-batch-size` 分批、429/5xx/解析失败重试、最终降级 `FALLBACK`）。
 - 流式能力：`LocalLlmRoleClient.streamChat(messages, onDelta)` 走 SSE
   （`stream=true`，解析 `data:` 事件行，跳过 `[DONE]`，聚合全部 delta 返回）。
-  角色识别本身始终用同步路径，流式方法供后续流式交互/续写场景使用。
+  角色识别本身始终用同步路径，流式方法供后续流式交互/续写场景使用
+  （流式方法**不**附带下面的 `enable_thinking=false`，流式交互通常本来就需要思考）。
+
+## 一次角色识别请求里到底发了什么
+
+ASR 只产出文本和时间，**音频不出后端**；送给本地 LLM 的是一个批次的句段数组 + 一段固定提示词：
+
+1. ASR（本地或公网）产出句段：`text` / `start_ms` / `end_ms` / 声学聚类 `speaker_id`。
+   `AsrJobWorker.roleAssignedTurns` 把它们重排成 `[{index, speaker_id, start_ms, end_ms, text}, …]`，
+   `index` 从 0 连续编号（**不是** `speaker_id`；`speaker_id` 只作为上下文特征一起发过去）。
+2. `LlmRoleRouter` 按 `medicalai.llm.role-route` 选路，LOCAL 交给 `LocalLlmRoleClient`。
+3. 按 `role-batch-size`（默认 40）分批，**一批一次 HTTP 请求**——不是逐句一次，也不是整段一次：
+
+```http
+POST http://192.168.1.56:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "/models/Ternary-Bonsai-2-27B-PQ2_0.gguf",
+  "messages": [
+    {"role": "system", "content": "你是医疗对话逐句角色分类器。只返回符合要求的 JSON，不输出解释或思考过程。"},
+    {"role": "user",   "content": "<逐句角色判断指令> + [{\"index\":0,\"speaker_id\":1,\"start_ms\":0,\"end_ms\":3000,\"text\":\"请描述一下哪里不舒服\"}, …]"}
+  ],
+  "temperature": 0,
+  "response_format": {"type": "json_object"},
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+要点：
+
+- **系统提示词是常量**（`RoleLlmClient.SYSTEM_PROMPT`）；**逐句角色判断指令 + 本批句段 JSON 拼在唯一一条
+  user 消息里**（`RoleLlmClient.ROLE_ASSIGNMENT_INSTRUCTION + mapper.writeValueAsString(turns)`）。
+  没有多轮历史、没有工具调用，一次请求就是一批彼此独立的判断。
+- 提示词里明确写了"`speaker_id` 只是 ASR 的声学聚类标签，不得据此、据发言顺序或句段数量猜测"，
+  并要求每个 `index` 恰好返回一次、不得增加未知 `index`。
+- 期望回答：`{"items":[{"index":0,"role":"DOCTOR","confidence":96}, …]}`，
+  其中 `role` ∈ {DOCTOR, PATIENT, OTHER}，`confidence` 是 0–100 整数。
+- 只取 `/choices/0/message/content`，解析前先剥离 `<think>…</think>`（见下节）。
+
+## 思考（thinking）与降级
+
+本地模型的 Qwen 系模板默认开启思考，而角色判断只要 JSON 结果，思考 token 纯属浪费。
+在 `.56`（`b10772`）上用 4 句真实问诊实测：
+
+| 请求 | 耗时 | completion_tokens | 结果 |
+| --- | --- | --- | --- |
+| 默认（开思考） | 11.8 s | 464（大部分是思考） | 4/4 角色判对 |
+| 附带 `chat_template_kwargs.enable_thinking=false` | 4.2 s | 137 | 4/4 角色判对 |
+
+生成速度不变（约 45 tok/s），省下的全是思考 token。因此适配器**默认**附带
+`chat_template_kwargs = {"enable_thinking": false}`；置 `LOCAL_LLM_DISABLE_THINKING=false`
+可去掉这个字段（服务端不支持该字段时也只是忽略）。按 `role-batch-size=40` 估算，
+一批的耗时大致能压到原来的 1/2～1/3，`read-timeout-ms=120000` 因此有充足余量。
+
+**思考混进 `content` 的风险**：`llama-server` 的 `--reasoning-format` 决定思考落在
+`reasoning_content` 还是直接拼进 `content`。后者会让一份完全合法的回答变成
+`<think>…</think>\n{…json…}`；适配器现在会先剥离思考块（未闭合的思考块——回答被截断——
+整段丢弃并按无效结果重试/降级），所以换模型模板或改这个参数不会再造成"静默全降级"。
+公网 `DashScopeRoleClient` 未做该剥离：qwen-plus 走的是非思考路径，保持既有行为不动。
 
 ## 路由切换
 
@@ -70,6 +132,7 @@ LLM_ROLE_ROUTE=DASHSCOPE
 | `LOCAL_LLM_ROLE_MODEL` | `/models/Ternary-Bonsai-2-27B-PQ2_0.gguf` | 本地角色识别模型 ID |
 | `LOCAL_LLM_ROLE_REVIEW_THRESHOLD` | `70` | 置信度低于此值要求医生复核 |
 | `LOCAL_LLM_ROLE_BATCH_SIZE` | `40` | 每批发送的句段数量 |
+| `LOCAL_LLM_DISABLE_THINKING` | `true` | 角色识别请求附带 `chat_template_kwargs.enable_thinking=false`，关闭本地模型思考 |
 | `LOCAL_LLM_CONNECT_TIMEOUT_MS` | `5000` | 连接超时（毫秒） |
 | `LOCAL_LLM_READ_TIMEOUT_MS` | `120000` | 读取超时（毫秒） |
 | `LOCAL_LLM_ROLE_RETRY_MAX_ATTEMPTS` | `2` | 失败重试次数上限 |
@@ -84,24 +147,31 @@ LLM_ROLE_ROUTE=DASHSCOPE
    转写文本永不丢失；降级批次会记录 `role_provider_route`，可追溯。
 5. **不出网**：本地路由不做任何回退到公网的操作；公网路由也不接收内网录音内容。
 6. **响应格式**：请求带 `temperature=0` 与 `response_format={"type":"json_object"}`，
-   解析 `/choices/0/message/content` 中的 `items` 数组并严格校验
-   `index` 集合、`role` 枚举与 `confidence`（0–100 整数）。
+   解析 `/choices/0/message/content` 中的 `items` 数组（解析前先剥离 `<think>…</think>` 思考块），
+   并严格校验 `index` 集合、`role` 枚举与 `confidence`（0–100 整数）。
+7. **关思考**：角色识别请求默认附带 `chat_template_kwargs={"enable_thinking":false}`，详见"思考（thinking）与降级"。
 
 ## 直连验证（无需启动后端）
 
 ```bash
-# 健康检查
-curl -s http://192.168.1.56:8080/health
+# 存活检查：/v1 与 /model 不是 llama.cpp 的路由，GET 它们必然是 404，别拿它判断服务死活
+curl -s http://192.168.1.56:8080/health      # {"status":"ok"}
+curl -s http://192.168.1.56:8080/v1/models    # 能列出模型即表示权重已加载
 
-# 角色识别（同步）
+# 角色识别（同步）——与适配器发出的报文一致：system + user 两条消息、关思考
 curl -s http://192.168.1.56:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model":"/models/Ternary-Bonsai-2-27B-PQ2_0.gguf",
-    "messages":[{"role":"user","content":"{\"items\":[{\"index\":0,\"speaker_id\":1,\"text\":\"请描述哪里不舒服\"},{\"index\":1,\"speaker_id\":1,\"text\":\"我腰痛两天了\"}]}"}],
+    "messages":[
+      {"role":"system","content":"你是医疗对话逐句角色分类器。只返回符合要求的 JSON，不输出解释或思考过程。"},
+      {"role":"user","content":"逐句判断以下句段的角色，每个 index 恰好返回一次。\n[{\"index\":0,\"speaker_id\":1,\"start_ms\":0,\"end_ms\":3000,\"text\":\"请描述哪里不舒服\"},{\"index\":1,\"speaker_id\":1,\"start_ms\":3200,\"end_ms\":7000,\"text\":\"我腰痛两天了\"}]"}
+    ],
     "temperature":0,
-    "response_format":{"type":"json_object"}
+    "response_format":{"type":"json_object"},
+    "chat_template_kwargs":{"enable_thinking":false}
   }'
+# 期望：{"choices":[{"message":{"content":"{\"items\":[{\"index\":0,\"role\":\"DOCTOR\",…}]}"}}]}
 
 # 流式对话（SSE）
 curl -N -s http://192.168.1.56:8080/v1/chat/completions \
@@ -163,6 +233,22 @@ mvn -q package       # 打包
 ```
 
 - `LocalLlmRoleClientTest`：同步分类、路径/模型/无鉴权头、Bearer 头、无效结果降级、
-  401 单次请求、429 重试、分批、SSE 流式聚合、未启用时零请求。
+  401 单次请求、429 重试、分批、SSE 流式聚合、未启用时零请求、默认关思考且可配置关闭、
+  思考混入 `content` 时仍能解析、思考块被截断时按无效结果降级。
 - `LlmRoleRouterTest`：默认公网路由、LOCAL 派发、未启用降级、`validateRequestedRoute` 校验。
 - 既有 `DashScopeRoleClientTest` 保持绿，确认公网路径行为未受影响。
+
+## 部署与排错
+
+`.56` 的连通性由**后端所在机器**决定（后端未必和 ASR、LLM 同机），部署时从后端机器实测 `/health`。
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| 转写任务**直接失败**，提示「公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理」 | `LLM_ROLE_ROUTE=LOCAL` 但 `LOCAL_LLM_ENABLED` 仍是 `false`：`AsrJobWorker` 在步骤 8 之前就会拦住（这是**响亮失败**，不是静默降级）。两个变量必须一起设 |
+| 转写成功，但角色全是 `OTHER`（`source=FALLBACK`），界面「待核对」句段等于全部句段 | `LOCAL_LLM_ENABLED=true` 但 `.56` 连不上 / 超时 / 返回不合法：降级只影响本批。用日志「本地LLM角色调用已降级…异常类型=…」定性 |
+| 手动点「开始 AI 判断」返回成功，但角色仍全是 `OTHER` | 与上一条同因。手动重判路径没有转写路径的那道守卫，未启用时也会安静地返回全 FALLBACK |
+| 日志「本地LLM角色调用已降级…异常类型=ConnectException / HTTP状态=null」 | 后端机器连不到 `LOCAL_LLM_ENDPOINT`：确认 `llama-server` 用 `--host 0.0.0.0` 启动（只绑 `127.0.0.1` 时只有 `.56` 本机能连），并放行 8080 |
+| `curl http://192.168.1.56:8080/v1` 或 `/model` 返回 404 | **正常现象**，llama.cpp 没有这两个路由；用 `GET /health`、`GET /v1/models` 判断 |
+| `curl http://192.168.1.78:8000/health` 返回 404 | 内网 AI 服务的健康检查是 `GET /healthz`，不是 `/health` |
+| 同一段对话换路由后角色口径不一致 | 仓库里角色识别有两条独立实现：本适配器（Java 直连 `.56`）与 `.78` 网关的 `/internal/transcript/assign-roles`（Python，当前无 Java 调用方、提示词也不同）。同一时间只用一条，别让两者并存 |
+| 每批耗时明显偏高 | 先确认 `enable_thinking` 已关闭；再检查 `role-batch-size` 是否过大（单批越长，单批失败时降级的句段越多） |

@@ -39,7 +39,8 @@ class LocalLlmRoleClientTest {
         assertEquals(0,request.path("temperature").asInt());
         assertEquals("你是医疗对话逐句角色分类器。只返回符合要求的 JSON，不输出解释或思考过程。",
                 request.at("/messages/0/content").asText());
-        assertFalse(request.toString().contains("enable_thinking"));
+        assertFalse(request.at("/chat_template_kwargs/enable_thinking").asBoolean(true),
+                "角色识别请求必须显式关闭本地模型思考，否则思考 token 成倍拉长每批耗时");
     }
     @Test void sendsBearerHeaderWhenApiKeyConfigured() throws Exception {
         var mapper=new ObjectMapper();var header=new AtomicReference<String>();
@@ -130,7 +131,7 @@ class LocalLlmRoleClientTest {
         var requests = new AtomicInteger();
         server.createContext("/v1/chat/completions", e -> { requests.incrementAndGet(); e.sendResponseHeaders(200, -1); e.close(); });
         var client = new LocalLlmRoleClient(new ObjectMapper(), false, endpoint, "",
-                "local-model", 70, 40, 5000, 120000, 2, 200);
+                "local-model", 70, 40, true, 5000, 120000, 2, 200);
         var result = client.assignRoles(List.of(Map.of("index", 0, "speaker_id", 0, "text", "嗯")));
         assertEquals(Map.of(0, new DashScopeRoleClient.RoleAssignment("OTHER", null, "FALLBACK")), result);
         assertEquals(0, requests.get());
@@ -167,5 +168,61 @@ class LocalLlmRoleClientTest {
         assertTrue(request.path("stream").asBoolean());
         assertEquals("local-model", request.path("model").asText());
         assertEquals("你好", request.at("/messages/0/content").asText());
+    }
+    @Test void disablesModelThinkingByDefaultAndCanBeTurnedOff() throws Exception {
+        var mapper = new ObjectMapper();
+        var requests = new CopyOnWriteArrayList<String>();
+        server.createContext("/v1/chat/completions", e -> {
+            requests.add(new String(e.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String content = mapper.writeValueAsString(Map.of("items", List.of(
+                    Map.of("index", 0, "role", "DOCTOR", "confidence", 90))));
+            byte[] output = mapper.writeValueAsBytes(Map.of("choices", List.of(Map.of("message", Map.of("content", content)))));
+            e.getResponseHeaders().set("Content-Type", "application/json");
+            e.sendResponseHeaders(200, output.length);
+            e.getResponseBody().write(output);
+            e.close();
+        });
+        var turns = List.<Map<String, Object>>of(Map.of("index", 0, "speaker_id", 0, "text", "哪里不舒服"));
+
+        new LocalLlmRoleClient(mapper, true, endpoint, "", "local-model", 70, 40, true, 5000, 120000, 2, 200)
+                .assignRoles(turns);
+        assertFalse(mapper.readTree(requests.get(0)).at("/chat_template_kwargs/enable_thinking").asBoolean(true),
+                "默认应显式关闭本地模型思考");
+
+        new LocalLlmRoleClient(mapper, true, endpoint, "", "local-model", 70, 40, false, 5000, 120000, 2, 200)
+                .assignRoles(turns);
+        assertTrue(mapper.readTree(requests.get(1)).path("chat_template_kwargs").isMissingNode(),
+                "关闭该配置后不应再附带 chat_template_kwargs");
+    }
+    @Test void toleratesThinkingLeakedIntoContentWhenServerIgnoresReasoningFormat() throws Exception {
+        var mapper = new ObjectMapper();
+        server.createContext("/v1/chat/completions", e -> {
+            e.getRequestBody().readAllBytes();
+            String content = "<think>先看 speaker_id 再逐句判断……</think>\n"
+                    + "{\"items\":[{\"index\":0,\"role\":\"DOCTOR\",\"confidence\":93}]}";
+            byte[] output = mapper.writeValueAsBytes(Map.of("choices", List.of(Map.of("message", Map.of("content", content)))));
+            e.getResponseHeaders().set("Content-Type", "application/json");
+            e.sendResponseHeaders(200, output.length);
+            e.getResponseBody().write(output);
+            e.close();
+        });
+        var result = new LocalLlmRoleClient(mapper, endpoint, "", "local-model", 70, 40)
+                .assignRoles(List.of(Map.of("index", 0, "speaker_id", 0, "text", "哪里不舒服")));
+        assertEquals(new DashScopeRoleClient.RoleAssignment("DOCTOR", 93, "LLM"), result.get(0));
+    }
+    @Test void truncatedThinkingBlockIsRejectedInsteadOfBeingGuessed() {
+        var mapper = new ObjectMapper();
+        server.createContext("/v1/chat/completions", e -> {
+            e.getRequestBody().readAllBytes();
+            String content = "<think>还没想完就被截断了";
+            byte[] output = mapper.writeValueAsBytes(Map.of("choices", List.of(Map.of("message", Map.of("content", content)))));
+            e.getResponseHeaders().set("Content-Type", "application/json");
+            e.sendResponseHeaders(200, output.length);
+            e.getResponseBody().write(output);
+            e.close();
+        });
+        var result = new LocalLlmRoleClient(mapper, endpoint, "", "local-model", 70, 40)
+                .assignRoles(List.of(Map.of("index", 0, "speaker_id", 0, "text", "嗯")));
+        assertEquals(Map.of(0, new DashScopeRoleClient.RoleAssignment("OTHER", null, "FALLBACK")), result);
     }
 }

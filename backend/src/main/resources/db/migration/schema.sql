@@ -473,6 +473,7 @@ ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS locked_at timestamp(0) without time 
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS lease_token uuid;
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS recording_id uuid REFERENCES recording(id);
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS provider_task_id varchar(256);
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS role_provider_route varchar(32);
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response jsonb;
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_raw_response_hash varchar(128);
 ALTER TABLE recording ADD COLUMN IF NOT EXISTS asr_segment_count int;
@@ -913,6 +914,7 @@ COMMENT ON COLUMN ai_job.idempotency_key IS '客户端请求与业务对象组�
 COMMENT ON COLUMN ai_job.status IS '任务状态：PENDING、RUNNING、SUCCEEDED、FAILED 等';
 COMMENT ON COLUMN ai_job.attempt_count IS '任务已尝试执行次数';
 COMMENT ON COLUMN ai_job.provider_route IS '实际使用的 AI/导出服务路由';
+COMMENT ON COLUMN ai_job.role_provider_route IS '本次转写完成后自动角色判断使用的 LLM 路由：DASHSCOPE 或 LOCAL；为空表示跟随全局默认';
 COMMENT ON COLUMN ai_job.result_ref IS '任务结果引用 ID';
 COMMENT ON COLUMN ai_job.last_error IS '最近一次失败错误信息';
 COMMENT ON COLUMN ai_job.started_at IS '任务开始执行时间';

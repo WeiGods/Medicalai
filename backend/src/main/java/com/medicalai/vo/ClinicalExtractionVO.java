@@ -19,11 +19,12 @@ public record ClinicalExtractionVO(
         @JsonProperty("provider_route") String providerRoute,
         @JsonProperty("source_route") String sourceRoute,
         @JsonProperty("available_routes") List<String> availableRoutes,
-        @JsonProperty("route_selection_required") boolean routeSelectionRequired) {
+        @JsonProperty("route_selection_required") boolean routeSelectionRequired,
+        @JsonProperty("default_route") String defaultRoute) {
     public ClinicalExtractionVO(String extractionId, int versionNo, String status, String snapshotId,
                                 String snapshotHash, Map<String, ClinicalFactVO> fields,
                                 List<String> qualityIssues, Instant generatedAt, Instant confirmedAt) {
         this(extractionId, versionNo, status, snapshotId, snapshotHash, fields, qualityIssues, generatedAt,
-                confirmedAt, null, "UNKNOWN", List.of(), false);
+                confirmedAt, null, "UNKNOWN", List.of(), false, null);
     }
 }

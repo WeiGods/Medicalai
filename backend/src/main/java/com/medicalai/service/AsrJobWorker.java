@@ -87,8 +87,10 @@ public class AsrJobWorker {
                     checkLease(lost);
                     // 原文预览先提交，音频页可在角色 LLM 仍执行时读取；正式结果流程保持不变。
                     store.savePreview(job, token, recording.id(), result.segments());
-                    if (!roleRouter.isConfigured()) {
-                        throw new IllegalStateException("公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理");
+                    // 角色识别路由来自任务本身（医生入队时选定），任务上没记就跟随全局默认。
+                    LlmRoute roleRoute = roleRoute(job);
+                    if (!roleRouter.isAvailable(roleRoute)) {
+                        throw new IllegalStateException(roleUnavailableMessage(roleRoute));
                     }
                     // 步骤 8 至 9：角色 LLM 判断后，事务性写入原始 ASR 回包、逐句数据和转写快照。
                     store.complete(job, token, recording.id(), roleAssignedTurns(job, result.segments()), result.rawResponse());
@@ -160,11 +162,11 @@ public class AsrJobWorker {
             turn.put("text", result.get(i).text());
             return turn;
         }).toList();
-        // 步骤 8：角色识别与 ASR 路由汇合；本地或公网 ASR 的文本都统一交给公网 LLM 判断。
-        LlmRoute route = roleRouter.roleRoute();
+        // 步骤 8：角色识别与 ASR 路由汇合；角色识别走公网还是内网由任务上记录的路由决定。
+        LlmRoute route = roleRoute(job);
         long roleStartedAt = System.nanoTime();
-        // 角色判断必须与产生文本的 ASR 路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
-        var assignedRoles = roleRouter.assignRoles(input);
+        // 角色判断必须与医生选择的路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
+        var assignedRoles = roleRouter.assignRoles(route, input);
         Map<Integer, DashScopeRoleClient.RoleAssignment> roles = assignedRoles == null
                 ? Map.of() : assignedRoles;
         List<RecordingMapper.Turn> turns = IntStream.range(0,result.size()).mapToObj(i -> {
@@ -180,6 +182,21 @@ public class AsrJobWorker {
     }
 
     private long elapsedMs(long startedAt) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt); }
+
+    /** 本次任务要用的角色识别路由：任务上没记录就跟随全局默认（{@code LLM_ROLE_ROUTE}）。 */
+    private LlmRoute roleRoute(RecordingMapper.AsrJob job) {
+        String recorded = job.roleProviderRoute();
+        if (recorded == null || recorded.isBlank()) return roleRouter.roleRoute();
+        LlmRoute route = LlmRoute.fromRequested(recorded);
+        return route.isCallable() ? route : roleRouter.roleRoute();
+    }
+
+    /** 路由不可用时给出可执行的提示，而不是让医生猜"为什么角色全是 OTHER"。 */
+    private static String roleUnavailableMessage(LlmRoute route) {
+        return route == LlmRoute.LOCAL
+                ? "内网角色识别未启用（LOCAL_LLM_ENABLED=true 时启用），本地 ASR 结果无法继续处理"
+                : "公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理";
+    }
 
     private void checkLease(AtomicBoolean lost) { if (lost.get()) throw new AsrJobStore.LeaseLostException(); }
 }

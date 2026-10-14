@@ -66,12 +66,11 @@ public class RecordingController {
     public AsrJobVO transcribe(@PathVariable("visitId") UUID visitId,
                              @RequestBody(required = false) TranscribeRequest request,
                              @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        String provider = request == null ? "DASHSCOPE" : request.provider();
-        if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
-            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
-        }
+        TranscribeRequest body = request == null ? new TranscribeRequest(null, null) : request;
+        String provider = asrProvider(body.provider());
+        String roleProvider = roleProvider(body.roleProvider());
         requireWrite(current);
-        return workflow.transcribe(visitId, current.doctor().id(), provider);
+        return workflow.transcribe(visitId, current.doctor().id(), provider, roleProvider);
     }
 
     @PostMapping("/visits/{visitId}/recordings/{recordingId}/retranscribe")
@@ -79,15 +78,46 @@ public class RecordingController {
                                  @PathVariable("recordingId") UUID recordingId,
                                  @RequestBody(required = false) TranscribeRequest request,
                                  @RequestAttribute("currentDoctor") AuthenticatedDoctor current) {
-        String provider = request == null ? "DASHSCOPE" : request.provider();
-        if (!java.util.Set.of("DASHSCOPE", "LOCAL").contains(provider == null ? "" : provider)) {
-            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
-        }
+        TranscribeRequest body = request == null ? new TranscribeRequest(null, null) : request;
+        String provider = asrProvider(body.provider());
+        String roleProvider = roleProvider(body.roleProvider());
         requireWrite(current);
-        return workflow.retranscribeRecording(visitId, recordingId, current.doctor().id(), provider);
+        return workflow.retranscribeRecording(visitId, recordingId, current.doctor().id(), provider, roleProvider);
     }
 
-    public record TranscribeRequest(String provider) {}
+    /**
+     * 转写请求：{@code provider} 选 ASR 路由，{@code role_provider} 选转写完成后自动角色判断
+     * 使用的 LLM 路由；{@code role_provider} 为空表示跟随后端 {@code LLM_ROLE_ROUTE} 的默认值。
+     */
+    public record TranscribeRequest(String provider, String roleProvider) {
+        /** 兼容旧调用方：只指定 ASR 路由。 */
+        public TranscribeRequest(String provider) {
+            this(provider, null);
+        }
+    }
+
+    private static final java.util.Set<String> PROVIDERS = java.util.Set.of("DASHSCOPE", "LOCAL");
+
+    private static String asrProvider(String provider) {
+        String value = provider == null ? "DASHSCOPE" : provider;
+        if (!PROVIDERS.contains(value)) {
+            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ASR_PROVIDER", "请选择公网或本地 ASR");
+        }
+        return value;
+    }
+
+    /** 路由可用性由服务层按"能力驱动"校验；这里只挡明显非法的取值。 */
+    private static String roleProvider(String roleProvider) {
+        if (roleProvider == null || roleProvider.isBlank()) {
+            return null;
+        }
+        String value = roleProvider.strip().toUpperCase(java.util.Locale.ROOT);
+        if (!PROVIDERS.contains(value)) {
+            throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "INVALID_ROLE_PROVIDER",
+                    "请选择公网或内网角色识别");
+        }
+        return value;
+    }
 
     @GetMapping("/visits/{visitId}/recordings/transcribe/{jobId}")
     public AsrJobVO transcriptionStatus(@PathVariable("visitId") UUID visitId, @PathVariable("jobId") UUID jobId,

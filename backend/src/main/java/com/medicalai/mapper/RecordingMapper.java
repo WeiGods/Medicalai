@@ -149,21 +149,26 @@ public class RecordingMapper {
     }
 
     public UUID createAsrJob(UUID visitId, String provider) {
-        UUID id = UUID.randomUUID();
-        jdbc.update("""
-                INSERT INTO ai_job(id,job_type,visit_id,idempotency_key,status,provider_route)
-                VALUES (?,?,?,?, 'PENDING',?)
-                """, id, "ASR_TRANSCRIBE", visitId, "asr:" + visitId + ":" + id, provider);
-        return id;
+        return createAsrJob(visitId, provider, null, null);
     }
 
     /** 创建任务时可绑定指定录音；补充重转写不能被其它待转写录音抢占。 */
     public UUID createAsrJob(UUID visitId, String provider, UUID recordingId) {
+        return createAsrJob(visitId, provider, recordingId, null);
+    }
+
+    /**
+     * 创建 ASR 任务，并在入队时就固定本次要使用的角色识别路由。
+     *
+     * <p>角色识别路由随任务落库，保证定时工作线程在转写完成后按医生当时选择的路由判断角色，
+     * 而不是读进程启动时的全局配置；{@code null} 表示跟随全局默认。
+     */
+    public UUID createAsrJob(UUID visitId, String provider, UUID recordingId, String roleProviderRoute) {
         UUID id = UUID.randomUUID();
         jdbc.update("""
-                INSERT INTO ai_job(id,job_type,visit_id,recording_id,idempotency_key,status,provider_route)
-                VALUES (?,?,?,?,?,'PENDING',?)
-                """, id, "ASR_TRANSCRIBE", visitId, recordingId, "asr:" + visitId + ":" + id, provider);
+                INSERT INTO ai_job(id,job_type,visit_id,recording_id,idempotency_key,status,provider_route,role_provider_route)
+                VALUES (?,?,?,?,?,'PENDING',?,?)
+                """, id, "ASR_TRANSCRIBE", visitId, recordingId, "asr:" + visitId + ":" + id, provider, roleProviderRoute);
         return id;
     }
 
@@ -189,12 +194,13 @@ public class RecordingMapper {
                 SET locked_at=medicalai_local_clock(), lease_token=?
                 FROM candidate c
                 WHERE j.id=c.id
-                RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at,j.provider_route
+                RETURNING j.id,j.visit_id,j.recording_id,j.provider_task_id,j.status,j.attempt_count,j.last_error,j.started_at,j.provider_route,j.role_provider_route
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
                         DatabaseDateTime.getInstant(rs, "started_at"),
-                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), provider, leaseToken);
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route"),
+                        rs.getString("role_provider_route")), provider, leaseToken);
         return jobs.stream().findFirst();
     }
 
@@ -279,31 +285,33 @@ public class RecordingMapper {
 
     public Optional<AsrJob> asrJob(UUID jobId, UUID visitId) {
         return jdbc.query("""
-                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route,role_provider_route
                 FROM ai_job WHERE id=? AND visit_id=? AND job_type='ASR_TRANSCRIBE'
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
                         DatabaseDateTime.getInstant(rs, "started_at"),
-                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), jobId, visitId).stream().findFirst();
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route"),
+                        rs.getString("role_provider_route")), jobId, visitId).stream().findFirst();
     }
 
     public Optional<AsrJob> latestAsrJob(UUID visitId) {
         return jdbc.query("""
-                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route,role_provider_route
                 FROM ai_job WHERE visit_id=? AND job_type='ASR_TRANSCRIBE'
                 ORDER BY created_at DESC LIMIT 1
                 """, (rs, n) -> new AsrJob(rs.getObject("id", UUID.class), rs.getObject("visit_id", UUID.class),
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
                         DatabaseDateTime.getInstant(rs, "started_at"),
-                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId).stream().findFirst();
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route"),
+                        rs.getString("role_provider_route")), visitId).stream().findFirst();
     }
 
     /** 返回接诊中最近创建的 ASR 任务；用于页面恢复 PENDING/RUNNING 任务跟踪。 */
     public Optional<AsrJob> activeAsrJob(UUID visitId) {
         return jdbc.query("""
-                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route
+                SELECT id,visit_id,recording_id,provider_task_id,status,attempt_count,last_error,started_at,provider_route,role_provider_route
                 FROM ai_job
                 WHERE visit_id=? AND job_type='ASR_TRANSCRIBE' AND status IN ('PENDING','RUNNING')
                 ORDER BY created_at DESC LIMIT 1
@@ -311,7 +319,8 @@ public class RecordingMapper {
                         rs.getObject("recording_id", UUID.class), rs.getString("provider_task_id"),
                         rs.getString("status"), rs.getInt("attempt_count"), rs.getString("last_error"),
                         DatabaseDateTime.getInstant(rs, "started_at"),
-                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route")), visitId)
+                        rs.getString("provider_route") == null ? "DASHSCOPE" : rs.getString("provider_route"),
+                        rs.getString("role_provider_route")), visitId)
                 .stream().findFirst();
     }
 
@@ -575,5 +584,13 @@ public class RecordingMapper {
     }
     public record TurnState(UUID snapshotId, String transcript, boolean edited, Instant updatedAt) {}
     public record AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
-                         int attemptCount, String lastError, Instant startedAt, String providerRoute) {}
+                         int attemptCount, String lastError, Instant startedAt, String providerRoute,
+                         String roleProviderRoute) {
+        /** 兼容旧调用方：未记录角色识别路由时跟随全局默认（LLM_ROLE_ROUTE）。 */
+        public AsrJob(UUID id, UUID visitId, UUID recordingId, String providerTaskId, String status,
+                      int attemptCount, String lastError, Instant startedAt, String providerRoute) {
+            this(id, visitId, recordingId, providerTaskId, status, attemptCount, lastError, startedAt,
+                    providerRoute, null);
+        }
+    }
 }

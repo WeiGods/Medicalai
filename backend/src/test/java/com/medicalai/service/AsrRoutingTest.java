@@ -36,7 +36,7 @@ class AsrRoutingTest {
         var response = workflow.transcribe(visitId,doctorId,"LOCAL");
         assertEquals(jobId,response.jobId());
         assertEquals("DASHSCOPE",response.providerRoute());
-        verify(recordings,never()).createAsrJob(any(),any());
+        verify(recordings,never()).createAsrJob(any(),any(),any(),any());
         verify(recordings,never()).requeueRetryableRecordings(any());
     }
     @Test void activeJobQueryRestoresQueuedTaskState() {
@@ -58,17 +58,18 @@ class AsrRoutingTest {
         if ("LOCAL".equals(provider)) org.springframework.test.util.ReflectionTestUtils.setField(workflow,"dashscopeApiKey","");
         when(recordings.latestAsrJob(visitId)).thenReturn(Optional.of(job("FAILED",provider.equals("LOCAL") ? "DASHSCOPE" : "LOCAL")));
         when(recordings.list(visitId)).thenReturn(List.of(new Recording(UUID.randomUUID(),visitId,"R1","UPLOAD","key","a.wav","audio/wav",1L,1L,"UPLOADED",null,Instant.now())));
-        when(recordings.createAsrJob(visitId,queueProvider)).thenReturn(jobId);
+        when(recordings.createAsrJob(visitId,queueProvider,null,"DASHSCOPE")).thenReturn(jobId);
         when(recordings.asrJob(jobId,visitId)).thenReturn(Optional.of(job("PENDING",queueProvider)));
         assertEquals(provider,workflow.transcribe(visitId,doctorId,provider).providerRoute());
         verify(recordings).requeueRetryableRecordings(visitId);
-        verify(recordings).createAsrJob(visitId,queueProvider);
+        // 未显式指定角色识别路由时，按 LLM_ROLE_ROUTE 的默认值（此处为 DASHSCOPE）随任务落库
+        verify(recordings).createAsrJob(visitId,queueProvider,null,"DASHSCOPE");
     }
     @Test void missingPublicCredentialsRejectedBeforeCreatingTask() {
         org.springframework.test.util.ReflectionTestUtils.setField(workflow,"dashscopeApiKey","");
         assertEquals("DASHSCOPE_NOT_CONFIGURED", assertThrows(BusinessException.class,
                 () -> workflow.transcribe(visitId,doctorId,"DASHSCOPE")).code());
-        verify(recordings,never()).createAsrJob(any(),any());
+        verify(recordings,never()).createAsrJob(any(),any(),any(),any());
     }
     @Test void invalidProviderRejectedBeforeWorkflow() {
         var service = mock(ClinicalWorkflowService.class);

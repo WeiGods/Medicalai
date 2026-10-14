@@ -50,7 +50,6 @@ public class ClinicalExtractionService {
     private final RecordingMapper recordings;
     private final MedicalRecordMapper records;
     private final ClinicalExtractionRouter clients;
-    private final LlmRouteResolver routes;
     private final ObjectMapper objectMapper;
     private final int roleReviewThreshold;
     private final long maxTurnDurationMs;
@@ -59,7 +58,7 @@ public class ClinicalExtractionService {
     @org.springframework.beans.factory.annotation.Autowired
     public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
                                      MedicalRecordMapper records, ClinicalExtractionRouter clients,
-                                     LlmRouteResolver routes, ObjectMapper objectMapper,
+                                     ObjectMapper objectMapper,
                                      @Value("${medicalai.dashscope.role-review-threshold:70}") int roleReviewThreshold,
                                      @Value("${medicalai.dashscope.extraction-max-turn-duration-ms:120000}") long maxTurnDurationMs,
                                      @Value("${medicalai.dashscope.extraction-max-turn-characters:600}") int maxTurnCharacters) {
@@ -67,7 +66,6 @@ public class ClinicalExtractionService {
         this.recordings = recordings;
         this.records = records;
         this.clients = clients;
-        this.routes = routes;
         this.objectMapper = objectMapper;
         this.roleReviewThreshold = roleReviewThreshold;
         this.maxTurnDurationMs = Math.max(1, maxTurnDurationMs);
@@ -77,15 +75,15 @@ public class ClinicalExtractionService {
     /** 兼容旧测试及嵌入式组装代码，使用默认提取边界。 */
     public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
                                      MedicalRecordMapper records, ClinicalExtractionRouter clients,
-                                     LlmRouteResolver routes, ObjectMapper objectMapper,
+                                     ObjectMapper objectMapper,
                                      int roleReviewThreshold) {
-        this(extractions, recordings, records, clients, routes, objectMapper,
+        this(extractions, recordings, records, clients, objectMapper,
                 roleReviewThreshold, 120_000L, 600);
     }
 
     @Transactional(readOnly = true)
     public ClinicalExtractionVO current(UUID visitId, DialogueSnapshot snapshot) {
-        LlmRouting routing = routes.analysisRouting(snapshot);
+        LlmRouting routing = clients.routing();
         return extractions.current(visitId)
                 .map(version -> toVO(version, snapshot, routing))
                 .orElseGet(() -> empty(snapshot, routing));
@@ -93,13 +91,14 @@ public class ClinicalExtractionService {
 
     @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot) {
-        return generate(visitId, doctorId, snapshot, routes.resolveAnalysis(snapshot, null));
+        return generate(visitId, doctorId, snapshot, (String) null);
     }
 
     @Transactional
-    public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, LlmRoute route) {
+    public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, String requestedProvider) {
         long startedAt = System.nanoTime();
-        LlmRouting routing = routes.analysisRouting(snapshot);
+        LlmRoute route = clients.resolveRoute(requestedProvider);
+        LlmRouting routing = clients.routing();
         LOG.info("信息提取开始: visitId={}, snapshotHash={}, route={}", visitId, shortHash(snapshot.snapshotHash()), route);
         List<SnapshotTurn> turns;
         try {
@@ -166,7 +165,7 @@ public class ClinicalExtractionService {
         }
         ClinicalExtractionMapper.Version confirmed = extractions.confirm(visitId, snapshot.id(), snapshot.snapshotHash(), doctorId)
                 .orElseThrow(() -> BusinessException.conflict("CLINICAL_EXTRACTION_NOT_CONFIRMABLE", "当前提取结果不可确认，请重新生成"));
-        return toVO(confirmed, snapshot, routes.analysisRouting(snapshot));
+        return toVO(confirmed, snapshot, clients.routing());
     }
 
     /** 病历生成前的硬门禁：快照哈希必须完全一致，不能复用旧提取。 */
@@ -331,7 +330,8 @@ public class ClinicalExtractionService {
             return new ClinicalExtractionVO(version.extractionId().toString(), version.versionNo(), "STALE",
                     currentSnapshot.id().toString(), currentSnapshot.snapshotHash(), Map.of(),
                     List.of("当前转写快照已更新，请重新生成信息提取结果。"), version.createdAt(), null,
-                    version.providerRoute(), routing.sourceRoute().name(), routeNames(routing), routing.selectionRequired());
+                    version.providerRoute(), routing.sourceRoute().name(), routeNames(routing), routing.selectionRequired(),
+                    routing.sourceRoute().name());
         }
         Map<String, ClinicalFactVO> fields = fields(version.contentJson());
         List<String> qualityIssues = issues(version.qualityIssuesJson());
@@ -341,12 +341,13 @@ public class ClinicalExtractionService {
                     currentSnapshot.id().toString(), currentSnapshot.snapshotHash(), fields,
                     appendIssue(qualityIssues, "当前提取缺少带原文证据的患者主诉，不能整体确认，请重新生成。"),
                     version.createdAt(), null, version.providerRoute(), routing.sourceRoute().name(), routeNames(routing),
-                    routing.selectionRequired());
+                    routing.selectionRequired(), routing.sourceRoute().name());
         }
         return new ClinicalExtractionVO(version.extractionId().toString(), version.versionNo(), version.status(),
                 currentSnapshot.id().toString(), currentSnapshot.snapshotHash(), fields,
                 qualityIssues, version.createdAt(), version.confirmedAt(), version.providerRoute(),
-                routing.sourceRoute().name(), routeNames(routing), routing.selectionRequired());
+                routing.sourceRoute().name(), routeNames(routing), routing.selectionRequired(),
+                routing.sourceRoute().name());
     }
 
     private boolean hasChiefComplaint(Map<String, ClinicalFactVO> fields) {
@@ -364,7 +365,7 @@ public class ClinicalExtractionService {
     private ClinicalExtractionVO empty(DialogueSnapshot snapshot, LlmRouting routing) {
         return new ClinicalExtractionVO(null, 0, "PENDING", snapshot.id().toString(), snapshot.snapshotHash(),
                 Map.of(), List.of(), null, null, null, routing.sourceRoute().name(), routeNames(routing),
-                routing.selectionRequired());
+                routing.selectionRequired(), routing.sourceRoute().name());
     }
 
     private List<String> routeNames(LlmRouting routing) {

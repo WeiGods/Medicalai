@@ -44,3 +44,5 @@ push-medicalai.*
 /asr_validation/*.py
 !/asr_validation/validate_speaker_turns.py
 /asr_validation/*_round*/
+.graphflow-cache/index-state.sqlite.json
+graphflow-out/graphflow-graph.sqlite

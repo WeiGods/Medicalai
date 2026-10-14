@@ -53,4 +53,34 @@ describe('api response handling', () => {
 
     await expect(api.deleteRecording('visit-1', 'recording-1')).rejects.toThrow('录音不存在')
   })
+
+  it('sends the role-recognition route as role_provider with the ASR provider', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ job_id: 'job-1' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.transcribe('visit-1', 'LOCAL', 'DASHSCOPE')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/visits/visit-1/recordings/transcribe', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ provider: 'LOCAL', role_provider: 'DASHSCOPE' })
+    }))
+  })
+
+  it('sends role_provider as null when the role route follows the backend default', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ job_id: 'job-2' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.retranscribeRecording('visit-1', 'recording-1', 'DASHSCOPE', null)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/visits/visit-1/recordings/recording-1/retranscribe', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ provider: 'DASHSCOPE', role_provider: null })
+    }))
+  })
 })

@@ -92,10 +92,16 @@ export const api = {
     body.append('duration_ms', String(Math.round(durationMs)))
     return request<Recording>(`/api/v1/visits/${visitId}/recordings`, { method: 'POST', body }, false)
   },
-  transcribe: (visitId: string, provider: AsrProvider) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe`, { method: 'POST', body: JSON.stringify({ provider }) }),
-  retranscribeRecording: (visitId: string, recordingId: string, provider: AsrProvider) => request<AsrJob>(
+  /**
+   * provider 是 ASR 路由；roleProvider 是角色识别 LLM 路由，null 表示跟随后端默认配置。
+   */
+  transcribe: (visitId: string, provider: AsrProvider, roleProvider?: LlmProvider | null) => request<AsrJob>(
+    `/api/v1/visits/${visitId}/recordings/transcribe`, {
+      method: 'POST', body: JSON.stringify({ provider, role_provider: roleProvider ?? null })
+    }),
+  retranscribeRecording: (visitId: string, recordingId: string, provider: AsrProvider, roleProvider?: LlmProvider | null) => request<AsrJob>(
     `/api/v1/visits/${visitId}/recordings/${recordingId}/retranscribe`, {
-      method: 'POST', body: JSON.stringify({ provider })
+      method: 'POST', body: JSON.stringify({ provider, role_provider: roleProvider ?? null })
     }),
   transcribeStatus: (visitId: string, jobId: string) => request<AsrJob>(`/api/v1/visits/${visitId}/recordings/transcribe/${jobId}`),
   activeTranscription: (visitId: string) => request<AsrJob | null>(`/api/v1/visits/${visitId}/recordings/transcribe/active`),
@@ -110,12 +116,12 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ role })
     }),
-  reclassifyTranscriptRoles: (visitId: string, provider?: LlmProvider) => request<Transcript>(
+  reclassifyTranscriptRoles: (visitId: string, provider?: LlmProvider | null) => request<Transcript>(
     `/api/v1/visits/${visitId}/transcript/roles/reclassify`, {
       method: 'POST', body: provider ? JSON.stringify({ provider }) : undefined
     }),
   clinicalExtraction: (visitId: string) => request<ClinicalExtraction>(`/api/v1/visits/${visitId}/clinical-extraction`),
-  generateClinicalExtraction: (visitId: string, provider?: LlmProvider) => request<ClinicalExtraction>(
+  generateClinicalExtraction: (visitId: string, provider?: LlmProvider | null) => request<ClinicalExtraction>(
     `/api/v1/visits/${visitId}/clinical-extraction/generate`, {
       method: 'POST', body: provider ? JSON.stringify({ provider }) : undefined
     }),
