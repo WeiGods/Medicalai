@@ -74,35 +74,29 @@ public class AsrJobWorker {
             }
         }, 20, 20, TimeUnit.SECONDS);
         try {
-            LlmRoute source = LlmRoute.fromAsrRoute(job.providerRoute());
-            if (!source.isCallable() || source != LlmRoute.fromAsrRoute(provider)) {
-                throw new IllegalStateException("ASR 任务路由不匹配");
-            }
-            store.validateForCall(job, token);
+            if (!provider.equals(job.providerRoute())) throw new IllegalStateException("ASR 任务路由不匹配");
             if ("PENDING".equals(job.status())) {
                 // 步骤 5（续）：将任务和一条录音切换为处理中，并获得本次录音的受控引用。
                 var recording = store.begin(job, token);
                 if ("LOCAL".equals(provider)) {
                     // 步骤 6（本地）：同步调用本地 ASR，获得原始文本、时间戳和 speaker_id。
                     long asrStartedAt = System.nanoTime();
-                    var audio = storage.load(recording.objectKey());
-                    store.validateForCall(job, token);
-                    var result = local.transcribeDetailed(audio, recording.fileName(), recording.mimeType());
+                    var result = local.transcribeDetailed(storage.load(recording.objectKey()), recording.fileName(), recording.mimeType());
                     LOG.info("本地ASR调用成功：任务ID={}，句段数={}，耗时毫秒={}",
                             job.id(), result.segments().size(), elapsedMs(asrStartedAt));
                     checkLease(lost);
                     // 原文预览先提交，音频页可在角色 LLM 仍执行时读取；正式结果流程保持不变。
                     store.savePreview(job, token, recording.id(), result.segments());
-                    if (!roleRouter.isConfigured(LlmRoute.LOCAL)) {
-                        LOG.warn("本地角色识别客户端未配置，继续以 FALLBACK 安全降级，不切换公网");
+                    // 角色识别路由来自任务本身（医生入队时选定），任务上没记就跟随全局默认。
+                    LlmRoute roleRoute = roleRoute(job);
+                    if (!roleRouter.isAvailable(roleRoute)) {
+                        throw new IllegalStateException(roleUnavailableMessage(roleRoute));
                     }
                     // 步骤 8 至 9：角色 LLM 判断后，事务性写入原始 ASR 回包、逐句数据和转写快照。
-                    store.validateForCall(job, token);
                     store.complete(job, token, recording.id(), roleAssignedTurns(job, result.segments()), result.rawResponse());
                 } else {
                     // 步骤 6（公网）：只提交一次 DashScope 异步任务；后续轮询会取得最终结果。
                     long submitStartedAt = System.nanoTime();
-                    store.validateForCall(job, token);
                     String taskId = cloud.submit(storage.presignedUrl(recording.objectKey()));
                     LOG.info("公网ASR任务提交成功：任务ID={}，耗时毫秒={}", job.id(), elapsedMs(submitStartedAt));
                     checkLease(lost);
@@ -138,7 +132,6 @@ public class AsrJobWorker {
         if (job.providerTaskId()==null || job.providerTaskId().isBlank() || job.recordingId()==null)
             throw new IllegalStateException("公网 ASR 提交已中断，缺少任务编号，请手动重试");
         // 步骤 7：轻量查询公网任务状态。处理中只释放租约，避免持续占用工作线程。
-        store.validateForCall(job, token);
         var task=cloud.query(job.providerTaskId());
         checkLease(lost);
         if (Set.of("PENDING","RUNNING").contains(task.status())) {
@@ -148,14 +141,12 @@ public class AsrJobWorker {
         if (!"SUCCEEDED".equals(task.status())) throw new IllegalStateException("公网 ASR 任务状态："+task.status());
         // 步骤 7（续）：仅在任务成功后下载并解析最终 ASR 结果，轮询过程不打印句段内容。
         long resultStartedAt = System.nanoTime();
-        store.validateForCall(job, token);
         var result=cloud.resultDetailed(task);
         LOG.info("公网ASR结果已获取：任务ID={}，任务状态={}，句段数={}，耗时毫秒={}",
                 job.id(), task.status(), result.segments().size(), elapsedMs(resultStartedAt));
         checkLease(lost);
         store.savePreview(job, token, job.recordingId(), result.segments());
         // 步骤 8 至 9：LLM 逐句分类后，以原子事务写入结果。
-        store.validateForCall(job, token);
         store.complete(job, token, job.recordingId(), roleAssignedTurns(job, result.segments()), result.rawResponse());
     }
 
@@ -171,10 +162,10 @@ public class AsrJobWorker {
             turn.put("text", result.get(i).text());
             return turn;
         }).toList();
-        // 步骤 8：角色识别严格跟随产生文本的 ASR 路由，不允许跨公网/本地发送。
-        LlmRoute route = LlmRoute.fromAsrRoute(job.providerRoute());
+        // 步骤 8：角色识别与 ASR 路由汇合；角色识别走公网还是内网由任务上记录的路由决定。
+        LlmRoute route = roleRoute(job);
         long roleStartedAt = System.nanoTime();
-        // 角色判断必须与产生文本的 ASR 路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
+        // 角色判断必须与医生选择的路由一致，避免把内网录音内容发送到公网，或反向依赖本地服务。
         var assignedRoles = roleRouter.assignRoles(route, input);
         Map<Integer, DashScopeRoleClient.RoleAssignment> roles = assignedRoles == null
                 ? Map.of() : assignedRoles;
@@ -191,6 +182,21 @@ public class AsrJobWorker {
     }
 
     private long elapsedMs(long startedAt) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt); }
+
+    /** 本次任务要用的角色识别路由：任务上没记录就跟随全局默认（{@code LLM_ROLE_ROUTE}）。 */
+    private LlmRoute roleRoute(RecordingMapper.AsrJob job) {
+        String recorded = job.roleProviderRoute();
+        if (recorded == null || recorded.isBlank()) return roleRouter.roleRoute();
+        LlmRoute route = LlmRoute.fromRequested(recorded);
+        return route.isCallable() ? route : roleRouter.roleRoute();
+    }
+
+    /** 路由不可用时给出可执行的提示，而不是让医生猜"为什么角色全是 OTHER"。 */
+    private static String roleUnavailableMessage(LlmRoute route) {
+        return route == LlmRoute.LOCAL
+                ? "内网角色识别未启用（LOCAL_LLM_ENABLED=true 时启用），本地 ASR 结果无法继续处理"
+                : "公网角色识别未配置 DASHSCOPE_API_KEY，本地 ASR 结果无法继续处理";
+    }
 
     private void checkLease(AtomicBoolean lost) { if (lost.get()) throw new AsrJobStore.LeaseLostException(); }
 }

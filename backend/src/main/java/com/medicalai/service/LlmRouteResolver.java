@@ -27,22 +27,10 @@ public class LlmRouteResolver {
         return routing(snapshot.id());
     }
 
-    public LlmRouting analysisRouting(DialogueSnapshot snapshot) {
-        return routing(snapshot);
-    }
-
     public LlmRouting routing(UUID snapshotId) {
         Set<LlmRoute> routes = new LinkedHashSet<>();
-        List<String> sources = recordings.snapshotAsrRoutes(snapshotId);
-        boolean missingRoute = sources.stream().anyMatch(value -> value == null || value.isBlank());
-        for (String value : sources) {
-            if (value != null && !value.isBlank()) routes.add(LlmRoute.fromAsrRoute(value));
-        }
-        // 老版本公网录音可能没有 asr_route；只有无本地/未知来源的历史数据可按公网兼容。
-        if (missingRoute && (routes.isEmpty() || routes.equals(Set.of(LlmRoute.DASHSCOPE)))) {
-            routes.add(LlmRoute.DASHSCOPE);
-        } else if (missingRoute) {
-            routes.add(LlmRoute.UNKNOWN);
+        for (String value : recordings.snapshotAsrRoutes(snapshotId)) {
+            routes.add(LlmRoute.fromAsrRoute(value));
         }
         if (routes.isEmpty() || routes.contains(LlmRoute.UNKNOWN)) {
             return new LlmRouting(LlmRoute.UNKNOWN, List.of(), false);
@@ -51,18 +39,22 @@ public class LlmRouteResolver {
             LlmRoute route = routes.iterator().next();
             return new LlmRouting(route, List.of(route), false);
         }
-        return new LlmRouting(LlmRoute.MIXED, List.of(), false);
+        return new LlmRouting(LlmRoute.MIXED, List.of(LlmRoute.DASHSCOPE, LlmRoute.LOCAL), true);
     }
 
-    /** 单一路由跟随快照；混合或未知来源禁止把整份快照交给任意一路模型。 */
+    /** 只有混合来源允许医生显式选择；单一路由不能被请求参数覆盖。 */
     public LlmRoute resolve(DialogueSnapshot snapshot, String requestedProvider) {
         LlmRouting routing = routing(snapshot);
         if (routing.sourceRoute() == LlmRoute.UNKNOWN) {
-            throw BusinessException.conflict("LLM_ROUTE_UNKNOWN", "当前快照来源无法确认，请统一当前接诊的 ASR 路由并重新转写");
+            throw BusinessException.conflict("LLM_ROUTE_UNKNOWN", "当前快照无法识别公网或内网来源，请重新转写后再进行 AI 分析");
         }
         if (routing.sourceRoute() == LlmRoute.MIXED) {
-            throw BusinessException.conflict("LLM_ROUTE_MIXED",
-                    "当前快照同时包含公网和本地来源，请统一当前接诊的 ASR 路由并重新转写");
+            LlmRoute requested = LlmRoute.fromRequested(requestedProvider);
+            if (!requested.isCallable()) {
+                throw BusinessException.conflict("LLM_ROUTE_SELECTION_REQUIRED",
+                        "当前快照同时包含公网和内网转写，请明确选择本次 AI 分析路由");
+            }
+            return requested;
         }
         if (requestedProvider != null && !requestedProvider.isBlank()
                 && LlmRoute.fromRequested(requestedProvider) != routing.sourceRoute()) {
@@ -70,10 +62,6 @@ public class LlmRouteResolver {
                     "当前快照只能使用" + label(routing.sourceRoute()) + "，不能切换到其他路由");
         }
         return routing.sourceRoute();
-    }
-
-    public LlmRoute resolveAnalysis(DialogueSnapshot snapshot, String requestedProvider) {
-        return resolve(snapshot, requestedProvider);
     }
 
     public static String label(LlmRoute route) {

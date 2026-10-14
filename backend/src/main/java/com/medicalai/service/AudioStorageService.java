@@ -98,18 +98,6 @@ public class AudioStorageService {
         }
     }
 
-    /** Verify retained audio before clearing drafts, without downloading the recording. */
-    public void assertAudioAvailable(String objectKey) {
-        assertAsrSubmissionReady();
-        if (objectKey == null || objectKey.isBlank()) throw new BusinessException(HttpStatus.NOT_FOUND,
-                "AUDIO_NOT_FOUND", "缺少原始录音，无法恢复转写");
-        try {
-            if (client.statObject(io.minio.StatObjectArgs.builder().bucket(bucket).object(objectKey).build()).size() <= 0)
-                throw new BusinessException(HttpStatus.NOT_FOUND, "AUDIO_NOT_FOUND", "原始录音为空，无法恢复转写");
-        } catch (BusinessException e) { throw e; }
-        catch (Exception e) { throw storageFailure("无法读取原始录音，请恢复音频后重试", e); }
-    }
-
     public String presignedUrl(String objectKey) {
         assertAsrSubmissionReady();
         try {

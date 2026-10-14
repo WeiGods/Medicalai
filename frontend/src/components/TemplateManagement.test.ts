@@ -49,7 +49,7 @@ describe('TemplateManagement preview', () => {
     await flushPromises()
 
     expect(api.draftTemplatePreviewBlob).toHaveBeenCalledWith('PDF', expect.stringContaining('"documentTitle":"门诊病历"'))
-    expect(wrapper.find('[role="dialog"][aria-label="模板预览"]').exists()).toBe(true)
+    expect(wrapper.get('[role="dialog"][aria-label="模板预览"]').exists()).toBe(true)
     expect(wrapper.get('iframe[title="PDF 预览"]').attributes('src')).toBe('blob:template-preview')
 
     await wrapper.get('button[aria-label="关闭预览"]').trigger('click')
@@ -104,7 +104,7 @@ describe('TemplateManagement preview', () => {
     const deleteButton = wrapper.get('button[aria-label="删除模板"]')
     expect(deleteButton.attributes('disabled')).toBeUndefined()
     await deleteButton.trigger('click')
-    expect(wrapper.find('[role="dialog"][aria-label="删除模板确认"]').exists()).toBe(true)
+    expect(wrapper.get('[role="dialog"][aria-label="删除模板确认"]').exists()).toBe(true)
 
     await wrapper.get('button[aria-label="确认删除模板"]').trigger('click')
     await flushPromises()

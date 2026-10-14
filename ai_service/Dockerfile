@@ -27,7 +27,6 @@ PY
 
 COPY model.py serve_realtime_ws.py streaming_speaker_turns.py offline_asr_structure.py ./
 COPY ai_service ./ai_service
-COPY backend/src/main/resources/ai/role-assignment.json ./ai_service/role-assignment.json
 COPY 热词列表 ./
 
 # Bake ASR / VAD / speaker models so a pulled image runs fully offline.

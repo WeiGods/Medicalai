@@ -25,10 +25,9 @@ vi.mock('../api', () => ({
     managedTemplates: vi.fn(),
     saveTranscript: vi.fn(),
     retranscribeRecording: vi.fn(),
-    rebuildTranscript: vi.fn(),
+    transcribe: vi.fn(),
     reclassifyTranscriptRoles: vi.fn(),
     generateClinicalExtraction: vi.fn(),
-    transcribe: vi.fn(),
     deletePatient: vi.fn(),
     patientDeletionStatus: vi.fn()
   }
@@ -47,7 +46,7 @@ const activeVisit: Visit = {
   id: 'visit-1', visit_no: 'V-001', patient_id: patient.id, doctor_id: doctor.id, status: 'ACTIVE',
   department_name: doctor.department_name, patient_name: patient.name, patient_gender: patient.gender,
   patient_age: patient.age, doctor_name: doctor.display_name, chief_complaint: null, version: 1,
-  created_at: '2026-09-21T08:00:00Z', last_activity_at: '2026-09-21T08:00:00Z', processing_route: null
+  created_at: '2026-09-21T08:00:00Z', last_activity_at: '2026-09-21T08:00:00Z'
 }
 
 const doneRecording: Recording = {
@@ -65,7 +64,8 @@ function transcript(edited = false): Transcript {
     snapshot_id: 'snapshot-1', snapshot_version: 1, snapshot_hash: 'hash-1', authority_status: 'ADOPTED',
     transcript: '患者：头痛', edited, source_dirty: false,
     turns: [{ id: 'turn-1', role: 'PATIENT', text: '头痛', start_ms: 0, end_ms: 1000, role_source: 'LLM', role_review_required: false }],
-    source_route: 'DASHSCOPE', available_routes: ['DASHSCOPE'], route_selection_required: false
+    source_route: 'DASHSCOPE', available_routes: ['DASHSCOPE'], route_selection_required: false,
+    default_route: 'DASHSCOPE'
   }
 }
 
@@ -90,6 +90,7 @@ function configure(options: {
   asrPreviews?: AsrPreviewRecording[]
   activeAsrJob?: AsrJob | null
   transcript?: Transcript
+  extraction?: ClinicalExtraction
   record?: MedicalRecord
   visit?: Visit
   visits?: Visit[]
@@ -102,7 +103,7 @@ function configure(options: {
   vi.mocked(api.asrPreviews).mockResolvedValue(options.asrPreviews || [])
   vi.mocked(api.activeTranscription).mockResolvedValue(options.activeAsrJob || null)
   vi.mocked(api.transcript).mockResolvedValue(options.transcript || transcript())
-  vi.mocked(api.clinicalExtraction).mockResolvedValue(pendingExtraction)
+  vi.mocked(api.clinicalExtraction).mockResolvedValue(options.extraction || pendingExtraction)
   vi.mocked(api.medicalRecord).mockResolvedValue(options.record || record())
   vi.mocked(api.confirmations).mockResolvedValue([])
   vi.mocked(api.exports).mockResolvedValue(options.exports || [])
@@ -144,81 +145,6 @@ describe('patient avatar colors', () => {
     expect(new Set(tiles.map(tile => tone(tile.get('.avatar')))).size).toBe(3)
     expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.recent .avatar')))
     expect(tone(tiles[0].get('.avatar'))).toBe(tone(wrapper.get('.patient-summary .avatar')))
-  })
-})
-
-describe('ASR source routing', () => {
-  it('keeps the recovery route pinned before first successful ASR', async () => {
-    const wrapper = await mountWorkbench({ visit: { ...activeVisit, recovery_route: 'LOCAL' }, recordings: [uploadedRecording] })
-    expect(wrapper.get('input[name="asr-provider"][value="LOCAL"]').element).toHaveProperty('checked', true)
-    expect(wrapper.get('input[name="asr-provider"][value="DASHSCOPE"]').element).toHaveProperty('disabled', true)
-    wrapper.unmount()
-  })
-
-  it('requires acknowledgement before rebuilding a mixed snapshot and submits the original snapshot', async () => {
-    vi.mocked(api.rebuildTranscript).mockImplementation(() => new Promise(() => undefined))
-    const wrapper = await mountWorkbench({ transcript: { ...transcript(), source_route: 'MIXED', available_routes: [] } })
-    const recovery = wrapper.findAll('button').find(button => button.text() === '统一路由并恢复整份转写')!
-    await recovery.trigger('click')
-    const submit = wrapper.findAll('button').find(button => button.text() === '确认整份恢复')!
-    expect(submit.element).toHaveProperty('disabled', true)
-    expect(wrapper.get('.modal-body').text()).toContain('保留全部原始录音')
-    await wrapper.get('input[name="rebuild-provider"][value="LOCAL"]').setValue(true)
-    await wrapper.get('.modal-body input[type="checkbox"]').setValue(true)
-    await submit.trigger('click')
-    expect(api.rebuildTranscript).toHaveBeenCalledWith(activeVisit.id, 'LOCAL', 'snapshot-1')
-    expect(api.transcribe).not.toHaveBeenCalled()
-    wrapper.unmount()
-  })
-
-  it('disables recovery while an older queued ASR task is still active', async () => {
-    const wrapper = await mountWorkbench({ transcript: { ...transcript(), source_route: 'UNKNOWN', available_routes: [] },
-      activeAsrJob: { job_id: 'older-job', status: 'PENDING', total_recordings: 1, completed_recordings: 0, error_message: null, transcript: null, provider_route: 'LOCAL' } })
-    const recovery = wrapper.findAll('button').find(button => button.text() === '统一路由并恢复整份转写')!
-    expect(recovery.element).toHaveProperty('disabled', true)
-    wrapper.unmount()
-  })
-  it.each(['LOCAL', 'DASHSCOPE'] as const)('locks ASR options and submits the %s visit route', async route => {
-    vi.mocked(api.transcribe).mockImplementation(() => new Promise(() => undefined))
-    const wrapper = await mountWorkbench({ visit: { ...activeVisit, processing_route: route }, recordings: [uploadedRecording] })
-    const other = route === 'LOCAL' ? 'DASHSCOPE' : 'LOCAL'
-    expect(wrapper.get(`input[name="asr-provider"][value="${route}"]`).element).toHaveProperty('checked', true)
-    expect(wrapper.get(`input[name="asr-provider"][value="${other}"]`).element).toHaveProperty('disabled', true)
-    await wrapper.get('.transcribe-action button').trigger('click')
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, route)
-    wrapper.unmount()
-  })
-
-  it.each(['LOCAL', 'DASHSCOPE'] as const)('omits provider when extracting the %s snapshot', async route => {
-    vi.mocked(api.generateClinicalExtraction).mockImplementation(() => new Promise(() => undefined))
-    const snapshot = { ...transcript(), source_route: route, available_routes: [route] }
-    const wrapper = await mountWorkbench({ transcript: snapshot })
-    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
-    expect(wrapper.find('[aria-label="选择 AI 处理路由"]').exists()).toBe(false)
-    expect(wrapper.text()).toContain(route === 'LOCAL' ? '本地处理' : '公网处理')
-    const generate = wrapper.findAll('button').find(button => button.text() === '生成信息提取')!
-    expect(generate.element).toHaveProperty('disabled', false)
-    await generate.trigger('click')
-    expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id)
-    wrapper.unmount()
-  })
-
-  it.each(['MIXED', 'UNKNOWN'] as const)('blocks role analysis and extraction for %s snapshots', async route => {
-    const snapshot: Transcript = { ...transcript(), source_route: route, available_routes: [], route_selection_required: false,
-      turns: [{ ...transcript().turns[0], role: 'UNKNOWN', role_source: 'UNKNOWN', role_review_required: true }] }
-    const wrapper = await mountWorkbench({ transcript: snapshot })
-    expect(wrapper.get('[role="alert"]').text()).toBe('请统一当前接诊的 ASR 路由并重新转写')
-    const reclassify = wrapper.findAll('button').find(button => button.text() === '开始 AI 判断')!
-    expect(reclassify.element).toHaveProperty('disabled', true)
-    await reclassify.trigger('click')
-    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
-    const generate = wrapper.findAll('button').find(button => button.text() === '生成信息提取')!
-    expect(generate.element).toHaveProperty('disabled', true)
-    await generate.trigger('click')
-    expect(wrapper.find('[aria-label="选择 AI 处理路由"]').exists()).toBe(false)
-    expect(api.reclassifyTranscriptRoles).not.toHaveBeenCalled()
-    expect(api.generateClinicalExtraction).not.toHaveBeenCalled()
-    wrapper.unmount()
   })
 })
 
@@ -270,7 +196,7 @@ describe('supplemental recording workflow', () => {
 
     await wrapper.get('button[aria-label="确认重新转写"]').trigger('click')
     expect(api.transcribe).toHaveBeenCalledTimes(1)
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
   })
 
   it('requires confirmation before re-transcribing supplemental audio when a draft exists', async () => {
@@ -289,7 +215,7 @@ describe('supplemental recording workflow', () => {
     await wrapper.get('.transcribe-action button').trigger('click')
 
     expect(wrapper.text()).not.toContain('重新转写确认')
-    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE')
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
   })
 
   it('re-transcribes an existing audio file with the selected ASR provider after confirmation', async () => {
@@ -303,7 +229,7 @@ describe('supplemental recording workflow', () => {
     expect(api.retranscribeRecording).not.toHaveBeenCalled()
 
     await wrapper.get('button[aria-label="确认重新转写录音"]').trigger('click')
-    expect(api.retranscribeRecording).toHaveBeenCalledWith(activeVisit.id, doneRecording.id, 'DASHSCOPE')
+    expect(api.retranscribeRecording).toHaveBeenCalledWith(activeVisit.id, doneRecording.id, 'DASHSCOPE', 'DASHSCOPE')
   })
 
   it('allows an active draft to expose deletion for a transcribed audio file', async () => {
@@ -822,6 +748,76 @@ describe('transcript review navigation', () => {
     await wrapper.get('.role-attention-action').trigger('click')
 
     expect(scrollTo).toHaveBeenCalledWith({ top: 320, behavior: 'smooth' })
+  })
+})
+
+describe('llm route selection', () => {
+  function routedTranscript(): Transcript {
+    const source = transcript()
+    return {
+      ...source,
+      turns: [{ ...source.turns[0], role_source: 'AUTO', role_review_required: true }],
+      available_routes: ['DASHSCOPE', 'LOCAL'],
+      route_selection_required: true,
+      default_route: 'DASHSCOPE'
+    }
+  }
+
+  it('shows the role-recognition route selector and reclassifies with the selected provider', async () => {
+    const routed = routedTranscript()
+    vi.mocked(api.reclassifyTranscriptRoles).mockResolvedValue(routed)
+    const wrapper = await mountWorkbench({ transcript: routed })
+
+    const options = wrapper.get('.route-selector').findAll('.route-option')
+    expect(options).toHaveLength(2)
+    expect(options[0].classes()).toContain('active')
+    expect(options[1].classes()).not.toContain('active')
+
+    await options[1].trigger('click')
+    await wrapper.get('.role-attention-action').trigger('click')
+    await flushPromises()
+
+    expect(api.reclassifyTranscriptRoles).toHaveBeenCalledWith(activeVisit.id, 'LOCAL')
+  })
+
+  it('keeps the route selector hidden when only one route is available', async () => {
+    const wrapper = await mountWorkbench()
+
+    expect(wrapper.find('.route-selector').exists()).toBe(false)
+  })
+
+  it('sends the role-recognition route chosen on the audio page as role_provider', async () => {
+    vi.mocked(api.transcribe).mockImplementation(() => new Promise(() => undefined))
+    const wrapper = await mountWorkbench({
+      recordings: [uploadedRecording],
+      transcript: { ...transcript(), default_route: 'LOCAL' }
+    })
+
+    expect(wrapper.findAll('input[name="role-llm-provider"]')).toHaveLength(2)
+    expect((wrapper.get('input[name="role-llm-provider"][value="LOCAL"]').element as HTMLInputElement).checked).toBe(true)
+
+    await wrapper.get('input[name="role-llm-provider"][value="DASHSCOPE"]').setValue(true)
+    await wrapper.get('.transcribe-action button').trigger('click')
+
+    expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE', 'DASHSCOPE')
+  })
+
+  it('generates the extraction with the provider selected from the extraction routes', async () => {
+    const routedExtraction: ClinicalExtraction = {
+      ...pendingExtraction, available_routes: ['DASHSCOPE', 'LOCAL'], route_selection_required: true, default_route: 'LOCAL'
+    }
+    vi.mocked(api.generateClinicalExtraction).mockImplementation(() => new Promise(() => undefined))
+    const wrapper = await mountWorkbench({ extraction: routedExtraction })
+
+    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
+    const options = wrapper.get('.extraction-actions .route-selector').findAll('.route-option')
+    expect(options).toHaveLength(2)
+    expect(options[1].classes()).toContain('active')
+
+    await options[0].trigger('click')
+    await wrapper.get('.extraction-actions > button.btn').trigger('click')
+
+    expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id, 'DASHSCOPE')
   })
 })
 

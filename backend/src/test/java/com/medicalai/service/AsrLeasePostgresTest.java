@@ -54,7 +54,7 @@ class AsrLeasePostgresTest {
         jdbc.update("INSERT INTO recording(id,visit_id,recording_no,source_type,object_key,file_name,mime_type) VALUES (?,?,?,'UPLOAD','key','test.wav','audio/wav')",id,visit,id.toString());
         return id;
     }
-    List<RecordingMapper.Turn> turns(){return List.of(new RecordingMapper.Turn("OTHER","离线测试",20,300,7,"FALLBACK",null,"LOCAL"));}
+    List<RecordingMapper.Turn> turns(){return List.of(new RecordingMapper.Turn("OTHER","离线测试",20,300,7));}
     int count(String table){return jdbc.queryForObject("SELECT count(*) FROM "+table,Integer.class);}
 
     @Test void routesClaimIndependentlyAndHeartbeatFencesStaleOwner(){
@@ -84,7 +84,6 @@ class AsrLeasePostgresTest {
         UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();
         store.begin(current,token);
         store.complete(current,token,recording,turns());
-        assertEquals("LOCAL",new VisitMapper(jdbc).find(visit,false).orElseThrow().processingRoute());
         assertEquals(1,count("asr_utterance"));assertEquals(1,count("dialogue_snapshot"));
         assertEquals(7,mapper.listByRecording(recording).getFirst().speakerId());
         assertEquals("说话人 7：离线测试",mapper.transcript(visit).orElseThrow().transcript());
@@ -93,51 +92,9 @@ class AsrLeasePostgresTest {
         assertEquals(1,count("asr_utterance"));
     }
 
-    TranscriptRecoveryStore recoveryStore(RecordingMapper recordingMapper) {
-        var factory = new ProxyFactory(new TranscriptRecoveryStore(new VisitMapper(jdbc),recordingMapper,new MedicalRecordMapper(jdbc)));
-        factory.setProxyTargetClass(true);
-        factory.addAdvice(new TransactionInterceptor(transactions,new AnnotationTransactionAttributeSource()));
-        return (TranscriptRecoveryStore) factory.getProxy();
-    }
-
-    @Test void rebuildPreservesAudioAndIsIdempotentAfterClearingOldSnapshot() {
-        UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();
-        store.begin(current,token);store.complete(current,token,recording,turns());
-        UUID snapshot=mapper.latestSnapshot(visit).orElseThrow().id();
-        UUID doctor=new VisitMapper(jdbc).doctorId(visit);
-        jdbc.update("UPDATE recording SET asr_route='UNKNOWN' WHERE id=?",recording);
-        var recovery=recoveryStore(mapper);
-        var prepared=recovery.prepare(visit,doctor,"LOCAL",snapshot,true);
-        UUID rebuilt=recovery.rebuild(visit,doctor,snapshot,prepared);
-        assertEquals("key",mapper.list(visit).getFirst().objectKey());
-        assertEquals("UPLOADED",mapper.list(visit).getFirst().status());
-        assertEquals(0,count("dialogue_snapshot"));assertEquals(0,count("asr_utterance"));
-        assertEquals("LOCAL",new VisitMapper(jdbc).find(visit,false).orElseThrow().recoveryRoute());
-        assertEquals(rebuilt,recovery.prepare(visit,doctor,"LOCAL",snapshot,true).existing().id());
-        assertEquals(1,count("ai_job"));
-    }
-
-    @Test void rebuildJobInsertFailureRollsBackAllDraftCleanup() {
-        UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();
-        store.begin(current,token);store.complete(current,token,recording,turns());
-        UUID snapshot=mapper.latestSnapshot(visit).orElseThrow().id();
-        UUID doctor=new VisitMapper(jdbc).doctorId(visit);
-        jdbc.update("UPDATE recording SET asr_route='UNKNOWN' WHERE id=?",recording);
-        RecordingMapper broken=spy(mapper);
-        doThrow(new IllegalStateException("insert failed")).when(broken).createRebuildJob(visit,snapshot,"LOCAL");
-        var recovery=recoveryStore(broken);
-        var prepared=recovery.prepare(visit,doctor,"LOCAL",snapshot,true);
-        assertThrows(IllegalStateException.class,()->recovery.rebuild(visit,doctor,snapshot,prepared));
-        assertEquals(snapshot,mapper.latestSnapshot(visit).orElseThrow().id());
-        assertEquals(1,count("asr_utterance"));assertEquals(1,count("ai_job"));
-        assertEquals("DONE",mapper.list(visit).getFirst().status());
-        assertNull(new VisitMapper(jdbc).find(visit,false).orElseThrow().recoveryRoute());
-        assertEquals("UNKNOWN",jdbc.queryForObject("SELECT asr_route FROM recording WHERE id=?",String.class,recording));
-    }
-
     @Test void retryOfEarlierRecordingKeepsCompletedLaterRecordingAndValidSessionScope() {
         UUID later=createRecording(visit);
-        jdbc.update("UPDATE recording SET created_at=medicalai_local_clock()+interval '1 second',status='DONE',asr_route='LOCAL' WHERE id=?",later);
+        jdbc.update("UPDATE recording SET created_at=medicalai_local_clock()+interval '1 second',status='DONE' WHERE id=?",later);
         UUID laterSession=mapper.createSession(visit,later);
         mapper.insertUtterances(visit,later,laterSession,List.of(new RecordingMapper.Turn("DOCTOR","已完成",0,100,0)));
         UUID token=UUID.randomUUID();var current=store.claim("LOCAL",token).orElseThrow();
@@ -155,20 +112,6 @@ class AsrLeasePostgresTest {
         store.begin(current,token);store.submitted(current,token,recording,"provider-123");
         var next=store.claim("DASHSCOPE",UUID.randomUUID()).orElseThrow();
         assertEquals("provider-123",next.providerTaskId());assertEquals("RUNNING",next.status());
-    }
-
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.NullAndEmptySource
-    @org.junit.jupiter.params.provider.ValueSource(strings={"DASHSCOPE","DASHSCOPE_ROLE_V2"})
-    void newPublicWorkerClaimsLegacyRoutesOnly(String provider) {
-        // 空字符串不是历史公网默认，只有 SQL NULL 才按旧公网任务兼容。
-        jdbc.update("UPDATE ai_job SET provider_route=? WHERE id=?",provider,job);
-        var claimed=store.claim(AsrJobWorker.PUBLIC_ROLE_ROUTE,UUID.randomUUID());
-        if ("".equals(provider)) assertTrue(claimed.isEmpty());
-        else {
-            assertEquals(job,claimed.orElseThrow().id());
-            assertEquals(LlmRoute.DASHSCOPE,LlmRoute.fromAsrRoute(claimed.orElseThrow().providerRoute()));
-        }
     }
 
     @Test void concurrentClaimsCannotOwnSameTask() throws Exception {

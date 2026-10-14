@@ -31,8 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from ai_service.role_prompt import ROLE_PROMPT
-
 if os.environ.get("ASR_OFFLINE") == "1":
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -633,7 +631,7 @@ async def healthz():
         "status": "ok",
         "models_loaded": settings.models_ready,
         "text_extraction_only": settings.text_extraction_only,
-        "clinical_extraction_configured": bool(settings.llm_api_base),
+        "clinical_extraction_configured": bool(settings.llm_api_base and settings.llm_api_key),
     }
 
 
@@ -900,17 +898,15 @@ async def assign_roles(body: dict):
     """内网逐句角色识别；失败时只安全降级为 OTHER/FALLBACK。"""
     turns = body.get("turns") or []
     indexes = []
-    if not isinstance(turns, list):
-        return {"items": []}
     for turn in turns:
         index = turn.get("index") if isinstance(turn, dict) else None
-        if type(index) is not int or index < 0 or index in indexes:
+        if not isinstance(index, int) or index < 0 or index in indexes:
             return {"items": []}
         indexes.append(index)
 
     fallback = [{"index": index, "role": "OTHER", "confidence": None, "source": "FALLBACK"}
                 for index in indexes]
-    if not indexes or not settings.llm_api_base:
+    if not indexes or not settings.llm_api_base or not settings.llm_api_key:
         return {"items": fallback}
 
     schema = {
@@ -919,24 +915,26 @@ async def assign_roles(body: dict):
             "type": "object", "additionalProperties": False, "required": ["items"],
             "properties": {"items": {"type": "array", "minItems": len(indexes), "maxItems": len(indexes),
                 "items": {"type": "object", "additionalProperties": False,
-                    "required": ["index", "role", "confidence"],
+                    "required": ["index", "role", "confidence", "source"],
                     "properties": {
                         "index": {"type": "integer", "minimum": 0},
                         "role": {"type": "string", "enum": ["DOCTOR", "PATIENT", "OTHER"]},
-                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100}}}}}
+                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "source": {"type": "string", "enum": ["LLM"]}}}}}
         }
     }
-    prompt = ROLE_PROMPT["instruction"] + json.dumps(turns, ensure_ascii=False, separators=(",", ":"))
-    headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
+    prompt = ("逐句判断以下医疗对话的角色。每个输入 index 必须恰好返回一次。"
+              "只能根据该句原文和上下文判断，禁止根据 speaker_id、序号或发言顺序猜测；不确定返回 OTHER。\n"
+              + json.dumps(turns, ensure_ascii=False))
     try:
         async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
             response = await client.post(
                 settings.llm_api_base.rstrip("/") + "/chat/completions",
                 json={"model": settings.llm_model, "messages": [
-                    {"role": "system", "content": ROLE_PROMPT["system"]},
+                    {"role": "system", "content": "你是医疗对话角色分类器，只返回 JSON。"},
                     {"role": "user", "content": prompt}], "temperature": 0,
                     "response_format": {"type": "json_schema", "json_schema": schema}},
-                headers=headers)
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"})
             response.raise_for_status()
             parsed = _json_content(response.json()["choices"][0]["message"]["content"])
             items = parsed.get("items")
@@ -950,9 +948,10 @@ async def assign_roles(body: dict):
                 index = item.get("index")
                 role = item.get("role")
                 confidence = item.get("confidence")
-                if (type(index) is not int or index not in indexes or index in seen
+                if (not isinstance(index, int) or index not in indexes or index in seen
                         or role not in {"DOCTOR", "PATIENT", "OTHER"}
-                        or type(confidence) is not int or not 0 <= confidence <= 100):
+                        or not isinstance(confidence, int) or not 0 <= confidence <= 100
+                        or item.get("source") != "LLM"):
                     return {"items": fallback}
                 seen.add(index)
                 result.append({"index": index, "role": role, "confidence": confidence, "source": "LLM"})

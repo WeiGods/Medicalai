@@ -29,14 +29,18 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
 
 /**
- * 本地角色识别适配器，医疗业务统一经内部 AI 网关调用本地模型。
+ * 内网本地 LLM（llama.cpp / OpenAI 兼容）的角色识别适配器。
  *
  * <p>这是通信适配器网络层新增的一路：把 ASR 的 MOSS 匿名推理结果发送到内网本地 LLM 进行
- * speaker 识别（角色判断），与公网 DashScope 客户端互为替代路由。生产角色识别走
- * {@code POST /internal/transcript/assign-roles}，保留分批、重试、降级 FALLBACK；
+ * speaker 识别（角色判断），与公网 DashScope 客户端互为替代路由。同步角色识别走
+ * {@code POST /v1/chat/completions}（与 DashScope 客户端同语义：分批、重试、降级 FALLBACK）；
  * 另提供 SSE 流式对话能力 {@link #streamChat}，供流式输出场景使用。
  *
- * <p>直接构造的兼容客户端可通过 {@code medicalai.local-llm.enabled=false} 禁用。未启用时 {@link #assignRoles}
+ * <p>请求语义与公网路由完全一致（同一套提示词、{@code temperature=0}、{@code response_format=json_object}），
+ * 另外默认附带 {@code chat_template_kwargs.enable_thinking=false}，避免本地思考 token 成倍拉长每批耗时
+ * （可用 {@code medicalai.local-llm.role-disable-thinking=false} 关掉这个附带字段）。
+ *
+ * <p>默认不启用（{@code medicalai.local-llm.enabled=false}）。未启用时 {@link #assignRoles}
  * 只会返回降级结果 (OTHER, null, FALLBACK)，绝不静默改走公网、也绝不发出任何网络请求。
  */
 @Service
@@ -56,6 +60,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
     private static final int MAX_RETRY_MAX_ATTEMPTS = 3;
     private static final int DEFAULT_RETRY_DELAY_MS = 200;
     private static final int MAX_RETRY_DELAY_MS = 10_000;
+    private static final boolean DEFAULT_DISABLE_THINKING = true;
 
     private final RestClient client;
     private final HttpClient httpClient;
@@ -66,14 +71,12 @@ public class LocalLlmRoleClient implements RoleLlmClient {
     private final String model;
     private final int reviewThreshold;
     private final int batchSize;
+    private final boolean disableThinking;
     private final int retryMaxAttempts;
     private final Duration retryDelay;
-    /** Spring 业务实例必选网关；旧构造器仅供嵌入式兼容和独立 streamChat 使用。 */
-    private AiServiceClient gateway;
 
     @Autowired
     public LocalLlmRoleClient(
-            AiServiceClient gateway,
             ObjectMapper mapper,
             @Value("${medicalai.local-llm.enabled:false}") boolean enabled,
             @Value("${medicalai.local-llm.endpoint:http://192.168.1.56:8080}") String endpoint,
@@ -81,23 +84,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
             @Value("${medicalai.local-llm.role-model:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}") String model,
             @Value("${medicalai.local-llm.role-review-threshold:70}") int reviewThreshold,
             @Value("${medicalai.local-llm.role-batch-size:40}") int batchSize,
-            @Value("${medicalai.local-llm.connect-timeout-ms:5000}") long connectTimeoutMs,
-            @Value("${medicalai.local-llm.read-timeout-ms:120000}") long readTimeoutMs,
-            @Value("${medicalai.local-llm.role-retry-max-attempts:2}") int retryMaxAttempts,
-            @Value("${medicalai.local-llm.role-retry-delay-ms:200}") long retryDelayMs) {
-        this(mapper, enabled, endpoint, apiKey, model, reviewThreshold, batchSize,
-                connectTimeoutMs, readTimeoutMs, retryMaxAttempts, retryDelayMs);
-        this.gateway = java.util.Objects.requireNonNull(gateway);
-    }
-
-    public LocalLlmRoleClient(
-            ObjectMapper mapper,
-            @Value("${medicalai.local-llm.enabled:false}") boolean enabled,
-            @Value("${medicalai.local-llm.endpoint:http://192.168.1.56:8080}") String endpoint,
-            @Value("${medicalai.local-llm.api-key:}") String apiKey,
-            @Value("${medicalai.local-llm.role-model:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}") String model,
-            @Value("${medicalai.local-llm.role-review-threshold:70}") int reviewThreshold,
-            @Value("${medicalai.local-llm.role-batch-size:40}") int batchSize,
+            @Value("${medicalai.local-llm.role-disable-thinking:true}") boolean disableThinking,
             @Value("${medicalai.local-llm.connect-timeout-ms:5000}") long connectTimeoutMs,
             @Value("${medicalai.local-llm.read-timeout-ms:120000}") long readTimeoutMs,
             @Value("${medicalai.local-llm.role-retry-max-attempts:2}") int retryMaxAttempts,
@@ -109,6 +96,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
         this.model = requireText("LOCAL_LLM_ROLE_MODEL", model);
         this.reviewThreshold = clamp(reviewThreshold, MIN_CONFIDENCE, MAX_CONFIDENCE);
         this.batchSize = clamp(batchSize, 1, MAX_BATCH_SIZE);
+        this.disableThinking = disableThinking;
         this.retryMaxAttempts = clamp(retryMaxAttempts, 1, MAX_RETRY_MAX_ATTEMPTS);
         this.retryDelay = Duration.ofMillis(clamp(retryDelayMs, 0, MAX_RETRY_DELAY_MS));
         this.httpClient = HttpClient.newBuilder()
@@ -118,7 +106,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
     }
 
     /**
-     * 保持直接构造客户端的兼容性（默认启用），生产环境应使用可配置超时和重试参数的 Spring 构造器。
+     * 保持直接构造客户端的兼容性（默认启用、默认关闭思考），生产环境应使用可配置超时和重试参数的 Spring 构造器。
      */
     public LocalLlmRoleClient(
             ObjectMapper mapper,
@@ -127,7 +115,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
             String model,
             int reviewThreshold,
             int batchSize) {
-        this(mapper, true, endpoint, apiKey, model, reviewThreshold, batchSize,
+        this(mapper, true, endpoint, apiKey, model, reviewThreshold, batchSize, DEFAULT_DISABLE_THINKING,
                 DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS,
                 DEFAULT_RETRY_MAX_ATTEMPTS, DEFAULT_RETRY_DELAY_MS);
     }
@@ -143,7 +131,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
             LOG.warn("本地LLM角色判断已跳过：模型={}，句段数={}，原因=句段索引无效", model, turns.size());
             return fallbackAssignments(indexes);
         }
-        if (!isConfigured()) {
+        if (!enabled) {
             LOG.warn("本地LLM角色判断已跳过：模型={}，句段数={}，原因=未启用（LOCAL_LLM_ENABLED=true 时接入内网路由）",
                     model, turns.size());
             return fallbackAssignments(indexes);
@@ -171,7 +159,7 @@ public class LocalLlmRoleClient implements RoleLlmClient {
 
     @Override
     public boolean isConfigured() {
-        return enabled || gateway != null;
+        return enabled;
     }
 
     /**
@@ -283,27 +271,22 @@ public class LocalLlmRoleClient implements RoleLlmClient {
 
     private Map<Integer, DashScopeRoleClient.RoleAssignment> requestAssignments(
             List<Map<String, Object>> turns, Set<Integer> indexes) throws JsonProcessingException {
-        if (gateway != null) {
-            Map<Integer, DashScopeRoleClient.RoleAssignment> assignments = gateway.assignRoleAssignments(turns);
-            if (assignments == null || !assignments.keySet().equals(indexes)
-                    || assignments.values().stream().anyMatch(assignment -> assignment == null
-                    || !SOURCE_LLM.equals(assignment.source()) || !ALLOWED_ROLES.contains(assignment.role())
-                    || assignment.confidence() == null || assignment.confidence() < MIN_CONFIDENCE
-                    || assignment.confidence() > MAX_CONFIDENCE)) {
-                throw new InvalidRoleResponseException("本地 AI 网关未返回完整角色判断结果");
-            }
-            return assignments;
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("model", model);
+        request.put("messages", List.of(
+                Map.of("role", "system", "content", SYSTEM_PROMPT),
+                Map.of("role", "user", "content", ROLE_ASSIGNMENT_INSTRUCTION + mapper.writeValueAsString(turns))));
+        request.put("temperature", 0);
+        request.put("response_format", Map.of("type", "json_object"));
+        if (disableThinking) {
+            // llama.cpp 的 Qwen 系模板默认开启思考，思考 token 会成倍拉长每批耗时（4 句实测 11.8s → 4.2s），
+            // 而角色判断只需要 JSON 结果；关闭后若服务端不支持该字段也只是忽略。
+            request.put("chat_template_kwargs", Map.of("enable_thinking", false));
         }
         var requestBuilder = client.post()
                 .uri("/v1/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of(
-                        "model", model,
-                        "messages", List.of(
-                                Map.of("role", "system", "content", SYSTEM_PROMPT),
-                                Map.of("role", "user", "content", ROLE_ASSIGNMENT_INSTRUCTION + mapper.writeValueAsString(turns))),
-                        "temperature", 0,
-                        "response_format", Map.of("type", "json_object")));
+                .body(request);
         if (!apiKey.isBlank()) {
             requestBuilder.header("Authorization", "Bearer " + apiKey);
         }
@@ -335,14 +318,18 @@ public class LocalLlmRoleClient implements RoleLlmClient {
         }
     }
 
+    /**
+     * 取出模型回答里的 JSON 文本。
+     *
+     * <p>思考块可能被 {@code --reasoning-format} 混进 {@code content}，若不剥离就会解析失败并静默降级为
+     * FALLBACK（转写不报错、角色却全是 OTHER），因此统一交给 {@link LlmJsonContent} 处理。
+     */
     private String extractContent(JsonNode response) {
         String content = response == null ? "" : response.at("/choices/0/message/content").asText("").strip();
         if (content.isBlank()) {
             throw new InvalidRoleResponseException("本地LLM角色判断未返回有效内容");
         }
-        return content.replaceFirst("(?is)^```(?:json)?\\s*", "")
-                .replaceFirst("(?s)\\s*```\\s*$", "")
-                .strip();
+        return LlmJsonContent.cleaned(content);
     }
 
     private Map<Integer, DashScopeRoleClient.RoleAssignment> parseAssignments(String content, Set<Integer> expected)

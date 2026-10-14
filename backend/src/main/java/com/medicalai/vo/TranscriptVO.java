@@ -6,11 +6,11 @@ public record TranscriptVO(String snapshotId, int snapshotVersion, String snapsh
                            String authorityStatus, String transcript, boolean edited,
                            boolean sourceDirty, List<UtteranceVO> turns,
                            String sourceRoute, List<String> availableRoutes,
-                           boolean routeSelectionRequired) {
+                           boolean routeSelectionRequired, String defaultRoute) {
     public TranscriptVO(String snapshotId, int snapshotVersion, String snapshotHash,
                         String authorityStatus, String transcript, boolean edited,
                         boolean sourceDirty, List<UtteranceVO> turns) {
         this(snapshotId, snapshotVersion, snapshotHash, authorityStatus, transcript, edited, sourceDirty, turns,
-                "UNKNOWN", List.of(), false);
+                "UNKNOWN", List.of(), false, null);
     }
 }

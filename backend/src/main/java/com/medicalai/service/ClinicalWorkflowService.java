@@ -57,8 +57,6 @@ public class ClinicalWorkflowService {
     private ExportFileService exportFiles;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ExportTemplateService exportTemplates;
-    @org.springframework.beans.factory.annotation.Autowired
-    private TranscriptRecoveryStore transcriptRecoveryStore;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.role-review-threshold:70}")
     private int roleReviewThreshold = 70;
     @org.springframework.beans.factory.annotation.Value("${medicalai.dashscope.api-key:}")
@@ -230,22 +228,22 @@ public class ClinicalWorkflowService {
         }
     }
 
+    /** 兼容旧调用方：未指定角色识别路由时跟随 {@code LLM_ROLE_ROUTE} 的默认值。 */
     @Transactional(noRollbackFor = BusinessException.class)
     public AsrJobVO transcribe(UUID visitId, UUID doctorId, String provider) {
+        return transcribe(visitId, doctorId, provider, null);
+    }
+
+    @Transactional(noRollbackFor = BusinessException.class)
+    public AsrJobVO transcribe(UUID visitId, UUID doctorId, String provider, String roleProvider) {
         // 步骤 3：接收转写请求，校验接诊状态、任务幂等性和所选 ASR 路由的运行条件。
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
-        Optional<RecordingMapper.AsrJob> active = recordings.activeAsrJob(visit.id());
-        String requestedRoute = resolveAsrProvider(visit,
-                (provider == null || provider.isBlank()) && active.isPresent() ? active.get().providerRoute() : provider);
-        if (active.isPresent()) {
-            if (!requestedRoute.equals(normalizeAsrProvider(active.get().providerRoute()))) {
-                throw BusinessException.conflict("ASR_ROUTE_MISMATCH", "当前 ASR 任务正在使用另一条路由，请等待任务结束后重试");
-            }
-            return asrJob(visitId, doctorId, active.get().id());
-        }
-        if ("DASHSCOPE".equals(requestedRoute) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+        Optional<RecordingMapper.AsrJob> active = recordings.latestAsrJob(visit.id())
+                .filter(j -> Set.of("PENDING", "RUNNING").contains(j.status()));
+        if (active.isPresent()) return asrJob(visitId, doctorId, active.get().id());
+        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
         recordings.requeueRetryableRecordings(visit.id());
@@ -255,17 +253,24 @@ public class ClinicalWorkflowService {
                 .filter(r -> "UPLOADED".equals(r.status())).toList();
         if (pending.isEmpty()) throw new BusinessException(HttpStatus.CONFLICT, "NO_PENDING_RECORDING", "请先上传录音");
         // 步骤 4：创建 PENDING ASR 任务；定时工作线程会按任务路由异步领取并处理。
-        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(requestedRoute));
+        // 角色识别路由在这一刻解析并随任务落库，转写完成时的自动角色判断按它执行。
+        LlmRoute roleRoute = roleRouter.resolveRequestedRoute(roleProvider);
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider), null, roleRoute.name());
         return asrJob(visitId, doctorId, jobId);
     }
 
     /** 在不重新上传原始文件的情况下，使用另一条 ASR 路由重新处理指定录音。 */
     @Transactional
     public AsrJobVO retranscribeRecording(UUID visitId, UUID recordingId, UUID doctorId, String provider) {
+        return retranscribeRecording(visitId, recordingId, doctorId, provider, null);
+    }
+
+    @Transactional
+    public AsrJobVO retranscribeRecording(UUID visitId, UUID recordingId, UUID doctorId, String provider,
+                                          String roleProvider) {
         Visit visit = owned(visitId, doctorId, true);
         requireActive(visit);
         requireRecordEditable(visit.id());
-        String requestedRoute = resolveAsrProvider(visit, provider);
         Recording recording = recordings.find(recordingId, doctorId)
                 .filter(item -> visit.id().equals(item.visitId()))
                 .orElseThrow(BusinessException::notFound);
@@ -278,26 +283,17 @@ public class ClinicalWorkflowService {
         if (visits.hasOpenSession(visit.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_PROCESSING", "本次接诊仍有录音操作进行中，暂不能重新转写");
         }
-        if ("DASHSCOPE".equals(requestedRoute) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
+        if ("DASHSCOPE".equals(provider) && (dashscopeApiKey == null || dashscopeApiKey.isBlank())) {
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "未配置 DASHSCOPE_API_KEY，请配置公网凭据或选择本地 ASR");
         }
         storage.assertAsrSubmissionReady();
         if (!recordings.requeueTranscribedRecording(recording.id())) {
             throw new BusinessException(HttpStatus.CONFLICT, "RECORDING_STATE_CHANGED", "录音状态已变化，请刷新后重试");
         }
-        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(requestedRoute), recording.id());
+        // 重转写同样把角色识别路由落在任务上，避免"重新转写后角色又悄悄换回默认路由"。
+        LlmRoute roleRoute = roleRouter.resolveRequestedRoute(roleProvider);
+        UUID jobId = recordings.createAsrJob(visit.id(), queueProvider(provider), recording.id(), roleRoute.name());
         invalidateClinicalExtraction(visit.id());
-        return asrJob(visitId, doctorId, jobId);
-    }
-
-    public AsrJobVO rebuildTranscript(UUID visitId, UUID doctorId, String provider, UUID snapshotId, boolean acknowledged) {
-        var prepared = transcriptRecoveryStore.prepare(visitId, doctorId, provider, snapshotId, acknowledged);
-        if (prepared.existing() != null) return asrJob(visitId, doctorId, prepared.existing().id());
-        if ("DASHSCOPE".equals(prepared.route()) && (dashscopeApiKey == null || dashscopeApiKey.isBlank()))
-            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "DASHSCOPE_NOT_CONFIGURED", "请先配置公网 ASR 凭据");
-        // Do not hold a visit lock while verifying retained audio in object storage.
-        for (Recording audio : prepared.audio()) storage.assertAudioAvailable(audio.objectKey());
-        UUID jobId = transcriptRecoveryStore.rebuild(visitId, doctorId, snapshotId, prepared);
         return asrJob(visitId, doctorId, jobId);
     }
 
@@ -350,11 +346,15 @@ public class ClinicalWorkflowService {
         String text = state.map(RecordingMapper.TurnState::transcript).orElse("");
         boolean edited = state.map(RecordingMapper.TurnState::edited).orElse(false);
         boolean dirty = state.isPresent() && !state.get().snapshotId().equals(snapshot.get().id());
-        LlmRouting routing = routes.routing(snapshot.get());
+        // source_route 仍然表示"这条转写是哪条 ASR 路由产出的"；而 available_routes / default_route
+        // 描述的是**角色识别**当前能走哪些 LLM 路由（能力驱动），两者语义不同，不能混用。
+        LlmRouting asrRouting = routes.routing(snapshot.get());
+        List<LlmRoute> roleRoutes = roleRouter.availableRoutes();
+        LlmRoute preferredRoleRoute = roleRouter.preferredRoute();
         return new TranscriptVO(snapshot.get().id().toString(), snapshot.get().snapshotVersion(),
                 snapshot.get().snapshotHash(), snapshot.get().authorityStatus(), text, edited, dirty, turns,
-                routing.sourceRoute().name(), routing.availableRoutes().stream().map(Enum::name).toList(),
-                routing.selectionRequired());
+                asrRouting.sourceRoute().name(), roleRoutes.stream().map(Enum::name).toList(),
+                roleRoutes.size() > 1, preferredRoleRoute == null ? null : preferredRoleRoute.name());
     }
 
     @Transactional(readOnly = true)
@@ -384,8 +384,8 @@ public class ClinicalWorkflowService {
         requireRecordEditable(visit.id());
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
                 new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
-        return extractionService().generate(visit.id(), doctorId, snapshot,
-                routes.resolveAnalysis(snapshot, requestedProvider));
+        // 提取路由同样能力驱动：医生可以在公网与内网提取模型之间显式选择。
+        return extractionService().generate(visit.id(), doctorId, snapshot, requestedProvider);
     }
 
     @Transactional
@@ -460,9 +460,20 @@ public class ClinicalWorkflowService {
     }
 
     public TranscriptVO reclassifyTranscriptRoles(UUID visitId, UUID doctorId, String requestedProvider) {
-        var prepared = roleReclassificationStore.prepare(visitId, doctorId, requestedProvider);
-        LlmRoute route = prepared.route();
-        List<Utterance> candidates = prepared.candidates();
+        Visit visit = owned(visitId, doctorId, false);
+        requireActive(visit);
+        requireRecordEditable(visit.id());
+        if (isConfirmed(visit.id())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "RECORD_CONFIRMED", "病历已确认，请先进入修改状态");
+        }
+        DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id())
+                .orElseThrow(() -> new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成转写"));
+        // 路由能力驱动：显式指定的路由必须当前可用，不指定则跟随 LLM_ROLE_ROUTE 的默认值。
+        LlmRoute route = roleRouter.resolveRequestedRoute(requestedProvider);
+
+        List<Utterance> candidates = currentUtterances(visit.id()).stream()
+                .filter(utterance -> !"MANUAL".equals(utterance.roleSource()))
+                .toList();
         if (candidates.isEmpty()) return transcript(visitId, doctorId);
 
         List<Map<String, Object>> inputs = new ArrayList<>();
@@ -485,7 +496,8 @@ public class ClinicalWorkflowService {
             updates.add(new RecordingMapper.RoleUpdate(candidates.get(index).id(), assignment.role(),
                     assignment.source(), assignment.confidence(), route.name()));
         }
-        roleReclassificationStore.apply(visitId, doctorId, prepared, updates);
+        roleReclassificationStore.apply(visit.id(), doctorId, updates, route);
+        invalidateClinicalExtraction(visit.id());
         return transcript(visitId, doctorId);
     }
 
@@ -986,17 +998,6 @@ public class ClinicalWorkflowService {
 
     private String queueProvider(String provider) {
         return "DASHSCOPE".equals(provider) ? AsrJobWorker.PUBLIC_ROLE_ROUTE : provider;
-    }
-
-    private String normalizeAsrProvider(String provider) {
-        if (provider == null || provider.isBlank()) return "DASHSCOPE";
-        if ("LOCAL".equalsIgnoreCase(provider)) return "LOCAL";
-        if ("DASHSCOPE".equalsIgnoreCase(provider) || AsrJobWorker.PUBLIC_ROLE_ROUTE.equalsIgnoreCase(provider)) return "DASHSCOPE";
-        throw new BusinessException(HttpStatus.BAD_REQUEST, "ASR_ROUTE_UNKNOWN", "不支持的 ASR 路由");
-    }
-
-    private String resolveAsrProvider(Visit visit, String provider) {
-        return AsrRoutePolicy.resolve(visit, visits, provider);
     }
 
     private String displayProvider(String providerRoute) {

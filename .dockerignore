@@ -8,12 +8,5 @@
 !offline_asr_structure.py
 !热词列表
 !ai_service
-!backend
-backend/**
-!backend/src
-!backend/src/main
-!backend/src/main/resources
-!backend/src/main/resources/ai
-!backend/src/main/resources/ai/role-assignment.json
 !docker-models
 ai_service/__pycache__

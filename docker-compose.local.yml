@@ -4,9 +4,7 @@ services:
   api:
     environment:
       MINIO_API_ENDPOINT: http://minio:9000
-      # 本地 ASR 接诊会继续走本地角色判断和本地信息提取；公网接诊仍按公网链路处理。
-      INTERNAL_AI_SERVICE_BASE_URL: ${INTERNAL_AI_SERVICE_BASE_URL:-http://ai:8000}
-      LOCAL_ASR_BASE_URL: ${LOCAL_ASR_BASE_URL:-http://ai:8000}
+      # 本地 ASR 只负责转写；角色识别统一汇入公网 LLM，因此公网凭据仍需通过环境变量提供。
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
   ai:
     environment:

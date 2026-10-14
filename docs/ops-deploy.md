@@ -27,7 +27,7 @@ mouyu/medicalai:backend-latest       （业务 API 容器 "api"，独立构建�
 mouyu/medicalai:frontend-latest      （前端容器 "frontend"，独立构建）
 ```
 
-三个容器的关系：浏览器访问 frontend，frontend 把 `/api` 反向代理给 backend。公网接诊的 ASR、角色判断和信息提取直接调用 DashScope；本地接诊分别通过 `LOCAL_ASR_BASE_URL` 调用本地 ASR，通过 `INTERNAL_AI_SERVICE_BASE_URL` 调用本地文本 AI 网关。网关再通过 `LLM_API_BASE` 访问独立部署的本地 LLM。两个本地地址可以相同，也可以分别部署。backend 还依赖 Postgres 和 MinIO；病历由已确认的可追溯提取结果组装。
+三个容器的关系：浏览器访问 frontend，frontend 把 `/api` 反向代理给 backend，backend 通过 `AI_SERVICE_BASE_URL=http://ai:8000` 调用 AI 服务完成录音转写和病历生成。backend 还依赖外部 Postgres 和 MinIO 存储录音文件。
 
 ## 内置模型（拉取即用，无需下载）
 
@@ -65,14 +65,10 @@ mouyu/medicalai:frontend-latest      （前端容器 "frontend"，独立构建�
    MINIO_ACCESS_KEY=xxx
    MINIO_SECRET_KEY=xxx
    DASHSCOPE_API_KEY=xxx          # 长录音异步转写用
-   # 本地 ASR 与文本网关可独立部署；公网接诊不会使用这些模型地址
-   LOCAL_ASR_BASE_URL=http://ai:8000
-   INTERNAL_AI_SERVICE_BASE_URL=http://ai:8000
-   # 以下配置传给 ai 容器，指向另行部署的本地 OpenAI 兼容 LLM
-   LLM_API_BASE=http://local-llm:8080/v1
-   LLM_API_KEY=                  # 未启用鉴权时留空
-   LLM_MODEL=your-local-model
-   EXTRACTION_LLM_MODEL=         # 留空使用 LLM_MODEL
+   # 可选：直连自建大模型服务时配置；不配则走 DashScope qwen-plus
+   # LLM_API_BASE=
+   # LLM_API_KEY=
+   # LLM_MODEL=
    ```
 
 3. 根据实际环境修改 `docker-compose.yml` 中的 `DB_URL`（Postgres 地址）和 `MINIO_API_ENDPOINT`（MinIO 地址）。
@@ -80,10 +76,10 @@ mouyu/medicalai:frontend-latest      （前端容器 "frontend"，独立构建�
 4. 启动：
 
    ```bash
-   docker compose --profile local-ai up -d --build
+   docker compose up -d
    ```
 
-   本次路由改造需要重建 API、前端和 AI 网关。`local-ai` profile 启动内置 ASR/网关容器；如果两类本地服务均已独立部署，配置好地址后只启动 API 和前端即可。仅使用公网时不需要本地模型服务。
+   compose 已为三个服务配置了 `image:` 字段：镜像存在时直接使用，不存在时自动拉取；开发者需要本地构建时加 `--build` 即可。
 
 5. 验证：
 
@@ -153,11 +149,3 @@ docker push mouyu/medicalai:local_ai-latest
 ```
 
 `ASR_MODEL`、`ASR_HUB` 环境变量仍然有效：显式设置 `ASR_MODEL` 可覆盖内置模型路径，用于灰度测试新模型。
-
-## 升级来源路由与恢复保护
-
-升级时先停止旧 API/ASR worker，再备份数据库并应用 `schema.sql` 中的 `processing_route`、`recovery_route` 兼容迁移，最后启动新版本。检查遗留 `PENDING/RUNNING` ASR 任务是否与接诊锁定来源一致；新 worker 会在任何模型调用前拒绝冲突任务。已由旧 worker 发出的公网请求无法撤回，因此切勿让旧、新 worker 同时执行任务。
-
-历史混合/未知接诊需医生在工作台确认整份恢复。恢复保留原始音频，但会清理未签署派生草稿；任何签署历史都会阻止该操作。失败恢复沿用 `recovery_route` 普通重试，不再次清理。
-
-角色提示词资源随 Java 和本地 AI 镜像共同发布；构建 AI 镜像时需使用仓库根目录上下文，根 `.dockerignore` 已为唯一提示词资源开放白名单。

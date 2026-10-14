@@ -102,11 +102,10 @@ public class AiServiceClient {
             for (Object value : items) {
                 if (!(value instanceof Map<?, ?> item)) return fallback;
                 Integer index = integer(item.get("index"));
-                String role = String.valueOf(item.get("role")).strip().toUpperCase(java.util.Locale.ROOT);
+                String role = normalizeRole(String.valueOf(item.get("role")));
                 Integer confidence = integer(item.get("confidence"));
                 String source = String.valueOf(item.get("source")).strip().toUpperCase(java.util.Locale.ROOT);
-                if (index == null || !fallback.containsKey(index) || !java.util.Set.of("DOCTOR", "PATIENT", "OTHER").contains(role)
-                        || confidence == null || confidence < 0 || confidence > 100
+                if (index == null || !fallback.containsKey(index) || confidence == null || confidence < 0 || confidence > 100
                         || !"LLM".equals(source) || result.put(index,
                         new DashScopeRoleClient.RoleAssignment(role, confidence, source)) != null) {
                     return fallback;

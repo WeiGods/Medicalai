@@ -41,8 +41,6 @@ export interface Visit {
   version: number
   created_at: string
   last_activity_at: string
-  processing_route: AsrProvider | null
-  recovery_route?: AsrProvider | null
 }
 
 export type DemoRole = 'DOCTOR' | 'DEPARTMENT_HEAD'
@@ -110,6 +108,8 @@ export interface Transcript {
   source_route: 'DASHSCOPE' | 'LOCAL' | 'MIXED' | 'UNKNOWN' | string
   available_routes: LlmProvider[]
   route_selection_required: boolean
+  /** 后端默认的角色识别 LLM 路由；未下发时前端跟随后端默认。 */
+  default_route?: LlmProvider
 }
 
 export interface ClinicalEvidence {
@@ -140,6 +140,8 @@ export interface ClinicalExtraction {
   source_route: 'DASHSCOPE' | 'LOCAL' | 'MIXED' | 'UNKNOWN' | string
   available_routes: LlmProvider[]
   route_selection_required: boolean
+  /** 后端默认的信息提取 LLM 路由；未下发时前端跟随后端默认。 */
+  default_route?: LlmProvider
 }
 
 export type AsrProvider = 'DASHSCOPE' | 'LOCAL'

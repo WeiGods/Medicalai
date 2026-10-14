@@ -15,8 +15,7 @@ public class VisitMapper {
             rs.getString("patient_name_snapshot"),rs.getString("patient_gender_snapshot"),
             rs.getObject("patient_age_snapshot",Integer.class),rs.getString("doctor_name_snapshot"),
             rs.getString("chief_complaint"),rs.getInt("version"),DatabaseDateTime.getInstant(rs,"started_at"),
-            DatabaseDateTime.getInstant(rs,"completed_at"),DatabaseDateTime.getInstant(rs,"created_at"),
-            rs.getString("processing_route"), rs.getString("recovery_route"));
+            DatabaseDateTime.getInstant(rs,"completed_at"),DatabaseDateTime.getInstant(rs,"created_at"));
     private final JdbcTemplate jdbc;
 
     public VisitMapper(JdbcTemplate jdbc) { this.jdbc=jdbc; }
@@ -113,51 +112,6 @@ public class VisitMapper {
                   updated_at=medicalai_local_now(),updated_by=?,version=version+1
                 WHERE id=? AND doctor_id=? RETURNING *
                 """,ROW,status,status,status,status,doctorId,id,doctorId);
-    }
-
-    /** Locks the first successful ASR source for the whole encounter. Caller must hold the visit row lock. */
-    public boolean lockProcessingRoute(UUID visitId, String route) {
-        String normalized = normalizeRoute(route);
-        if (!Set.of("DASHSCOPE", "LOCAL").contains(normalized == null ? "" : normalized)) {
-            throw new IllegalArgumentException("不支持的接诊处理路由");
-        }
-        return jdbc.update("""
-                UPDATE visit SET processing_route=?,recovery_route=NULL,updated_at=medicalai_local_now()
-                WHERE id=? AND (processing_route IS NULL OR processing_route=?)
-                  AND (recovery_route IS NULL OR recovery_route=?)
-                """, normalized, visitId, normalized, normalized) == 1;
-    }
-
-    public void setRecoveryRoute(UUID visitId, String route) {
-        jdbc.update("UPDATE visit SET recovery_route=?,updated_at=medicalai_local_now() WHERE id=?", route, visitId);
-    }
-
-    /** Best-effort source inference for visits created before processing_route existed. */
-    public String historicalProcessingRoute(UUID visitId) {
-        List<String> values = jdbc.query("""
-                SELECT DISTINCT r.asr_route FROM recording r
-                WHERE r.visit_id=? AND (r.status='DONE' OR EXISTS (
-                    SELECT 1 FROM asr_utterance u WHERE u.recording_id=r.id AND u.result_type='CANONICAL'))
-                """, (rs, n) -> normalizeRoute(rs.getString("asr_route")), visitId);
-        values = values.stream().map(value -> value == null ? "" : value).distinct().toList();
-        if (values.isEmpty()) return null;
-        // Historical public rows may have no route column; preserve the old public behavior.
-        if (values.stream().allMatch(value -> value.isBlank() || "DASHSCOPE".equals(value))) {
-            return "DASHSCOPE";
-        }
-        if (values.size() == 1 && "LOCAL".equals(values.getFirst())) {
-            return "LOCAL";
-        }
-        return "UNKNOWN";
-    }
-
-    private String normalizeRoute(String route) {
-        if (route == null || route.isBlank()) return null;
-        return switch (route.strip().toUpperCase(Locale.ROOT)) {
-            case "DASHSCOPE", "DASHSCOPE_ROLE_V2" -> "DASHSCOPE";
-            case "LOCAL" -> "LOCAL";
-            default -> "UNKNOWN";
-        };
     }
 
     /** 按外键安全顺序删除一次已取消接诊的全部持久化产物。 */

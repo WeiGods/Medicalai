@@ -32,21 +32,39 @@ medicalai:
     # 鉴权模式；DEMO 表示演示登录
     mode: ${AUTH_MODE:DEMO}
   llm:
-    # 历史兼容默认；正常新业务由接诊锁定的 ASR 来源决定角色/提取路由。
+    # 角色识别 LLM 路由：DASHSCOPE=公网 LLM（默认）；LOCAL=内网本地 LLM（llama.cpp）
     role-route: ${LLM_ROLE_ROUTE:DASHSCOPE}
+    # 信息提取 LLM 路由：DASHSCOPE=公网 LLM（默认）；LOCAL=内网本地 LLM（llama.cpp）
+    extraction-route: ${LLM_EXTRACTION_ROUTE:DASHSCOPE}
   local-llm:
-    # 以下开关/直连地址只控制独立 streamChat 和旧嵌入式适配器；医疗角色判断使用 internal-ai 网关。
-    enabled: ${LOCAL_LLM_ENABLED:false}
-    # 独立流式对话的本地 LLM 地址，不用于医疗角色判断
+    # 是否启用内网本地 LLM（llama.cpp / OpenAI 兼容）通信适配器；默认关闭，开启后仅作为
+    # 角色识别 LOCAL 路由使用，绝不把内网内容改送公网
+    enabled: ${LOCAL_LLM_ENABLED:true}
+    # 内网本地 LLM 服务地址
     endpoint: ${LOCAL_LLM_ENDPOINT:http://192.168.1.56:8080}
     # 本地 LLM 的 API 密钥；llama.cpp 未启用鉴权时留空（留空则不发送 Authorization 头）
     api-key: ${LOCAL_LLM_API_KEY:}
-    # 独立流式对话模型 ID；网关模型由 ai 容器的 LLM_MODEL 配置
+    # 本地角色识别模型 ID
     role-model: ${LOCAL_LLM_ROLE_MODEL:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}
     # 本地 LLM 角色置信度低于该值时要求医生人工复核
     role-review-threshold: ${LOCAL_LLM_ROLE_REVIEW_THRESHOLD:70}
     # 每批发送给本地角色识别模型的句段数量
     role-batch-size: ${LOCAL_LLM_ROLE_BATCH_SIZE:40}
+    # 角色识别请求是否关闭本地模型思考（chat_template_kwargs.enable_thinking=false）；
+    # 角色判断只需要 JSON 结果，思考 token 会成倍拉长每批耗时，故默认关闭
+    role-disable-thinking: ${LOCAL_LLM_DISABLE_THINKING:true}
+    # 是否启用内网本地 LLM 的**信息提取**；未显式配置时跟随 medicalai.local-llm.enabled
+    # （链到属性而不是环境变量，这样用 --medicalai.local-llm.enabled=true 或 IDE VM option 开启角色识别时，
+    #   提取也会一并开启，不会出现"角色走了内网、提取还关着"的错觉）
+    extraction-enabled: ${LOCAL_LLM_EXTRACTION_ENABLED:${medicalai.local-llm.enabled:false}}
+    # 本地信息提取模型 ID
+    extraction-model: ${LOCAL_LLM_EXTRACTION_MODEL:/models/Ternary-Bonsai-2-27B-PQ2_0.gguf}
+    # 本地信息提取的最大输出 token 数（12 个字段带证据，需要足够空间）
+    extraction-max-tokens: ${LOCAL_LLM_EXTRACTION_MAX_TOKENS:4096}
+    # 等待本地信息提取的时间上限，单位毫秒；比角色识别长，因为输出更长
+    extraction-read-timeout-ms: ${LOCAL_LLM_EXTRACTION_READ_TIMEOUT_MS:180000}
+    # 信息提取请求是否关闭本地模型思考；未显式配置时跟随上面角色识别的开关
+    extraction-disable-thinking: ${LOCAL_LLM_EXTRACTION_DISABLE_THINKING:${LOCAL_LLM_DISABLE_THINKING:true}}
     # 连接本地 LLM 的超时时间，单位毫秒
     connect-timeout-ms: ${LOCAL_LLM_CONNECT_TIMEOUT_MS:5000}
     # 等待本地 LLM 普通响应的超时时间，单位毫秒
@@ -65,10 +83,8 @@ medicalai:
     # 旧属性仅为已有部署保留；新代码统一读取 internal-ai，公网快照不会使用此地址。
     base-url: ${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}
   internal-ai:
-    # 内网 AI 网关地址；本地角色识别和信息提取统一经此网关调用
+    # 内网 AI 网关地址；用于本地 ASR/角色识别等本地推理服务
     base-url: ${INTERNAL_AI_SERVICE_BASE_URL:${AI_SERVICE_BASE_URL:http://192.168.1.78:8000}}
-    connect-timeout-ms: ${INTERNAL_AI_CONNECT_TIMEOUT_MS:5000}
-    read-timeout-ms: ${INTERNAL_AI_READ_TIMEOUT_MS:120000}
   minio:
     # MinIO 对象存储服务地址，用于保存录音文件
     api-endpoint: ${MINIO_API_ENDPOINT:http://106.55.225.222:9000}
@@ -102,7 +118,7 @@ medicalai:
     role-review-threshold: ${DASHSCOPE_ROLE_REVIEW_THRESHOLD:85}
     # 每批发送给角色识别模型的句段数量
     role-batch-size: ${DASHSCOPE_ROLE_BATCH_SIZE:40}
-    # 公网快照的信息提取由后端直连 DashScope；本地快照由 internal-ai 网关处理。
+    # 公网信息提取由后端直连 DashScope，不经过 internal-ai 或 127.0.0.1:8000。
     extraction-model: ${DASHSCOPE_EXTRACTION_MODEL:qwen-plus}
     # 信息提取调用公网模型的超时时间，单位毫秒
     extraction-timeout-ms: ${DASHSCOPE_EXTRACTION_TIMEOUT_MS:${DASHSCOPE_READ_TIMEOUT_MS:60000}}
