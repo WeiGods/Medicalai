@@ -55,6 +55,9 @@ DEFAULT_PUNC_MODEL = (
     "punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
 )
 
+# strict json_schema 撞上服务端语法采样缺陷时的降级格式：不注入 Schema，字段完整性仍由调用方校验。
+JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
+
 
 def _env(name, default=None):
     value = os.environ.get(name)
@@ -819,6 +822,28 @@ def _json_content(content):
     return parsed
 
 
+async def _post_chat_completion_with_schema_degrade(post, payload):
+    """发送一次 chat/completions；strict json_schema 遇服务端 5xx 时改用 json_object 重发一次。
+
+    `.56` 的 llama.cpp（`b10772`）在 strict `json_schema` 叠加上关思考时会因语法采样器缺陷返回 5xx
+    （`got exception: Unexpected empty grammar stack after accepting piece: / (14)`）；温度 0 下同一报文
+    必然复现（前缀命中缓存时 0.16s 即失败），因此原样重试没有意义。`json_object` 不注入 Schema，
+    可绕开该缺陷，字段完整性仍由调用方校验（提取路径照旧检查 12 个标准字段）。
+
+    :param post: 接收 payload、返回 httpx.Response 的异步函数
+    :return: `(response, degraded)`，`degraded=True` 表示最终这次请求用的是 json_object
+    """
+    response = await post(payload)
+    if response.status_code < 500:
+        return response, False
+    degraded_payload = dict(payload)
+    degraded_payload["response_format"] = dict(JSON_OBJECT_RESPONSE_FORMAT)
+    logger.warning(
+        "内网 LLM 结构化语法降级: model=%s, httpStatus=%d, 改用 response_format=json_object 重试",
+        payload.get("model"), response.status_code)
+    return await post(degraded_payload), True
+
+
 async def llm_extract_clinical_facts(turns, snapshot_hash):
     if not settings.llm_api_base:
         raise HTTPException(status_code=503, detail="未配置结构化信息提取模型")
@@ -840,13 +865,18 @@ async def llm_extract_clinical_facts(turns, snapshot_hash):
     headers = {}
     if settings.llm_api_key:
         headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+    degraded = False
     try:
-        async with httpx.AsyncClient(timeout=settings.extraction_timeout_s) as client:
-            response = await client.post(settings.llm_api_base.rstrip("/") + "/chat/completions",
-                                         json=payload, headers=headers)
-            response.raise_for_status()
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
+        url = settings.llm_api_base.rstrip("/") + "/chat/completions"
+
+        async def post(request_payload):
+            async with httpx.AsyncClient(timeout=settings.extraction_timeout_s) as client:
+                return await client.post(url, json=request_payload, headers=headers)
+
+        response, degraded = await _post_chat_completion_with_schema_degrade(post, payload)
+        response.raise_for_status()
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
     except HTTPException:
         raise
     except Exception as error:
@@ -861,8 +891,9 @@ async def llm_extract_clinical_facts(turns, snapshot_hash):
     usage = body.get("usage") if isinstance(body, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
     populated = sum(value is not None for value in fields.values())
-    logger.info("内网信息提取 LLM 响应: route=LOCAL, model=%s, snapshotHash=%s, httpStatus=%d, fields=%d, promptTokens=%s, completionTokens=%s, totalTokens=%s, elapsedMs=%d",
-                settings.extraction_model, str(snapshot_hash)[:12], response.status_code, populated,
+    logger.info("内网信息提取 LLM 响应: route=LOCAL, model=%s, snapshotHash=%s, responseFormat=%s, httpStatus=%d, fields=%d, promptTokens=%s, completionTokens=%s, totalTokens=%s, elapsedMs=%d",
+                settings.extraction_model, str(snapshot_hash)[:12],
+                "json_object" if degraded else "json_schema", response.status_code, populated,
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0),
                 int((time.perf_counter() - started_at) * 1000))
     return extracted
@@ -927,35 +958,39 @@ async def assign_roles(body: dict):
               "只能根据该句原文和上下文判断，禁止根据 speaker_id、序号或发言顺序猜测；不确定返回 OTHER。\n"
               + json.dumps(turns, ensure_ascii=False))
     try:
-        async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
-            response = await client.post(
-                settings.llm_api_base.rstrip("/") + "/chat/completions",
-                json={"model": settings.llm_model, "messages": [
-                    {"role": "system", "content": "你是医疗对话角色分类器，只返回 JSON。"},
-                    {"role": "user", "content": prompt}], "temperature": 0,
-                    "response_format": {"type": "json_schema", "json_schema": schema}},
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"})
-            response.raise_for_status()
-            parsed = _json_content(response.json()["choices"][0]["message"]["content"])
-            items = parsed.get("items")
-            if not isinstance(items, list) or len(items) != len(indexes):
+        url = settings.llm_api_base.rstrip("/") + "/chat/completions"
+        auth = {"Authorization": f"Bearer {settings.llm_api_key}"}
+        payload = {"model": settings.llm_model, "messages": [
+            {"role": "system", "content": "你是医疗对话角色分类器，只返回 JSON。"},
+            {"role": "user", "content": prompt}], "temperature": 0,
+            "response_format": {"type": "json_schema", "json_schema": schema}}
+
+        async def post(request_payload):
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
+                return await client.post(url, json=request_payload, headers=auth)
+
+        response, _degraded = await _post_chat_completion_with_schema_degrade(post, payload)
+        response.raise_for_status()
+        parsed = _json_content(response.json()["choices"][0]["message"]["content"])
+        items = parsed.get("items")
+        if not isinstance(items, list) or len(items) != len(indexes):
+            return {"items": fallback}
+        result = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
                 return {"items": fallback}
-            result = []
-            seen = set()
-            for item in items:
-                if not isinstance(item, dict):
-                    return {"items": fallback}
-                index = item.get("index")
-                role = item.get("role")
-                confidence = item.get("confidence")
-                if (not isinstance(index, int) or index not in indexes or index in seen
-                        or role not in {"DOCTOR", "PATIENT", "OTHER"}
-                        or not isinstance(confidence, int) or not 0 <= confidence <= 100
-                        or item.get("source") != "LLM"):
-                    return {"items": fallback}
-                seen.add(index)
-                result.append({"index": index, "role": role, "confidence": confidence, "source": "LLM"})
-            return {"items": result if seen == set(indexes) else fallback}
+            index = item.get("index")
+            role = item.get("role")
+            confidence = item.get("confidence")
+            if (not isinstance(index, int) or index not in indexes or index in seen
+                    or role not in {"DOCTOR", "PATIENT", "OTHER"}
+                    or not isinstance(confidence, int) or not 0 <= confidence <= 100
+                    or item.get("source") != "LLM"):
+                return {"items": fallback}
+            seen.add(index)
+            result.append({"index": index, "role": role, "confidence": confidence, "source": "LLM"})
+        return {"items": result if seen == set(indexes) else fallback}
     except Exception as error:
         logger.warning("Internal role assignment unavailable: %s", type(error).__name__)
         return {"items": fallback}
