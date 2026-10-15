@@ -6,6 +6,7 @@ import Icon from './Icon.vue'
 import TemplateManagement from './TemplateManagement.vue'
 import RecordingAudioPlayer from './RecordingAudioPlayer.vue'
 import AsrPreviewCard from './AsrPreviewCard.vue'
+import ClinicalSummaryCard from './ClinicalSummaryCard.vue'
 import { formatDateTime } from '../dateTime'
 import { roleLabel } from '../asrRoles'
 import { showMessage, type MessageType } from '../message'
@@ -63,12 +64,20 @@ const asrProvider = ref<AsrProvider>('DASHSCOPE')
 const roleProvider = ref<LlmProvider | null>(null)
 const activeAsrProvider = ref<AsrProvider | null>(null)
 const recordings = ref<Recording[]>([])
+// 接诊级批量转写入口只显示一次，放在最后一段待处理录音的卡片内。
+const transcriptionActionRecordingId = computed(() => recordings.value
+  .filter(item => item.status === 'UPLOADED' || item.status === 'FAILED').at(-1)?.id)
 const asrPreviews = ref<AsrPreviewRecording[]>([])
 const asrPreviewError = ref('')
 const recordingToDelete = ref<Recording | null>(null)
 const recordingToRetranscribe = ref<Recording | null>(null)
 const transcript = ref<Transcript | null>(null)
 const extraction = ref<ClinicalExtraction | null>(null)
+const extractionRequestBusy = ref(false)
+const extractionError = ref('')
+let extractionPollTimer: number | undefined
+let extractionPollRevision = 0
+let extractionRequestRevision = 0
 const record = ref<MedicalRecord | null>(null)
 const recordForm = ref<MedicalRecordContent | null>(null)
 const confirmations = ref<Confirmation[]>([])
@@ -600,7 +609,7 @@ const segments = computed(() => {
 })
 const roleReviewCount = computed(() => transcript.value?.turns.filter(turn => turn.role_review_required).length || 0)
 const unclassifiedRoleCount = computed(() => transcript.value?.turns.filter(turn =>
-  turn.role_source === 'AUTO' || turn.role_source === 'UNKNOWN').length || 0)
+  turn.role_source === 'AUTO' || turn.role_source === 'UNKNOWN' || turn.role_source === 'FALLBACK').length || 0)
 const extractionFieldLabels: Record<string, string> = {
   chief_complaint: '主诉', onset_course: '起病与病程', symptom_characteristics: '症状特征',
   associated_symptoms: '伴随症状', past_medical_history: '既往史', medication_history: '用药史',
@@ -614,8 +623,55 @@ const extractionConfirmed = computed(() => extraction.value?.status === 'CONFIRM
   && extraction.value.snapshot_id === transcript.value?.snapshot_id
   && extraction.value.snapshot_hash === transcript.value?.snapshot_hash)
 const extractionStatusText = computed(() => ({
-  PENDING: '待生成', GENERATED: '待整体确认', CONFIRMED: '已整体确认', FAILED: '需修正转写', STALE: '转写已更新'
+  PENDING: '待生成', QUEUED: '等待提取', RUNNING: '正在提取', GENERATED: '待整体确认', CONFIRMED: '已整体确认', FAILED: '提取失败', STALE: '转写已更新'
 })[extraction.value?.status || 'PENDING'] || extraction.value?.status || '待生成')
+const extractionRunning = computed(() => extractionRequestBusy.value || ['QUEUED', 'RUNNING'].includes(extraction.value?.status || ''))
+
+function clearExtractionPolling() {
+  extractionPollRevision += 1
+  if (extractionPollTimer !== undefined) window.clearTimeout(extractionPollTimer)
+  extractionPollTimer = undefined
+}
+
+watch(() => [currentVisit.value?.id, transcript.value?.snapshot_id, transcript.value?.snapshot_hash,
+  extraction.value?.status, allTranscribed.value] as const, () => {
+  clearExtractionPolling()
+  const visitId = currentVisit.value?.id
+  const snapshotId = transcript.value?.snapshot_id
+  const snapshotHash = transcript.value?.snapshot_hash
+  if (!visitId || !snapshotId || !allTranscribed.value || !['QUEUED', 'RUNNING'].includes(extraction.value?.status || '')) return
+  const revision = extractionPollRevision
+  const poll = async () => {
+    try {
+      const state = await api.clinicalExtraction(visitId)
+      if (revision !== extractionPollRevision || currentVisit.value?.id !== visitId
+        || transcript.value?.snapshot_id !== snapshotId || transcript.value?.snapshot_hash !== snapshotHash) return
+      extractionError.value = ''
+      if (state.snapshot_id === snapshotId && state.snapshot_hash === snapshotHash) extraction.value = state
+    } catch {
+      if (revision === extractionPollRevision) extractionError.value = '提取进度暂时无法获取，正在重新连接。'
+    }
+    if (revision === extractionPollRevision && ['QUEUED', 'RUNNING'].includes(extraction.value?.status || '')) {
+      extractionPollTimer = window.setTimeout(poll, 2000)
+    }
+  }
+  extractionPollTimer = window.setTimeout(poll, 1500)
+})
+
+async function refreshExtractionForTranscript(visitId: string) {
+  const snapshotId = transcript.value?.snapshot_id
+  const revision = ++extractionRequestRevision
+  extractionRequestBusy.value = false
+  extraction.value = null
+  extractionError.value = ''
+  try {
+    const state = await api.clinicalExtraction(visitId)
+    if (revision === extractionRequestRevision && currentVisit.value?.id === visitId
+      && transcript.value?.snapshot_id === snapshotId) extraction.value = state
+  } catch {
+    if (revision === extractionRequestRevision && currentVisit.value?.id === visitId) extractionError.value = '提取状态加载失败，请重试。'
+  }
+}
 
 const statusText = (visit: Visit | null) => {
   if (!visit) return '待接诊'
@@ -658,6 +714,35 @@ const recordingTimeLabel = computed(() => formatRecordingDuration(recordingElaps
 
 function toast(text: string, type: MessageType = 'info') {
   showMessage(text, type)
+}
+
+/**
+ * 导航被处理中的转写任务阻塞时，说明当前真实阶段。
+ * ASR 原文预览会在角色 LLM 判断开始前先落库，因此“处理中 + 已有预览句段”
+ * 可以和“仍在等待 ASR 原文”区分开来。
+ */
+function transcriptionProgressMessage() {
+  const processingPreviews = asrPreviews.value.filter(preview => preview.status === 'PROCESSING')
+  const roleInferenceInProgress = processingPreviews.some(preview => Array.isArray(preview.segments) && preview.segments.length > 0)
+  if (roleInferenceInProgress) {
+    return '音频转写已完成，AI 正在识别医患角色，完成后即可进入下一步。'
+  }
+
+  const recordingProcessing = recordings.value.some(recording => recording.status === 'PROCESSING')
+  const activeJob = activeAsrJob?.status === 'PENDING' || activeAsrJob?.status === 'RUNNING'
+  if (actionBusy.value === 'transcribe' || recordingProcessing || processingPreviews.length > 0 || activeJob) {
+    return '正在转写音频，请稍候。'
+  }
+  return null
+}
+
+function recordingStatusLabel(recording: Recording) {
+  if (recording.status === 'PROCESSING') {
+    const preview = asrPreviews.value.find(item => item.recording_id === recording.id)
+    if (preview?.status === 'PROCESSING' && Array.isArray(preview.segments) && preview.segments.length > 0) return '角色判断中'
+  }
+  return ({ UPLOADED: '待转写', PROCESSING: '转写中', DONE: '已转写', FAILED: '转写失败' })[recording.status]
+    || recording.status
 }
 
 function addLog(text: string) {
@@ -795,6 +880,10 @@ function syncAsrPreviewPolling(visitId: string, revision: number, recordingList:
 function clearVisitArtifacts() {
   visitStateRevision += 1
   clearAsrPreviewPolling()
+  clearExtractionPolling()
+  extractionRequestRevision += 1
+  extractionRequestBusy.value = false
+  extractionError.value = ''
   recordings.value = []
   asrPreviews.value = []
   asrPreviewError.value = ''
@@ -1038,7 +1127,7 @@ function navigate(next: MainView) {
     if (sameStep || reviewingSignedRecord || returningToAudio) view.value = requested
     else {
       view.value = current
-      toast('请按当前接诊流程完成本步骤后再继续。')
+      toast(transcriptionProgressMessage() || '请按当前接诊流程完成本步骤后再继续。')
     }
     }
   }
@@ -1370,6 +1459,11 @@ watch(() => currentVisit.value?.id, (visitId, previousVisitId) => {
   roleProvider.value = null
   activeAsrProvider.value = null
   if (previousVisitId && visitId !== previousVisitId) {
+    clearExtractionPolling()
+    extractionRequestRevision += 1
+    extractionRequestBusy.value = false
+    extractionError.value = ''
+    extraction.value = null
     clearAsrPreviewPolling()
     asrPreviews.value = []
     asrPreviewError.value = ''
@@ -1408,7 +1502,11 @@ async function startTranscription() {
         transcriptDraft.value = state.transcript?.transcript || ''
         addLog('完成真实 ASR 转写')
         navigate('transcript')
-        toast('转写完成，请核对文本并生成病历。')
+        toast(unclassifiedRoleCount.value
+          ? '转写完成，角色判断完成后将自动开始信息提取。'
+          : roleReviewCount.value
+            ? `转写完成，信息提取已自动开始，另有 ${roleReviewCount.value} 条角色建议核对。`
+            : '转写完成，主诉与病情信息已自动开始提取。')
         return
       }
       if (state.status === 'FAILED') throw new Error(state.error_message || '转写失败')
@@ -1435,9 +1533,10 @@ async function saveTranscript() {
     const updated = await api.saveTranscript(currentVisit.value.id, transcriptDraft.value.trim())
     transcript.value = updated
     transcriptDraft.value = updated.transcript
+    await refreshExtractionForTranscript(currentVisit.value.id)
     addLog('保存采用的转写文本')
     navigate('transcript')
-    toast('转写文本已保存，可生成病历。')
+    toast('转写文本已保存，当前提取已失效，请手动重新提取。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '保存转写失败', 'error')
   } finally {
@@ -1472,8 +1571,9 @@ async function saveUtteranceRole(turn: Utterance | undefined, role: EditableUtte
     const updated = await api.updateUtteranceRole(currentVisit.value.id, turn.id, role)
     transcript.value = updated
     transcriptDraft.value = updated.transcript
+    await refreshExtractionForTranscript(currentVisit.value.id)
     addLog('人工修订句段说话角色')
-    toast('角色已人工确认，请重新生成并确认病历。')
+    toast('角色已人工确认，当前提取已失效，请手动重新提取。')
   } catch (error) {
     toast(error instanceof Error ? error.message : '角色更新失败', 'error')
   } finally {
@@ -1494,8 +1594,9 @@ async function reclassifyTranscriptRoles() {
     const updated = await api.reclassifyTranscriptRoles(currentVisit.value.id)
     transcript.value = updated
     transcriptDraft.value = updated.transcript
+    await refreshExtractionForTranscript(currentVisit.value.id)
     addLog('使用 AI 重新判断未人工确认的句段角色')
-    toast('AI 角色判断已更新，请继续核对待人工确认的句段。')
+    toast('AI 角色判断已更新，信息提取已自动开始；请继续核对待人工确认的句段。')
   } catch (error) {
     toast(error instanceof Error ? error.message : 'AI 角色判断失败', 'error')
   } finally {
@@ -1770,21 +1871,31 @@ function stopRecording() {
 }
 
 async function generateClinicalExtraction() {
-  if (!currentVisit.value || locked.value) return
-  actionBusy.value = 'extract'
+  if (!currentVisit.value || locked.value || extractionRunning.value) return
+  const visitId = currentVisit.value.id
+  const snapshotId = transcript.value?.snapshot_id
+  const snapshotHash = transcript.value?.snapshot_hash
+  const revision = ++extractionRequestRevision
+  extractionRequestBusy.value = true
+  extractionError.value = ''
   try {
-    extraction.value = await api.generateClinicalExtraction(currentVisit.value.id)
-    transcriptTab.value = 'facts'
+    const result = await api.generateClinicalExtraction(visitId)
+    if (revision !== extractionRequestRevision || currentVisit.value?.id !== visitId
+      || transcript.value?.snapshot_id !== snapshotId || transcript.value?.snapshot_hash !== snapshotHash) return
+    extraction.value = result
     if (extraction.value?.status === 'GENERATED') {
       addLog('生成可追溯信息提取结果')
       toast('信息提取已生成，请核对原文证据后整体确认。')
-    } else {
+    } else if (!['QUEUED', 'RUNNING'].includes(result.status)) {
       toast(extraction.value?.quality_issues[0] || '请先在全文编辑中修正转写。', 'error')
     }
   } catch (error) {
-    toast(error instanceof Error ? error.message : '信息提取失败', 'error')
+    if (revision === extractionRequestRevision && currentVisit.value?.id === visitId) {
+      extractionError.value = error instanceof Error ? error.message : '信息提取失败'
+      toast(extractionError.value, 'error')
+    }
   } finally {
-    actionBusy.value = ''
+    if (revision === extractionRequestRevision) extractionRequestBusy.value = false
   }
 }
 
@@ -2230,6 +2341,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  clearExtractionPolling()
+  extractionRequestRevision += 1
   stopAudio()
   stopRecorder()
   resetRecordingTimer()
@@ -2245,7 +2358,7 @@ defineExpose({ selectPatient })
 </script>
 
 <template>
-  <div class="shell">
+  <div class="shell" :class="{ 'transcript-shell': view === 'transcript' }">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark"><Icon name="pulse" /></div>
@@ -2498,7 +2611,7 @@ defineExpose({ selectPatient })
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name" :title="item.file_name || ''">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
-                  <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
+                  <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ recordingStatusLabel(item) }}</span>
                   <button v-if="active && !locked && item.status === 'DONE'" class="btn small" :aria-label="`重新转写 ${item.file_name}`" @click="requestRetranscribeRecording(item)"><Icon name="refresh" />重新转写</button>
                   <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
@@ -2550,8 +2663,8 @@ defineExpose({ selectPatient })
             <template v-if="transcriptDraft">
               <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
                 <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
-                <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
-                  <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
+                <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '角色判断尚未完成' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
+                  <p v-if="unclassifiedRoleCount">本次转写的角色判断尚未完成，完成后将自动开始信息提取；期间可继续查看转写。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。信息提取与病历流程不受影响，可逐句核对。</p>
                 </div>
              <div class="role-attention-actions"><span class="small-muted">{{ currentAiRouteDescription }} · 角色识别</span><template v-if="!readOnlyCurrentPatient"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
               </aside>
@@ -2588,7 +2701,7 @@ defineExpose({ selectPatient })
                 <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
              <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions">
                   <span class="small-muted">{{ currentAiRouteDescription }} · 信息提取</span>
-                   <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button>
+                   <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button>
                   <button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
                 </div>
               </div>
@@ -2676,6 +2789,14 @@ defineExpose({ selectPatient })
             <template v-else-if="active">
               <div v-if="readOnlyCurrentPatient" class="info-banner read-only-banner"><Icon name="lock" />当前接诊正在进行，科室长仅可查看已有录音和处理结果。</div>
               <template v-if="!readOnlyCurrentPatient">
+              <div class="ai-route-readonly audio-route-note">
+                <Icon name="shield" />
+                <div>
+                  <strong>本次接诊 AI 处理环境：{{ currentAiRouteLabel }}</strong>
+                  <span>转写、角色识别和信息提取统一使用此环境</span>
+                  <span v-if="activeAsrProvider">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</span>
+                </div>
+              </div>
               <div class="audio-source-grid">
                 <div class="upload-method">
                   <div class="method-heading"><span class="method-icon"><Icon name="upload" /></span><div><h3>上传录音文件</h3><p>支持 MP3、WAV、M4A、WEBM</p></div></div>
@@ -2715,45 +2836,43 @@ defineExpose({ selectPatient })
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
-                  <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ ({ UPLOADED:'待转写', PROCESSING:'转写中', DONE:'已转写', FAILED:'转写失败' })[item.status] || item.status }}</span>
+                  <span class="badge" :class="{ teal: item.status === 'DONE', red: item.status === 'FAILED' }">{{ recordingStatusLabel(item) }}</span>
                   <button v-if="active && !locked && item.status === 'DONE'" class="btn small" :aria-label="`重新转写 ${item.file_name}`" @click="requestRetranscribeRecording(item)"><Icon name="refresh" />重新转写</button>
                   <button v-if="active && !locked && ['UPLOADED', 'FAILED', 'DONE'].includes(item.status)" class="btn small danger" :aria-label="`删除 ${item.file_name}`" @click="requestDeleteRecording(item)"><Icon name="trash" />删除</button>
                 </div>
                 <p v-if="item.status === 'FAILED' && item.error_message" class="issue-hint">{{ item.error_message }}</p>
-                <RecordingAudioPlayer
-                  :recording="item"
-                  :active="playingId === item.id"
-                  :loading="isAudioLoading(item)"
-                  :loaded="playingId === item.id && !!audioPlaybackUrl"
-                  :playing="playingId === item.id && audioIsPlaying"
-                  :ended="playingId === item.id && audioEnded"
-                  :src="playingId === item.id ? audioPlaybackUrl : ''"
-                  :current-time="playingId === item.id ? audioCurrentTime : 0"
-                  :actual-duration="playingId === item.id ? audioMediaDuration : 0"
-                  :volume="playingId === item.id ? audioVolume : 1"
-                  :playback-rate="playingId === item.id ? audioPlaybackRate : 1"
-                  :error="playingId === item.id ? audioPlaybackError : ''"
-                  :autoplay-blocked="playingId === item.id && audioAutoplayBlocked"
-                  @toggle="playRecording(item)"
-                  @retry="retryAudio(item)"
-                  @seek="seekAudio"
-                  @volume="setAudioVolume"
-                  @rate="setAudioPlaybackRate"
-                  @audio-element="setAudioElement(item.id, $event)"
-                  @time-update="updateAudioTime"
-                  @loaded-metadata="updateAudioTime(audioCurrentTime, $event)"
-                  @playing="onAudioPlaying"
-                  @paused="onAudioPaused"
-                  @ended="onAudioEnded"
-                  @media-error="onAudioMediaError"
-                />
-              </div>
-              <div v-if="recordings.length && !readOnlyCurrentPatient" class="asr-controls">
-                 <div class="ai-route-readonly"><span class="small-muted">本次接诊 AI 处理环境：{{ currentAiRouteLabel }}</span><span class="small-muted">转写、角色识别和信息提取统一使用此环境</span></div>
-                <p v-if="activeAsrProvider" class="small-muted">最近提交任务：{{ activeAsrProvider === 'LOCAL' ? '本地 ASR' : '公网 ASR' }}</p>
-              </div>
-              <div v-if="!readOnlyCurrentPatient && recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" class="transcribe-action">
-                <button class="btn soft" :disabled="locked || !recordings.some(item => item.status === 'UPLOADED' || item.status === 'FAILED')" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(item => item.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
+                <div class="audio-playback-row">
+                  <RecordingAudioPlayer
+                    :recording="item"
+                    :active="playingId === item.id"
+                    :loading="isAudioLoading(item)"
+                    :loaded="playingId === item.id && !!audioPlaybackUrl"
+                    :playing="playingId === item.id && audioIsPlaying"
+                    :ended="playingId === item.id && audioEnded"
+                    :src="playingId === item.id ? audioPlaybackUrl : ''"
+                    :current-time="playingId === item.id ? audioCurrentTime : 0"
+                    :actual-duration="playingId === item.id ? audioMediaDuration : 0"
+                    :volume="playingId === item.id ? audioVolume : 1"
+                    :playback-rate="playingId === item.id ? audioPlaybackRate : 1"
+                    :error="playingId === item.id ? audioPlaybackError : ''"
+                    :autoplay-blocked="playingId === item.id && audioAutoplayBlocked"
+                    @toggle="playRecording(item)"
+                    @retry="retryAudio(item)"
+                    @seek="seekAudio"
+                    @volume="setAudioVolume"
+                    @rate="setAudioPlaybackRate"
+                    @audio-element="setAudioElement(item.id, $event)"
+                    @time-update="updateAudioTime"
+                    @loaded-metadata="updateAudioTime(audioCurrentTime, $event)"
+                    @playing="onAudioPlaying"
+                    @paused="onAudioPaused"
+                    @ended="onAudioEnded"
+                    @media-error="onAudioMediaError"
+                  />
+                  <div v-if="!readOnlyCurrentPatient && item.id === transcriptionActionRecordingId" class="transcribe-action">
+                    <button class="btn soft" :disabled="locked" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(recording => recording.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
+                  </div>
+                </div>
               </div>
             </template>
             <template v-else-if="completed">
@@ -2812,8 +2931,8 @@ defineExpose({ selectPatient })
           <div class="card-head"><h2><Icon name="text" />转写结果 <span v-if="allTranscribed" class="badge teal">已完成</span></h2><div class="record-header-actions"><button v-if="canReturnToAudio" class="btn small" aria-label="返回录音上传" @click="navigate('audio')"><Icon name="arrow-left" />返回录音上传</button><button class="text-btn" :disabled="!transcriptDraft" @click="copyTranscript"><Icon name="copy" /></button></div></div>
           <aside v-if="roleReviewCount" class="role-attention" :class="{ 'is-analysis': unclassifiedRoleCount }" aria-live="polite">
             <div class="role-attention-icon"><Icon :name="unclassifiedRoleCount ? 'sparkle' : 'warning'" /></div>
-            <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '完成角色识别后再生成病历' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
-              <p v-if="unclassifiedRoleCount">本次转写的医生、患者角色尚未经过 AI 分析。请先完成分析，再重点核对不确定的句段。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。请逐句确认后再生成病历。</p>
+            <div class="role-attention-copy"><div class="role-attention-title"><h3>{{ unclassifiedRoleCount ? '角色判断尚未完成' : '请核对角色判断' }}</h3><span>{{ unclassifiedRoleCount || roleReviewCount }} 条{{ unclassifiedRoleCount ? '待分析' : '待核对' }}</span></div>
+              <p v-if="unclassifiedRoleCount">本次转写的角色判断尚未完成，完成后将自动开始信息提取；期间可继续查看转写。</p><p v-else>AI 已完成初步判断，其中部分角色置信度不足或无法确认。信息提取与病历流程不受影响，可逐句核对。</p>
             </div>
             <div class="role-attention-actions"><span class="small-muted">{{ currentAiRouteDescription }} · 角色识别</span><template v-if="!readOnlyCurrentPatient"><button v-if="unclassifiedRoleCount" class="btn primary role-attention-action" :disabled="locked || !turnsMatchTranscript" @click="reclassifyTranscriptRoles"><Icon name="refresh" />{{ actionBusy === 'reclassify-roles' ? '正在 AI 判断' : '开始 AI 判断' }}</button><button v-else class="btn primary role-attention-action" :disabled="locked" @click="openRoleReview"><Icon name="list" />查看待核对句段</button></template></div>
           </aside>
@@ -2822,15 +2941,24 @@ defineExpose({ selectPatient })
             <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
             <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
           </div>
-          <div v-if="transcriptTab === 'dialogue'" ref="transcriptBody" class="transcript-body">
-            <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
-            <div v-for="(item, index) in segments" :key="item.turn?.id || index" :ref="element => setRoleReviewElement(item.turn?.id, element)" class="dialogue" :class="{ patient: item.roleCode === 'PATIENT', 'needs-review': item.turn?.role_review_required }">
-              <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
-              <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
-                <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
-                 <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="!readOnlyCurrentPatient && item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
+          <div v-if="transcriptTab === 'dialogue'" class="transcript-dialogue-layout">
+            <div ref="transcriptBody" class="transcript-body">
+              <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
+              <div v-for="(item, index) in segments" :key="item.turn?.id || index" :ref="element => setRoleReviewElement(item.turn?.id, element)" class="dialogue" :class="{ patient: item.roleCode === 'PATIENT', 'needs-review': item.turn?.role_review_required }">
+                <span class="speaker">{{ item.role === '医生' ? '医' : item.role === '患者' ? '患' : '其' }}</span>
+                <div><div class="dialogue-meta"><span>{{ item.role }}</span><span v-if="roleStatus(item.turn)" class="role-status" :class="{ review: item.turn?.role_review_required, manual: item.turn?.role_source === 'MANUAL' }">{{ roleStatus(item.turn) }}</span><time>{{ item.time }}</time></div>
+                  <p><template v-for="(piece, pieceIndex) in highlightText(item.text)" :key="pieceIndex"><mark v-if="piece.mark">{{ piece.text }}</mark><template v-else>{{ piece.text }}</template></template></p>
+                  <div v-if="item.turn?.id && turnsMatchTranscript" class="role-control"><label><span>角色</span><select :value="item.turn.role" :disabled="locked || actionBusy === 'role'" @change="updateUtteranceRole(item.turn, $event)"><option value="DOCTOR">医生</option><option value="PATIENT">患者</option><option value="OTHER">其他人</option></select></label><button v-if="!readOnlyCurrentPatient && item.turn.role_review_required" class="role-confirm" type="button" :disabled="locked || actionBusy === 'role'" @click="confirmCurrentUtteranceRole(item.turn)">确认当前角色</button></div>
+                </div>
               </div>
             </div>
+            <ClinicalSummaryCard :extraction="extraction" :snapshot-id="transcript?.snapshot_id || null"
+              :snapshot-hash="transcript?.snapshot_hash || null" :role-review-count="roleReviewCount"
+              :role-analysis-pending-count="unclassifiedRoleCount"
+              :all-transcribed="allTranscribed" :read-only="readOnlyCurrentPatient || locked"
+              :busy="extractionRequestBusy" :error="extractionError"
+              @retry="generateClinicalExtraction" @review="openRoleReview" @details="transcriptTab = 'facts'"
+              @confirm="confirmClinicalExtraction" />
           </div>
           <div v-else-if="transcriptTab === 'edit'" class="card-body">
             <label for="transcript-edit" class="transcript-note">核对转写文字；修改后需重新生成并确认病历</label>
@@ -2844,7 +2972,7 @@ defineExpose({ selectPatient })
               <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact"><div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
             </template>
             <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-             <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span class="small-muted">{{ currentAiRouteDescription }} · 信息提取</span><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="actionBusy === 'extract' || !allTranscribed" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ actionBusy === 'extract' ? '正在提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
+             <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span class="small-muted">{{ currentAiRouteDescription }} · 信息提取</span><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
           </div>
           <div class="transcript-actions"><span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
             <button v-if="!readOnlyCurrentPatient && transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>

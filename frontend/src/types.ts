@@ -158,7 +158,7 @@ export interface ClinicalFact {
 export interface ClinicalExtraction {
   extraction_id: string | null
   version_no: number
-  status: 'PENDING' | 'GENERATED' | 'CONFIRMED' | 'FAILED' | 'STALE' | string
+  status: 'PENDING' | 'QUEUED' | 'RUNNING' | 'GENERATED' | 'CONFIRMED' | 'FAILED' | 'STALE' | string
   snapshot_id: string | null
   snapshot_hash: string | null
   fields: Record<string, ClinicalFact>

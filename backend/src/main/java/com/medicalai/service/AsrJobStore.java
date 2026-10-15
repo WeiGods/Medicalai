@@ -158,6 +158,7 @@ public class AsrJobStore {
         String hash = DialogueSnapshotHasher.hash(job.visitId(), turns);
         UUID snapshotId = recordings.createSnapshot(job.visitId(), recordingId, sessionId, turns, utteranceIds, hash);
         recordings.saveTranscript(job.visitId(), snapshotId, transcriptText(turns), false);
+        recordings.enqueueClinicalExtraction(job.visitId(), snapshotId);
         LOG.info("ASR转写结果已入库：任务ID={}，接诊ID={}，快照ID={}，句段数={}",
                 job.id(), job.visitId(), snapshotId, turns.size());
     }

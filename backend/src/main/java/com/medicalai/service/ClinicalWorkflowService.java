@@ -402,7 +402,7 @@ public class ClinicalWorkflowService {
         DialogueSnapshot snapshot = recordings.latestSnapshot(visit.id()).orElseThrow(() ->
                 new BusinessException(HttpStatus.CONFLICT, "SNAPSHOT_REQUIRED", "请先完成录音转写"));
         String route = resolveVisitRouteForAnalysis(visit, requestedProvider, false);
-        return extractionService().generate(visit.id(), doctorId, snapshot, route);
+        return extractionService().request(visit.id(), doctorId, snapshot, route);
     }
 
     @Transactional

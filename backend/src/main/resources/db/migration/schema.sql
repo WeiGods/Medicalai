@@ -274,6 +274,9 @@ CREATE TABLE IF NOT EXISTS ai_job (
     lease_token uuid
 );
 
+CREATE INDEX IF NOT EXISTS ix_ai_job_clinical_extraction_queue
+    ON ai_job(provider_route,status,created_at) WHERE job_type='CLINICAL_EXTRACT';
+
 CREATE TABLE IF NOT EXISTS record_export (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     record_id uuid NOT NULL REFERENCES medical_record(id),

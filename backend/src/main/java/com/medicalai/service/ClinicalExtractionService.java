@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.medicalai.domain.DialogueSnapshot;
 import com.medicalai.exception.BusinessException;
 import com.medicalai.mapper.ClinicalExtractionMapper;
+import com.medicalai.mapper.ClinicalExtractionJobMapper;
 import com.medicalai.mapper.MedicalRecordMapper;
 import com.medicalai.mapper.RecordingMapper;
 import com.medicalai.vo.ClinicalEvidenceVO;
@@ -54,6 +55,8 @@ public class ClinicalExtractionService {
     private final int roleReviewThreshold;
     private final long maxTurnDurationMs;
     private final int maxTurnCharacters;
+    @org.springframework.beans.factory.annotation.Autowired
+    private ClinicalExtractionJobMapper jobs;
 
     @org.springframework.beans.factory.annotation.Autowired
     public ClinicalExtractionService(ClinicalExtractionMapper extractions, RecordingMapper recordings,
@@ -84,6 +87,16 @@ public class ClinicalExtractionService {
     @Transactional(readOnly = true)
     public ClinicalExtractionVO current(UUID visitId, DialogueSnapshot snapshot) {
         LlmRouting routing = clients.routing();
+        if (jobs != null) {
+            var job = jobs.current(visitId, snapshot.snapshotHash()).orElse(null);
+            if (job != null && Set.of("PENDING", "RUNNING", "FAILED").contains(job.status())) {
+                String status = "PENDING".equals(job.status()) ? "QUEUED" : job.status();
+                return new ClinicalExtractionVO(null, 0, status, snapshot.id().toString(), snapshot.snapshotHash(),
+                        Map.of(), job.error() == null ? List.of() : List.of(job.error()), null, null,
+                        job.route(), routing.sourceRoute().name(), routeNames(routing), routing.selectionRequired(),
+                        routing.sourceRoute().name());
+            }
+        }
         return extractions.current(visitId)
                 .map(version -> toVO(version, snapshot, routing))
                 .orElseGet(() -> empty(snapshot, routing));
@@ -95,10 +108,35 @@ public class ClinicalExtractionService {
     }
 
     @Transactional
+    public ClinicalExtractionVO request(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, String requestedProvider) {
+        LlmRoute route = clients.resolveRoute(requestedProvider);
+        extractions.validateSource(visitId, doctorId, snapshot.id(), snapshot.snapshotHash(), route.name());
+        var existing = extractions.current(visitId).orElse(null);
+        if (existing != null && existing.sourceSnapshotId().equals(snapshot.id())
+                && existing.sourceSnapshotHash().equals(snapshot.snapshotHash())
+                && Set.of("GENERATED", "CONFIRMED").contains(existing.status())
+                && hasChiefComplaint(fields(existing.contentJson()))) return toVO(existing, snapshot, clients.routing());
+        jobs.enqueue(visitId, snapshot.id(), route.name());
+        return current(visitId, snapshot);
+    }
+
+    @Transactional
     public ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot, String requestedProvider) {
+        return generate(visitId, doctorId, snapshot, requestedProvider, null, null);
+    }
+
+    @Transactional
+    public ClinicalExtractionVO generateForJob(UUID visitId, UUID doctorId, DialogueSnapshot snapshot,
+                                               String requestedProvider, UUID jobId, UUID token) {
+        return generate(visitId, doctorId, snapshot, requestedProvider, jobId, token);
+    }
+
+    private ClinicalExtractionVO generate(UUID visitId, UUID doctorId, DialogueSnapshot snapshot,
+                                          String requestedProvider, UUID jobId, UUID token) {
         long startedAt = System.nanoTime();
         LlmRoute route = clients.resolveRoute(requestedProvider);
         LlmRouting routing = clients.routing();
+        extractions.validateSource(visitId, doctorId, snapshot.id(), snapshot.snapshotHash(), route.name());
         LOG.info("信息提取开始: visitId={}, snapshotHash={}, route={}", visitId, shortHash(snapshot.snapshotHash()), route);
         List<SnapshotTurn> turns;
         try {
@@ -106,7 +144,7 @@ public class ClinicalExtractionService {
         } catch (BusinessException error) {
             LOG.warn("信息提取因快照无效失败: visitId={}, snapshotHash={}, route={}, code={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, error.code(), elapsedMs(startedAt));
-            return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()));
+            return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()), jobId, token);
         }
 
         List<String> issues = qualityIssues(turns);
@@ -114,7 +152,7 @@ public class ClinicalExtractionService {
             // 质量门禁不调用 LLM，避免将角色或时间信息不可信的医疗对话发送到模型。
             LOG.warn("信息提取被质量门禁拦截: visitId={}, snapshotHash={}, route={}, turns={}, issues={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, turns.size(), issues.size(), elapsedMs(startedAt));
-            return saveFailure(visitId, doctorId, snapshot, routing, route, issues);
+            return saveFailure(visitId, doctorId, snapshot, routing, route, issues, jobId, token);
         }
 
         try {
@@ -128,27 +166,27 @@ public class ClinicalExtractionService {
                         visitId, shortHash(snapshot.snapshotHash()), route, response == null ? null : response.status(),
                         elapsedMs(startedAt));
                 return saveFailure(visitId, doctorId, snapshot, routing, route,
-                        List.of("提取服务返回的快照标识无效，请重试。"));
+                        List.of("提取服务返回的快照标识无效，请重试。"), jobId, token);
             }
             Map<String, ClinicalFactVO> fields = validateFields(response.extraction(), turns);
             requireChiefComplaint(fields);
-            ClinicalExtractionMapper.Version saved = extractions.insert(visitId, snapshot.id(), snapshot.snapshotHash(),
-                    "GENERATED", json(fields), "[]", route.name(),
-                    response.model() == null ? "clinical-extraction" : response.model(), doctorId);
+            ClinicalExtractionMapper.Version saved = save(visitId, doctorId, snapshot, "GENERATED", json(fields),
+                    "[]", route.name(), response.model() == null ? "clinical-extraction" : response.model(), jobId, token);
             LOG.info("信息提取完成: visitId={}, snapshotHash={}, route={}, model={}, version={}, fields={}, evidence={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, response.model(), saved.versionNo(),
                     populatedFields(fields), evidenceCount(fields), elapsedMs(startedAt));
             return toVO(saved, snapshot, routing);
         } catch (BusinessException error) {
+            if (Set.of("SOURCE_CHANGED", "NOT_FOUND", "RECORD_CONFIRMED").contains(error.code())) throw error;
             // 模型不可用同样保存为 FAILED，前端才能展示明确原因并允许医生原地重试；绝不改走模板兜底。
             LOG.warn("信息提取失败: visitId={}, snapshotHash={}, route={}, code={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, error.code(), elapsedMs(startedAt));
-            return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()));
+            return saveFailure(visitId, doctorId, snapshot, routing, route, List.of(error.getMessage()), jobId, token);
         } catch (Exception error) {
             LOG.error("信息提取发生未预期错误: visitId={}, snapshotHash={}, route={}, exception={}, elapsedMs={}",
                     visitId, shortHash(snapshot.snapshotHash()), route, error.getClass().getSimpleName(), elapsedMs(startedAt), error);
             return saveFailure(visitId, doctorId, snapshot, routing, route,
-                    List.of("提取结果校验失败，请修改转写后重试。"));
+                    List.of("提取结果校验失败，请修改转写后重试。"), jobId, token);
         }
     }
 
@@ -188,10 +226,18 @@ public class ClinicalExtractionService {
     }
 
     private ClinicalExtractionVO saveFailure(UUID visitId, UUID doctorId, DialogueSnapshot snapshot,
-                                            LlmRouting routing, LlmRoute route, List<String> issues) {
-        ClinicalExtractionMapper.Version saved = extractions.insert(visitId, snapshot.id(), snapshot.snapshotHash(),
-                "FAILED", "{}", json(issues), route.name(), "clinical-extraction", doctorId);
+                                            LlmRouting routing, LlmRoute route, List<String> issues, UUID jobId, UUID token) {
+        ClinicalExtractionMapper.Version saved = save(visitId, doctorId, snapshot, "FAILED", "{}", json(issues),
+                route.name(), "clinical-extraction", jobId, token);
         return toVO(saved, snapshot, routing);
+    }
+
+    private ClinicalExtractionMapper.Version save(UUID visitId, UUID doctorId, DialogueSnapshot snapshot,
+            String status, String content, String issues, String route, String model, UUID jobId, UUID token) {
+        return jobId == null
+                ? extractions.insert(visitId, snapshot.id(), snapshot.snapshotHash(), status, content, issues, route, model, doctorId)
+                : extractions.insertForJob(visitId, snapshot.id(), snapshot.snapshotHash(), status, content, issues,
+                    route, model, doctorId, jobId, token);
     }
 
     private List<SnapshotTurn> snapshotTurns(DialogueSnapshot snapshot) {
@@ -235,8 +281,7 @@ public class ClinicalExtractionService {
                 issues.add(prefix + "角色为未人工确认的其他人，不能作为医疗事实来源。");
             } else if (!"MANUAL".equals(turn.roleSource())
                     && (!Set.of("DOCTOR", "PATIENT").contains(turn.role())
-                    || !"LLM".equals(turn.roleSource())
-                    || turn.roleConfidence() == null || turn.roleConfidence() < roleReviewThreshold)) {
+                    || !"LLM".equals(turn.roleSource()))) {
                 issues.add(prefix + "说话角色尚未完成可信核对。");
             }
         }

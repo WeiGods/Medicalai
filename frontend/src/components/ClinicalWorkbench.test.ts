@@ -158,6 +158,71 @@ describe('patient avatar colors', () => {
   })
 })
 
+describe('automatic clinical extraction display', () => {
+  const queued: ClinicalExtraction = { ...pendingExtraction, status: 'QUEUED', snapshot_id: 'snapshot-1', snapshot_hash: 'hash-1' }
+  const generated: ClinicalExtraction = { ...queued, status: 'GENERATED', fields: {
+    chief_complaint: { value: '头痛三天', confidence: 95, evidence: [] }
+  } }
+
+  it('places the summary alongside the dialogue inside the active transcript content area', async () => {
+    const wrapper = await mountWorkbench({ extraction: generated })
+    const layout = wrapper.get('.transcript-view > .card > .transcript-dialogue-layout')
+    expect(layout.find('.transcript-body').exists()).toBe(true)
+    expect(layout.get('.clinical-summary .clinical-summary-chief').text()).toBe('头痛三天')
+    expect(api.generateClinicalExtraction).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('polls a persisted task through completion without switching away from the dialogue', async () => {
+    vi.useFakeTimers()
+    try {
+      const wrapper = await mountWorkbench({ extraction: queued })
+      expect(wrapper.get('.clinical-summary').text()).toContain('正在提取')
+      vi.mocked(api.clinicalExtraction).mockResolvedValue(generated)
+      await vi.advanceTimersByTimeAsync(1600)
+      await flushPromises()
+      expect(wrapper.get('.clinical-summary-chief').text()).toBe('头痛三天')
+      expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
+      const calls = vi.mocked(api.clinicalExtraction).mock.calls.length
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(api.clinicalExtraction).toHaveBeenCalledTimes(calls)
+      wrapper.unmount()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('retries in place with an independent loading state and does not repeat the request', async () => {
+    let finish!: (value: ClinicalExtraction) => void
+    vi.mocked(api.generateClinicalExtraction).mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    const wrapper = await mountWorkbench({ extraction: { ...queued, status: 'FAILED', quality_issues: ['请重试'] } })
+    await wrapper.get('.clinical-summary-actions button').trigger('click')
+    expect(wrapper.get('.clinical-summary').attributes('aria-busy')).toBe('true')
+    expect(wrapper.get('.transcript-body .role-control select').attributes('disabled')).toBeUndefined()
+    expect(api.generateClinicalExtraction).toHaveBeenCalledTimes(1)
+    finish(generated)
+    await flushPromises()
+    expect(wrapper.get('.clinical-summary-chief').text()).toBe('头痛三天')
+    expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
+    wrapper.unmount()
+  })
+
+  it('ignores an in-flight extraction response after switching to another patient', async () => {
+    let finish!: (value: ClinicalExtraction) => void
+    const second = { ...patient, id: 'patient-2', name: '第二位患者' }
+    const secondVisit = { ...activeVisit, id: 'visit-2', patient_id: second.id }
+    vi.mocked(api.generateClinicalExtraction).mockImplementation(() => new Promise(resolve => { finish = resolve }))
+    const wrapper = await mountWorkbench({ patients: [patient, second], visits: [activeVisit, secondVisit],
+      extraction: { ...queued, status: 'FAILED' } })
+    await wrapper.get('.clinical-summary-actions button').trigger('click')
+    vi.mocked(api.transcript).mockResolvedValue({ ...transcript(), snapshot_id: 'snapshot-2', snapshot_hash: 'hash-2' })
+    vi.mocked(api.clinicalExtraction).mockResolvedValue(pendingExtraction)
+    await wrapper.vm.selectPatient(second.id)
+    finish(generated)
+    await flushPromises()
+    expect(wrapper.get('.clinical-summary').text()).not.toContain('头痛三天')
+    wrapper.unmount()
+  })
+})
+
 describe('supplemental recording workflow', () => {
   it('returns from transcript to audio without mutating existing data and highlights audio', async () => {
     const wrapper = await mountWorkbench()
@@ -804,6 +869,38 @@ describe('llm route selection', () => {
     await wrapper.get('.transcribe-action button').trigger('click')
 
     expect(api.transcribe).toHaveBeenCalledWith(activeVisit.id)
+  })
+
+  it('places transcription inside the pending audio card beside its player', async () => {
+    const wrapper = await mountWorkbench({
+      visit: { ...activeVisit, ai_route: 'LOCAL' },
+      recordings: [doneRecording, uploadedRecording]
+    })
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    const note = wrapper.get('.audio-route-note')
+    expect(note.text()).toContain('本次接诊 AI 处理环境：本地')
+    expect(note.text()).toContain('转写、角色识别和信息提取统一使用此环境')
+    expect(note.element.nextElementSibling?.classList.contains('audio-source-grid')).toBe(true)
+    const audioCards = wrapper.findAll('.audio-item')
+    const action = wrapper.get('.transcribe-action button')
+    expect(audioCards).toHaveLength(2)
+    expect(action.element.closest('.audio-item')).toBe(audioCards[1].element)
+    expect(action.element.closest('.audio-playback-row')).toBe(audioCards[1].get('.audio-player').element.parentElement)
+    expect(audioCards[0].find('.transcribe-action').exists()).toBe(false)
+    expect(wrapper.find('.audio-recording-layout').exists()).toBe(false)
+    expect(action.text()).toContain('开始转写')
+  })
+
+  it('keeps a single batch action inside the last pending audio card when multiple recordings need transcription', async () => {
+    const failedRecording: Recording = { ...uploadedRecording, id: 'recording-3', file_name: 'failed.wav', status: 'FAILED' }
+    const wrapper = await mountWorkbench({ recordings: [uploadedRecording, failedRecording, doneRecording] })
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    const action = wrapper.get('.transcribe-action button')
+    expect(wrapper.findAll('.transcribe-action')).toHaveLength(1)
+    expect(action.element.closest('.audio-item')).toBe(wrapper.findAll('.audio-item')[1].element)
+    expect(action.text()).toContain('重试转写')
   })
 
   it('generates extraction with the unified route and no extraction selector', async () => {

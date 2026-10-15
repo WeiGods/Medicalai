@@ -27,7 +27,15 @@ public class RecordingMapper {
             rs.getString("role_provider_route"));
 
     private final JdbcTemplate jdbc;
-    public RecordingMapper(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+    private final ClinicalExtractionJobMapper extractionJobs;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RecordingMapper(JdbcTemplate jdbc, ClinicalExtractionJobMapper extractionJobs) {
+        this.jdbc = jdbc;
+        this.extractionJobs = extractionJobs;
+    }
+
+    public RecordingMapper(JdbcTemplate jdbc) { this(jdbc, null); }
 
     public List<Recording> list(UUID visitId) {
         return jdbc.query("SELECT * FROM recording WHERE visit_id=? ORDER BY created_at,recording_no", RECORDING, visitId);
@@ -513,6 +521,14 @@ public class RecordingMapper {
                   snapshot_id=EXCLUDED.snapshot_id,transcript_text=EXCLUDED.transcript_text,
                   edited=EXCLUDED.edited,updated_at=medicalai_local_now()
                 """, visitId, snapshotId, transcript, edited);
+    }
+
+    /**
+     * 显式触发自动信息提取。保存转写本身不再隐式入队，避免全文编辑和人工角色修改
+     * 在医生尚未确认时意外调用 LLM；ASR 完成及 AI 角色重判完成时由调用方显式触发。
+     */
+    public void enqueueClinicalExtraction(UUID visitId, UUID snapshotId) {
+        if (extractionJobs != null) extractionJobs.enqueueSnapshot(visitId, snapshotId);
     }
 
     private int nextSnapshotVersion(UUID visitId) {

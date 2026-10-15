@@ -69,6 +69,8 @@ public class TranscriptRoleReclassificationStore {
                 DialogueSnapshotHasher.hash(visitId, turns), doctorId);
         recordings.saveTranscript(visitId, snapshotId, transcriptText(turns), state != null && state.edited());
         if (extractions != null) extractions.markCurrentStale(visitId);
+        // AI 角色重判完成属于自动提取触发点；医生全文编辑/人工改角色仍只保存并失效旧结果。
+        recordings.enqueueClinicalExtraction(visitId, snapshotId);
     }
 
     private List<RecordingMapper.Turn> currentTurns(UUID visitId) {
