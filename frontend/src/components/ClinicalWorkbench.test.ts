@@ -173,6 +173,32 @@ describe('automatic clinical extraction display', () => {
     wrapper.unmount()
   })
 
+  it('renders extraction facts with readable status, confidence, and evidence layers', async () => {
+    const readable: ClinicalExtraction = {
+      ...generated,
+      fields: {
+        chief_complaint: {
+          value: '头痛三天',
+          confidence: 95,
+          evidence: [{ turn_index: 0, start_ms: 1200, end_ms: 2300, role: 'PATIENT', quote: '我头痛三天了' }]
+        }
+      }
+    }
+    const wrapper = await mountWorkbench({ extraction: readable })
+
+    await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
+
+    expect(wrapper.get('.extraction-header').text()).toContain('信息提取结果')
+    expect(wrapper.find('.extraction-content .extraction-facts').exists()).toBe(true)
+    expect(wrapper.find('.extraction-actions').exists()).toBe(true)
+    const fact = wrapper.get('.extraction-fact')
+    expect(fact.get('.fact-head b').text()).toBe('主诉')
+    expect(fact.get('.confidence-pill').classes()).toContain('confidence-high')
+    expect(fact.get('.fact-evidence').text()).toContain('患者')
+    expect(fact.get('.fact-evidence').text()).toContain('我头痛三天了')
+    wrapper.unmount()
+  })
+
   it('polls a persisted task through completion without switching away from the dialogue', async () => {
     vi.useFakeTimers()
     try {
@@ -508,6 +534,18 @@ describe('recording playback', () => {
 })
 
 describe('ASR raw preview', () => {
+  it('keeps the not-started preview compact while preserving recording actions', async () => {
+    const wrapper = await mountWorkbench({ recordings: [uploadedRecording], asrPreviews: [] })
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    expect(wrapper.find('.audio-view.audio-view-active').exists()).toBe(true)
+    expect(wrapper.find('.audio-source-grid').exists()).toBe(true)
+    expect(wrapper.find('.audio-view-asr-empty').exists()).toBe(true)
+    expect(wrapper.get('.asr-preview-empty').text()).toContain('完成录音转写后，ASR 原文将在此显示')
+    expect(wrapper.find('.transcribe-action button').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
   it('loads and displays raw ASR segments on the audio page without changing canonical transcript', async () => {
     const preview: AsrPreviewRecording = {
       recording_id: doneRecording.id,
@@ -546,6 +584,29 @@ describe('ASR raw preview', () => {
 
     expect(wrapper.get('.asr-preview-card').text()).toContain('已完成原文')
     expect(wrapper.get('.asr-preview-card').text()).toContain('已完成')
+  })
+
+  it('uses the completed reading layout and opens the dialogue from the shortcut', async () => {
+    const completedVisit = { ...activeVisit, status: 'COMPLETED' as const }
+    const preview: AsrPreviewRecording = {
+      recording_id: doneRecording.id,
+      recording_no: doneRecording.recording_no,
+      file_name: doneRecording.file_name,
+      status: 'DONE',
+      segments: [{ text: '已完成原文', start_ms: 0, end_ms: 900 }]
+    }
+    const wrapper = await mountWorkbench({ visit: completedVisit, visits: [completedVisit], asrPreviews: [preview] })
+    await wrapper.get('.step:nth-child(2)').trigger('click')
+
+    expect(wrapper.find('.audio-view.audio-view-completed').exists()).toBe(true)
+    expect(wrapper.find('.audio-view-completed > .asr-preview-card').exists()).toBe(true)
+    expect(wrapper.get('.audio-view-completed .audio-card-head-actions button').text()).toContain('查看转写结果')
+    expect(wrapper.get('.asr-preview-actions button').text()).toContain('查看转写结果')
+
+    await wrapper.get('.audio-view-completed .audio-card-head-actions button').trigger('click')
+    expect(wrapper.find('.transcript-view').exists()).toBe(true)
+    expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
+    wrapper.unmount()
   })
 
   it('restores preview polling after loading a visit with an in-progress recording', async () => {
@@ -911,8 +972,12 @@ describe('llm route selection', () => {
     const wrapper = await mountWorkbench({ extraction: routedExtraction })
 
     await wrapper.get('.transcript-tabs button:nth-child(3)').trigger('click')
+    expect(wrapper.get('.transcript-tabs button:nth-child(3)').text()).toBe('信息提取结果')
+    expect(wrapper.get('.extraction-heading h3').text()).toBe('信息提取结果')
+    expect(wrapper.get('.extraction-heading p').text()).toContain('原文依据')
+    expect(wrapper.get('.extraction-action-buttons .btn').text()).toContain('生成信息提取')
     expect(wrapper.find('.extraction-actions .route-selector').exists()).toBe(false)
-    await wrapper.get('.extraction-actions > button.btn').trigger('click')
+    await wrapper.get('.extraction-action-buttons > button.btn').trigger('click')
 
     expect(api.generateClinicalExtraction).toHaveBeenCalledWith(activeVisit.id)
   })

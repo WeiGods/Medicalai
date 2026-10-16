@@ -5,6 +5,11 @@ import type { AsrPreviewRecording } from '../types'
 const props = defineProps<{
   previews: AsrPreviewRecording[]
   error?: string
+  showViewAction?: boolean
+}>()
+
+const emit = defineEmits<{
+  (event: 'view-transcript'): void
 }>()
 
 const formatTime = (milliseconds: number) => {
@@ -47,7 +52,7 @@ const emptyMessage = (preview: AsrPreviewRecording) => {
       <p v-if="props.error" class="issue-hint asr-preview-error" role="status">ASR 原文预览暂时无法加载：{{ props.error }}</p>
       <div v-if="!props.previews.length && !props.error" class="asr-preview-empty">
         <Icon name="text" />
-        <span>暂无 ASR 原文；录音开始识别后会显示在这里。</span>
+        <span>完成录音转写后，ASR 原文将在此显示</span>
       </div>
       <article v-for="preview in props.previews" :key="preview.recording_id" class="asr-preview-recording">
         <div class="asr-preview-recording-head">
@@ -66,6 +71,12 @@ const emptyMessage = (preview: AsrPreviewRecording) => {
         </div>
         <p v-else class="asr-preview-pending">{{ emptyMessage(preview) }}</p>
       </article>
+    </div>
+    <div v-if="props.showViewAction" class="asr-preview-actions">
+      <span>角色判断完成后的正式结果在转写结果页查看</span>
+      <button type="button" class="btn primary audio-view-result-btn" @click="emit('view-transcript')">
+        <Icon name="text" />查看转写结果
+      </button>
     </div>
   </section>
 </template>

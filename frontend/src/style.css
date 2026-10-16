@@ -64,6 +64,87 @@ body.modal-open{overflow:hidden}
 @keyframes modal-slide-in{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
 @media(max-width:600px){.modal-backdrop{padding:16px}.modal-dialog{width:100%;max-height:calc(100vh - 32px);border-radius:11px}.modal-dialog .modal-head{padding:18px 18px 15px}.modal-dialog .modal-body{padding:18px}.modal-dialog .modal-actions{padding:13px 18px}.modal-dialog .modal-actions .btn{flex:1}.modal-dialog .modal-actions{justify-content:stretch}}
 
+/* 阅读型转写工作区：提高正文、编辑器和信息提取结果的可读性。 */
+.transcript-tabs{min-height:48px;align-items:stretch;padding:0 22px;gap:8px;background:#fbfdfc}
+.transcript-tabs .tab{min-height:48px;padding:0 14px;border-bottom:3px solid transparent;border-radius:8px 8px 0 0;color:#5d756b;font-size:14px;font-weight:500;line-height:1.4}
+.transcript-tabs .tab:hover{background:#f0f8f4;color:#176f64}
+.transcript-tabs .tab.active{background:#e7f5ef;border-color:var(--teal);color:#126d63;font-weight:700}
+.transcript-note{margin-bottom:18px;color:#657c71;font-size:12px;line-height:1.7}
+.transcript-note svg{width:15px;height:15px;color:#548c78}
+.dialogue{gap:12px;margin-bottom:22px}
+.speaker{width:32px;height:32px;border-radius:9px;font-size:13px;font-weight:650}
+.dialogue-meta{gap:9px;margin-bottom:7px;color:#42685a;font-size:12px}
+.dialogue-meta time{font-size:11px;color:#7f9489}
+.dialogue p{font-size:15px;line-height:1.85;color:#3f5b50}
+.dialogue mark{padding:2px 4px}
+.role-status{font-size:11px;padding:2px 7px}
+.role-control{gap:8px;margin-top:10px;color:#5f776b;font-size:12px}
+.role-control select{font-size:12px;padding:5px 7px}
+.role-confirm{padding:6px 9px;font-size:12px}
+.role-attention-title h3{font-size:14px}
+.role-attention-title span{font-size:11px}
+.role-attention-copy p{font-size:12px;line-height:1.7}
+.role-attention-action{min-height:36px;padding:8px 12px;font-size:13px}
+.transcript-edit-body{display:flex;flex-direction:column;gap:12px;min-height:0}
+.transcript-edit-body .transcript-note{margin:0}
+.transcript-editor{min-height:340px;padding:16px;border:1px solid #cbdcd3;border-radius:8px;background:#fff;color:#314e42;font-size:15px;line-height:2;resize:vertical}
+.transcript-editor:focus{border-color:#4d9c85;box-shadow:0 0 0 3px #dff1e9;outline:none}
+.transcript-editor:disabled{background:#f4f8f5;color:#526c60;opacity:1}
+
+.extraction-body{padding:22px;background:#f4faf7;color:#38554a}
+.extraction-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:0 0 18px;margin-bottom:16px;border-bottom:1px solid #d8e8df}
+.extraction-heading{display:flex;align-items:flex-start;gap:11px;min-width:0}
+.extraction-heading-icon{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:10px;background:#dff1e9;color:#147d72}
+.extraction-heading-icon svg{width:18px;height:18px}
+.extraction-heading h3{font-size:17px;line-height:1.4;color:#274c3f}
+.extraction-heading p{margin-top:4px;color:#607b6d;font-size:12px;line-height:1.7}
+.extraction-status{display:flex;align-items:flex-end;flex-direction:column;gap:6px;margin:0;flex:0 0 auto}
+.extraction-status .badge{padding:5px 10px;font-size:12px;border-radius:999px}
+.extraction-status .small-muted{font-size:11px;color:#718a7d}
+.extraction-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.extraction-fact{min-width:0;padding:16px;border:1px solid #dbe9e1;border-bottom:1px solid #dbe9e1;border-radius:12px;background:#fff;box-shadow:0 3px 12px rgba(36,80,62,.05);font-size:14px;color:#466557}
+.extraction-fact:first-of-type{border-top:1px solid #dbe9e1}
+.fact-head{align-items:flex-start;margin-bottom:10px}
+.fact-label{display:flex;align-items:center;gap:8px;min-width:0}
+.extraction-fact .fact-head b{font-size:13px;font-weight:700;line-height:1.5;color:#2f5c4b}
+.fact-state{padding:3px 7px;border-radius:999px;background:#fff4dc;color:#9a6b2d;font-size:11px;line-height:1.3;white-space:nowrap}
+.confidence-pill{padding:4px 8px;border-radius:999px;font-size:11px;font-weight:650;line-height:1.3;white-space:nowrap}
+.confidence-high{background:#e3f4ea;color:#287957}
+.confidence-medium{background:#fff3d9;color:#9a6b2d}
+.confidence-low{background:#ffebe5;color:#a65347}
+.extraction-fact p{margin:0 0 12px;font-size:15px;line-height:1.8;color:#2f4c40;white-space:pre-wrap;overflow-wrap:anywhere}
+.extraction-fact.fact-empty{background:#fffaf0;border-color:#f0dfbd}
+.extraction-fact.fact-empty p{color:#967445;font-size:14px}
+.fact-evidence{display:grid;gap:5px;padding:10px 11px;border-left:3px solid #b9dccc;border-radius:0 7px 7px 0;background:#f4f9f6}
+.extraction-fact small{display:block;margin:0;color:#617b6d;font-size:12px;line-height:1.65;overflow-wrap:anywhere}
+.extraction-issues{gap:7px;padding:13px 14px;border-color:#efcfc4;background:#fff4f0;color:#985b50;font-size:12px;line-height:1.7;border-radius:9px}
+.extraction-issues b{font-size:13px}
+.empty-extraction{padding:28px 8px;color:#718a7d;font-size:14px;text-align:center}
+.extraction-actions{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:18px;padding-top:16px;border-top:1px solid #d8e8df}
+.extraction-route-note{color:#718a7d;font-size:11px;line-height:1.6}
+.extraction-action-buttons{display:flex;gap:9px;flex-wrap:wrap;justify-content:flex-end}
+.extraction-action-buttons .btn{min-height:36px;padding:8px 13px;font-size:13px}
+
+@media(max-width:900px){
+  .extraction-facts{grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  .transcript-tabs{overflow-x:auto;padding:0 12px;gap:4px}
+  .transcript-tabs .tab{min-height:48px;padding:0 12px;font-size:14px;white-space:nowrap}
+  .dialogue p{font-size:14px;line-height:1.85}
+  .dialogue-meta{font-size:12px}
+  .dialogue-meta time{font-size:11px}
+  .transcript-editor{min-height:300px;font-size:14px;line-height:1.9}
+  .extraction-body{padding:18px 14px}
+  .extraction-header{flex-direction:column;gap:12px}
+  .extraction-status{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
+  .extraction-heading h3{font-size:16px}
+  .extraction-heading p{font-size:12px}
+  .extraction-actions{align-items:stretch;flex-direction:column}
+  .extraction-action-buttons{width:100%;flex-direction:column}
+  .extraction-action-buttons .btn{width:100%;font-size:13px}
+}
+
 /* 导出模板选择与实时预览 */
 .template-picker{display:flex;align-items:center;gap:11px;padding:17px 24px 0;flex-wrap:wrap}
 .template-picker label{font-size:11px;color:#5c7b67;font-weight:600}
@@ -539,3 +620,176 @@ body.modal-open{overflow:hidden}
 .ai-route-readonly{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 12px;border:1px solid #e4eee8;border-radius:7px;background:#fafdfb}
 .ai-settings-view{max-width:900px}.ai-settings-card .card-body{padding:28px}.settings-lead{margin:0 0 20px;color:#70877b;font-size:12px;line-height:1.8}.ai-route-choices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.ai-route-choice{display:flex;align-items:center;gap:10px;padding:16px;border:1px solid #dfeae3;border-radius:8px;color:#5e7d6d;cursor:pointer}.ai-route-choice.active{border-color:#59a68d;background:#f1f9f4;box-shadow:0 0 0 2px #e4f3eb}.ai-route-choice input{accent-color:var(--teal)}.ai-route-choice span{display:grid;gap:5px}.ai-route-choice small{color:#91a49a;font-size:10px}.ai-scope-list{display:flex;gap:18px;flex-wrap:wrap;margin:22px 0;padding:14px 16px;border-radius:7px;background:#f7faf8;color:#6a8878;font-size:11px}.ai-scope-list b{color:#4b6c5b}.ai-capability-grid{display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:16px}.ai-capability-grid>div{display:grid;grid-template-columns:minmax(110px,1fr) repeat(2,minmax(0,1fr));align-items:center;gap:10px;padding:12px 14px;border:1px solid #e4eee8;border-radius:7px}.ai-capability-grid span{font-size:10px;color:#90a39a}.ai-capability-grid span.ok{color:#3d9672}.ai-capability-grid span.bad{color:#bd7968}.ai-capability-grid .capability-heading{border:0;padding:0 14px;color:#4b6c5b}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px}
 @media(max-width:600px){.ai-route-badge{font-size:9px;padding:5px 7px}.ai-route-choices,.ai-capability-grid{grid-template-columns:1fr}.settings-actions{align-items:stretch;flex-direction:column}.settings-actions .btn{width:100%}}
+
+/* 转写阅读样式的最终覆盖，确保旧版响应式规则不会降低可读性。 */
+.transcript-view .transcript-tabs .tab{font-size:14px;min-height:48px}
+.transcript-view .transcript-note{font-size:12px;color:#657c71}
+.transcript-view .transcript-actions .small-muted{font-size:11px;color:#6d8478}
+.transcript-view .transcript-editor{font-size:15px;line-height:2;padding:16px}
+.transcript-view .extraction-body{font-size:14px}
+@media(max-width:760px){
+  .transcript-view .transcript-note{font-size:12px}
+  .transcript-view .transcript-editor{font-size:14px;line-height:1.9}
+  .transcript-view .extraction-fact p{font-size:14px}
+}
+
+/* 信息提取结果：固定标题和操作区，仅让字段内容滚动，避免所有层级挤在同一块。 */
+.extraction-body{
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  padding:0;
+  overflow:hidden;
+  background:#f3faf7;
+}
+.extraction-header{
+  flex:0 0 auto;
+  margin:0;
+  padding:20px 24px 18px;
+  background:#fbfefd;
+  border-bottom:1px solid #d8e8df;
+}
+.extraction-heading{gap:13px}
+.extraction-heading-icon{width:40px;height:40px;flex-basis:40px;border-radius:11px}
+.extraction-heading h3{font-size:18px;line-height:1.45}
+.extraction-heading p{margin-top:6px;font-size:13px;line-height:1.7}
+.extraction-status{align-items:flex-end;gap:7px}
+.extraction-status .badge{padding:6px 11px;font-size:12px}
+.extraction-status .small-muted{font-size:11px}
+.extraction-content{
+  flex:1 1 auto;
+  min-height:0;
+  overflow:auto;
+  padding:20px 24px 24px;
+  overscroll-behavior:contain;
+  scrollbar-width:thin;
+  scrollbar-color:#c9ddd3 transparent;
+}
+.extraction-facts{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(280px,1fr));
+  gap:18px;
+  align-items:stretch;
+}
+.extraction-fact{
+  display:flex;
+  flex-direction:column;
+  min-height:138px;
+  padding:19px 20px 18px;
+  border:1px solid #d7e8df;
+  border-radius:11px;
+  background:#fff;
+  box-shadow:0 2px 8px rgba(36,80,62,.04);
+}
+.extraction-fact.fact-empty{background:#fffaf0;border-color:#eeddbd}
+.fact-head{display:flex;align-items:flex-start;justify-content:space-between;flex:0 0 auto;margin-bottom:13px;gap:12px}
+.fact-label{gap:9px}
+.extraction-fact .fact-head b{font-size:14px;line-height:1.5}
+.fact-state,.confidence-pill{padding:4px 8px;font-size:11px;line-height:1.3}
+.extraction-fact p{
+  flex:0 0 auto;
+  min-height:27px;
+  margin:0 0 14px;
+  font-size:15px;
+  line-height:1.85;
+  color:#294b3d;
+}
+.extraction-fact.fact-empty p{font-size:14px;color:#967445}
+.fact-evidence{
+  margin-top:auto;
+  gap:6px;
+  padding:10px 12px;
+  border-left-width:3px;
+  border-radius:0 7px 7px 0;
+}
+.extraction-fact small{font-size:12px;line-height:1.7}
+.extraction-issues{margin:0;padding:14px 16px;font-size:13px;line-height:1.75}
+.empty-extraction{padding:42px 12px;font-size:14px}
+.extraction-actions{
+  flex:0 0 auto;
+  margin:0;
+  padding:14px 24px 16px;
+  background:#fff;
+  border-top:1px solid #d8e8df;
+}
+.extraction-route-note{font-size:11px}
+.extraction-action-buttons{gap:10px}
+.extraction-action-buttons .btn{min-height:38px;padding:9px 15px;font-size:13px}
+.transcript-view .extraction-body{min-height:0}
+
+@media(max-width:1100px){
+  .extraction-facts{grid-template-columns:1fr;gap:16px}
+}
+@media(max-width:760px){
+  .extraction-header{padding:17px 16px 15px}
+  .extraction-heading-icon{width:36px;height:36px;flex-basis:36px}
+  .extraction-heading h3{font-size:16px}
+  .extraction-heading p{font-size:12px}
+  .extraction-content{padding:16px 14px 20px}
+  .extraction-facts{gap:14px}
+  .extraction-fact{min-height:124px;padding:16px 15px}
+  .extraction-fact .fact-head b{font-size:13px}
+  .extraction-fact p{font-size:14px;line-height:1.8}
+  .extraction-actions{padding:13px 14px 15px}
+}
+
+/* 问诊音频页：按接诊状态切换“操作优先”和“阅读优先”布局。 */
+.main.audio-page .page-heading{margin-bottom:14px}
+.main.audio-page .patient-summary{margin-top:14px;margin-bottom:12px}
+.main.audio-page .steps{padding:12px 18px;margin-bottom:14px}
+.main.audio-page .patient-actions{flex-wrap:wrap}
+.audio-view{min-width:0}
+.audio-view .audio-completed-banner,
+.audio-view .audio-transcription-complete-banner{align-items:center;margin-bottom:14px}
+.audio-view .audio-completed-banner>span,
+.audio-view .audio-transcription-complete-banner>span{flex:1;min-width:0}
+.audio-view .audio-completed-banner .audio-view-result-btn,
+.audio-view .audio-transcription-complete-banner .audio-view-result-btn{margin-left:auto}
+.audio-view .audio-card-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+.audio-view .audio-view-result-btn{min-height:36px;padding:8px 12px;font-size:13px}
+.audio-view>.card{min-width:0}
+.audio-view>.asr-preview-card{display:flex;flex-direction:column;min-height:0}
+.audio-view>.asr-preview-card .asr-preview-body{min-height:0;flex:1 1 auto;overflow-y:auto}
+.audio-view .asr-preview-actions{display:flex;align-items:center;justify-content:space-between;gap:14px;flex:0 0 auto;padding:12px 18px 14px;border-top:1px solid var(--line);background:#fff;color:#718a7d;font-size:11px;line-height:1.6}
+.audio-view .asr-preview-actions .audio-view-result-btn{flex:0 0 auto}
+.full-view.audio-view.audio-view-completed>.card{min-height:0}
+.audio-view-active.audio-view-asr-empty>.asr-preview-card,
+.audio-view-waiting.audio-view-asr-empty>.asr-preview-card{max-height:150px}
+.audio-view-active.audio-view-asr-empty>.asr-preview-card .asr-preview-body,
+.audio-view-waiting.audio-view-asr-empty>.asr-preview-card .asr-preview-body{max-height:none}
+.audio-view-active.audio-view-asr-empty>.asr-preview-card .asr-preview-body>.transcript-note,
+.audio-view-waiting.audio-view-asr-empty>.asr-preview-card .asr-preview-body>.transcript-note{display:none}
+.audio-view-active.audio-view-asr-empty>.asr-preview-card .asr-preview-body,
+.audio-view-waiting.audio-view-asr-empty>.asr-preview-card .asr-preview-body{padding:10px 14px 12px}
+.audio-view-active.audio-view-asr-empty .asr-preview-empty,
+.audio-view-waiting.audio-view-asr-empty .asr-preview-empty{min-height:66px;padding:12px;font-size:12px}
+
+@media(min-width:1400px){
+  .main.audio-page .patient-summary{margin-top:10px;margin-bottom:10px}
+  .main.audio-page .steps{padding-top:10px;padding-bottom:10px;margin-bottom:12px}
+  .full-view.audio-view.audio-view-completed{display:grid;grid-template-columns:minmax(320px,.72fr) minmax(440px,1.28fr);gap:18px;align-items:start}
+  .full-view.audio-view.audio-view-completed>.card{min-height:0;margin-bottom:0}
+  .full-view.audio-view.audio-view-completed>section.card>.card-body{padding:16px 20px 20px;min-height:0}
+  .full-view.audio-view.audio-view-completed>.asr-preview-card{height:clamp(240px,36vh,320px);max-height:320px;min-height:240px;margin-bottom:0}
+  .full-view.audio-view.audio-view-completed>.asr-preview-card .asr-preview-body{max-height:none}
+}
+
+@media(max-width:1399px){
+  .audio-view-completed>.asr-preview-card{max-height:320px}
+}
+
+@media(max-width:760px){
+  .main.audio-page .page-heading{margin-bottom:11px}
+  .main.audio-page .patient-summary{margin-top:12px;margin-bottom:10px}
+  .main.audio-page .steps{padding:11px 8px;margin-bottom:11px}
+  .audio-view .card-head{align-items:flex-start}
+  .audio-view .audio-completed-banner,
+  .audio-view .audio-transcription-complete-banner{align-items:flex-start;flex-wrap:wrap}
+  .audio-view .audio-completed-banner .audio-view-result-btn,
+  .audio-view .audio-transcription-complete-banner .audio-view-result-btn{width:calc(100% - 24px);margin-left:24px}
+  .audio-view .audio-card-head-actions{align-items:flex-end;gap:6px}
+  .audio-view .audio-view-result-btn{min-height:44px;padding:9px 11px;font-size:12px}
+  .audio-view .asr-preview-actions{align-items:stretch;flex-direction:column;gap:9px;padding:12px 14px 14px}
+  .audio-view .asr-preview-actions .audio-view-result-btn{width:100%;min-height:44px}
+  .audio-view-completed>.asr-preview-card{max-height:320px;min-height:220px}
+}

@@ -518,6 +518,7 @@ const completed = computed(() => currentVisit.value?.status === 'COMPLETED')
 const waiting = computed(() => !currentVisit.value || currentVisit.value.status === 'WAITING')
 const active = computed(() => currentVisit.value?.status === 'ACTIVE')
 const allTranscribed = computed(() => recordings.value.length > 0 && recordings.value.every(r => r.status === 'DONE'))
+const hasAsrPreviewContent = computed(() => asrPreviews.value.some(preview => Array.isArray(preview.segments) && preview.segments.length > 0))
 const confirmed = computed(() => !!record.value?.confirmed)
 const exported = computed(() => !!record.value && exports.value.some(item =>
   item.version_no === record.value?.version_no && item.status === 'SUCCEEDED'))
@@ -1132,6 +1133,11 @@ function navigate(next: MainView) {
     }
   }
   window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function openTranscriptResult() {
+  transcriptTab.value = 'dialogue'
+  navigate('transcript')
 }
 
 function showWorkflowStep() {
@@ -2406,7 +2412,7 @@ defineExpose({ selectPatient })
       </div>
     </header>
 
-    <main class="main" :class="{ 'transcript-page': view === 'transcript' }">
+    <main class="main" :class="{ 'transcript-page': view === 'transcript', 'audio-page': view === 'audio' }">
       <div class="page-heading">
         <div>
           <div class="eyebrow"><i class="dot green"></i> CLINICAL WORKSPACE</div>
@@ -2512,9 +2518,11 @@ defineExpose({ selectPatient })
         </div>
         <div v-if="readOnlyCurrentPatient" class="patient-actions read-only-actions">
            <span class="read-only-note"><Icon name="lock" />科室长只读查看接诊详情，接诊医生：{{ currentVisit?.doctor_name || '—' }}</span>
+            <button v-if="allTranscribed && view !== 'transcript'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
            <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
         </div>
         <div v-else class="patient-actions">
+           <button v-if="allTranscribed && view !== 'transcript'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
           <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
           <template v-else-if="!closed">
@@ -2671,7 +2679,7 @@ defineExpose({ selectPatient })
            <div class="transcript-tabs">
                 <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
                 <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
-                <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
+                <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取结果</button>
               </div>
               <div v-if="transcriptTab === 'dialogue'" class="transcript-body">
                 <div class="transcript-note"><Icon name="info" />真实 ASR 转写结果 · 请核对后采用</div>
@@ -2683,26 +2691,37 @@ defineExpose({ selectPatient })
                   </div>
                 </div>
               </div>
-              <div v-else-if="transcriptTab === 'edit'" class="card-body">
+              <div v-else-if="transcriptTab === 'edit'" class="card-body transcript-edit-body">
                 <label for="transcript-edit" class="transcript-note">核对转写文字；修改后需重新生成并确认病历</label>
                 <textarea id="transcript-edit" v-model="transcriptDraft" class="transcript-editor" :disabled="locked"></textarea>
               </div>
               <div v-else class="transcript-body extraction-body">
-                <div class="transcript-note"><Icon name="shield" />仅展示可追溯的原文事实；未确认内容不能生成病历。</div>
-                <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
-                <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
-                <template v-else-if="extractionFacts.length">
-                  <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact">
-                    <div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div>
-                    <p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p>
-                    <small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small>
+                <div class="extraction-header">
+                  <div class="extraction-heading">
+                    <span class="extraction-heading-icon"><Icon name="shield" /></span>
+                    <div><h3>信息提取结果</h3><p>请核对每项内容及其原文依据，确认后才能生成病历。</p></div>
                   </div>
-                </template>
-                <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-             <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions">
-                  <span class="small-muted">{{ currentAiRouteDescription }} · 信息提取</span>
-                   <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button>
-                  <button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
+                  <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
+                </div>
+                <div class="extraction-content">
+                  <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
+                  <template v-else-if="extractionFacts.length">
+                    <div class="extraction-facts">
+                      <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact" :class="{ 'fact-empty': !item.fact.value }">
+                        <div class="fact-head"><div class="fact-label"><b>{{ item.label }}</b><span v-if="!item.fact.value" class="fact-state">待补充</span></div><span v-if="item.fact.value && item.fact.confidence != null" class="confidence-pill" :class="{ 'confidence-high': item.fact.confidence >= 90, 'confidence-medium': item.fact.confidence >= 70 && item.fact.confidence < 90, 'confidence-low': item.fact.confidence < 70 }">置信度 {{ item.fact.confidence }}%</span></div>
+                        <p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p>
+                        <div v-if="item.fact.evidence && item.fact.evidence.length" class="fact-evidence"><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
+                      </div>
+                    </div>
+                  </template>
+                  <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
+                </div>
+                <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions">
+                  <span class="extraction-route-note">{{ currentAiRouteDescription }} · 信息提取</span>
+                  <div class="extraction-action-buttons">
+                    <button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button>
+                    <button v-else-if="extraction?.status === 'GENERATED'" class="btn primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button>
+                  </div>
                 </div>
               </div>
               <div class="transcript-actions">
@@ -2774,9 +2793,20 @@ defineExpose({ selectPatient })
         </section>
       </div>
 
-      <div v-else-if="view === 'audio'" class="full-view">
+      <div v-else-if="view === 'audio'" class="full-view audio-view" :class="{
+        'audio-view-waiting': waiting,
+        'audio-view-active': active,
+        'audio-view-completed': completed,
+        'audio-view-asr-empty': !hasAsrPreviewContent && !asrPreviewError
+      }">
         <section class="card">
-          <div class="card-head"><h2><Icon name="mic" />问诊录音</h2><span class="small-muted">{{ String(recordings.length).padStart(2, '0') }} 段录音</span></div>
+          <div class="card-head">
+            <h2><Icon name="mic" />问诊录音</h2>
+            <div class="audio-card-head-actions">
+              <span class="small-muted">{{ String(recordings.length).padStart(2, '0') }} 段录音</span>
+              <button v-if="allTranscribed || completed" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
+            </div>
+          </div>
           <div class="card-body">
             <div v-if="waiting" class="step-guard">
               <div class="empty-icon"><Icon name="mic" /></div>
@@ -2832,6 +2862,11 @@ defineExpose({ selectPatient })
               </div>
               <div class="upload-footer"><span>完整录音上传后，点击“开始转写”</span></div>
               </template>
+              <div v-if="allTranscribed" class="info-banner audio-transcription-complete-banner">
+                <Icon name="check" />
+                <span>录音已全部转写完成，可直接查看医患对话和转写结果。</span>
+                <button class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
+              </div>
               <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
@@ -2876,7 +2911,11 @@ defineExpose({ selectPatient })
               </div>
             </template>
             <template v-else-if="completed">
-              <div class="info-banner"><Icon name="lock" />本次接诊已完成，以下录音仅供查看和播放，不能再上传或转写。</div>
+              <div class="info-banner audio-completed-banner">
+                <Icon name="lock" />
+                <span>本次接诊已完成，以下录音仅供查看和播放，不能再上传或转写。</span>
+                <button class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
+              </div>
               <div v-if="!recordings.length" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>没有保留的录音</h3><p>该已完成接诊未找到录音记录。</p></div>
               <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
@@ -2923,7 +2962,12 @@ defineExpose({ selectPatient })
             </div>
           </div>
         </section>
-        <AsrPreviewCard :previews="asrPreviews" :error="asrPreviewError" />
+        <AsrPreviewCard
+          :previews="asrPreviews"
+          :error="asrPreviewError"
+          :show-view-action="completed || (allTranscribed && hasAsrPreviewContent)"
+          @view-transcript="openTranscriptResult"
+        />
       </div>
 
       <div v-else-if="view === 'transcript'" class="full-view transcript-view">
@@ -2939,7 +2983,7 @@ defineExpose({ selectPatient })
           <div class="transcript-tabs">
             <button class="tab" :class="{ active: transcriptTab === 'dialogue' }" @click="transcriptTab='dialogue'">医患对话</button>
             <button class="tab" :class="{ active: transcriptTab === 'edit' }" @click="transcriptTab='edit'">全文编辑</button>
-            <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取</button>
+            <button class="tab" :class="{ active: transcriptTab === 'facts' }" @click="transcriptTab='facts'">信息提取结果</button>
           </div>
           <div v-if="transcriptTab === 'dialogue'" class="transcript-dialogue-layout">
             <div ref="transcriptBody" class="transcript-body">
@@ -2960,19 +3004,28 @@ defineExpose({ selectPatient })
               @retry="generateClinicalExtraction" @review="openRoleReview" @details="transcriptTab = 'facts'"
               @confirm="confirmClinicalExtraction" />
           </div>
-          <div v-else-if="transcriptTab === 'edit'" class="card-body">
+          <div v-else-if="transcriptTab === 'edit'" class="card-body transcript-edit-body">
             <label for="transcript-edit" class="transcript-note">核对转写文字；修改后需重新生成并确认病历</label>
             <textarea id="transcript-edit" v-model="transcriptDraft" class="transcript-editor" :disabled="locked"></textarea>
           </div>
           <div v-else class="transcript-body extraction-body">
-            <div class="transcript-note"><Icon name="shield" />仅展示可追溯的原文事实；未确认内容不能生成病历。</div>
-            <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
-            <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
-            <template v-else-if="extractionFacts.length">
-              <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact"><div class="fact-head"><b>{{ item.label }}</b><span v-if="item.fact.value && item.fact.confidence != null">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div>
-            </template>
-            <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
-             <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span class="small-muted">{{ currentAiRouteDescription }} · 信息提取</span><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn small soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn small primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div>
+            <div class="extraction-header">
+              <div class="extraction-heading">
+                <span class="extraction-heading-icon"><Icon name="shield" /></span>
+                <div><h3>信息提取结果</h3><p>请核对每项内容及其原文依据，确认后才能生成病历。</p></div>
+              </div>
+              <div class="extraction-status"><span class="badge" :class="{ teal: extractionConfirmed, amber: !extractionConfirmed }">{{ extractionStatusText }}</span><span v-if="extraction?.version_no" class="small-muted">提取版本 v{{ extraction.version_no }}</span></div>
+            </div>
+            <div class="extraction-content">
+              <div v-if="extraction?.quality_issues.length" class="extraction-issues"><b>需要处理</b><span v-for="issue in extraction.quality_issues" :key="issue">{{ issue }}</span></div>
+              <template v-else-if="extractionFacts.length">
+                <div class="extraction-facts">
+                  <div v-for="item in extractionFacts" :key="item.key" class="source-fact extraction-fact" :class="{ 'fact-empty': !item.fact.value }"><div class="fact-head"><div class="fact-label"><b>{{ item.label }}</b><span v-if="!item.fact.value" class="fact-state">待补充</span></div><span v-if="item.fact.value && item.fact.confidence != null" class="confidence-pill" :class="{ 'confidence-high': item.fact.confidence >= 90, 'confidence-medium': item.fact.confidence >= 70 && item.fact.confidence < 90, 'confidence-low': item.fact.confidence < 70 }">置信度 {{ item.fact.confidence }}%</span></div><p>{{ item.fact.value || '未从当前对话提取到明确事实' }}</p><div v-if="item.fact.evidence && item.fact.evidence.length" class="fact-evidence"><small v-for="evidence in item.fact.evidence" :key="`${evidence.turn_index}-${evidence.quote}`">{{ evidence.role === 'DOCTOR' ? '医生' : '患者' }} · {{ formatTime(evidence.start_ms) }} · “{{ evidence.quote }}”</small></div></div>
+                </div>
+              </template>
+              <div v-else class="empty-extraction">当前快照尚未生成结构化提取结果。</div>
+            </div>
+            <div v-if="!readOnlyCurrentPatient && !locked" class="extraction-actions"><span class="extraction-route-note">{{ currentAiRouteDescription }} · 信息提取</span><div class="extraction-action-buttons"><button v-if="extraction?.status !== 'GENERATED' && !extractionConfirmed" class="btn soft" :disabled="extractionRunning || !allTranscribed || !!unclassifiedRoleCount" @click="generateClinicalExtraction"><Icon name="sparkle" />{{ extractionRunning ? '正在提取' : extraction?.status === 'STALE' ? '重新提取' : extraction?.status === 'FAILED' ? '重试提取' : '生成信息提取' }}</button><button v-else-if="extraction?.status === 'GENERATED'" class="btn primary" :disabled="actionBusy === 'confirm-extraction'" @click="confirmClinicalExtraction"><Icon name="check" />{{ actionBusy === 'confirm-extraction' ? '正在确认' : '整体确认提取结果' }}</button></div></div>
           </div>
           <div class="transcript-actions"><span class="small-muted">{{ transcriptDraft.length }} 字 · {{ recordings.filter(item => item.status === 'DONE').length }} 段录音</span>
             <button v-if="!readOnlyCurrentPatient && transcriptTab === 'edit'" class="btn small soft" :disabled="locked" @click="saveTranscript"><Icon name="save" />保存转写</button>
