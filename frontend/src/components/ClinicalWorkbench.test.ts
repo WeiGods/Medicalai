@@ -540,6 +540,8 @@ describe('ASR raw preview', () => {
 
     expect(wrapper.find('.audio-view.audio-view-active').exists()).toBe(true)
     expect(wrapper.find('.audio-source-grid').exists()).toBe(true)
+    expect(wrapper.find('.audio-view-active > .asr-preview-card').exists()).toBe(true)
+    expect(wrapper.find('.audio-recordings-list').exists()).toBe(true)
     expect(wrapper.find('.audio-view-asr-empty').exists()).toBe(true)
     expect(wrapper.get('.asr-preview-empty').text()).toContain('完成录音转写后，ASR 原文将在此显示')
     expect(wrapper.find('.transcribe-action button').exists()).toBe(true)
@@ -599,11 +601,39 @@ describe('ASR raw preview', () => {
     await wrapper.get('.step:nth-child(2)').trigger('click')
 
     expect(wrapper.find('.audio-view.audio-view-completed').exists()).toBe(true)
+    expect(wrapper.find('.audio-operation-card').exists()).toBe(true)
+    expect(wrapper.find('.audio-view-completed .audio-recordings-list').exists()).toBe(true)
     expect(wrapper.find('.audio-view-completed > .asr-preview-card').exists()).toBe(true)
+    expect(wrapper.findAll('.audio-view-completed .audio-view-result-btn')).toHaveLength(1)
     expect(wrapper.get('.audio-view-completed .audio-card-head-actions button').text()).toContain('查看转写结果')
-    expect(wrapper.get('.asr-preview-actions button').text()).toContain('查看转写结果')
+    expect(wrapper.find('.audio-view-completed .asr-preview-actions').exists()).toBe(false)
 
     await wrapper.get('.audio-view-completed .audio-card-head-actions button').trigger('click')
+    expect(wrapper.find('.transcript-view').exists()).toBe(true)
+    expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
+    wrapper.unmount()
+  })
+
+  it('opens the dialogue shortcut from a later active workflow step', async () => {
+    const draftRecord = record(true, false)
+    const wrapper = await mountWorkbench({ record: draftRecord })
+
+    expect(wrapper.find('.record-card').exists()).toBe(true)
+    const shortcut = wrapper.get('.patient-summary .audio-view-result-btn')
+    await shortcut.trigger('click')
+
+    expect(wrapper.find('.transcript-view').exists()).toBe(true)
+    expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' })
+    wrapper.unmount()
+  })
+
+  it('allows the transcript workflow step to review completed audio from a later step', async () => {
+    const draftRecord = record(true, false)
+    const wrapper = await mountWorkbench({ record: draftRecord })
+
+    await wrapper.get('.step:nth-child(3)').trigger('click')
+
     expect(wrapper.find('.transcript-view').exists()).toBe(true)
     expect(wrapper.get('.transcript-tabs button.active').text()).toBe('医患对话')
     wrapper.unmount()

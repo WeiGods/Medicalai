@@ -1125,7 +1125,8 @@ function navigate(next: MainView) {
     const reviewingSignedRecord = requested === 'record' && current === 'export' && !!record.value?.record_id
     const returningToAudio = requested === 'audio' && current === 'transcript'
       && view.value === 'transcript' && active.value && !locked.value
-    if (sameStep || reviewingSignedRecord || returningToAudio) view.value = requested
+    const reviewingTranscript = requested === 'transcript' && allTranscribed.value
+    if (sameStep || reviewingSignedRecord || returningToAudio || reviewingTranscript) view.value = requested
     else {
       view.value = current
       toast(transcriptionProgressMessage() || '请按当前接诊流程完成本步骤后再继续。')
@@ -1137,7 +1138,12 @@ function navigate(next: MainView) {
 
 function openTranscriptResult() {
   transcriptTab.value = 'dialogue'
-  navigate('transcript')
+  // 快捷入口用于查看已有转写结果，不应被“当前业务步骤”守卫拦截。
+  // 业务流程按钮仍继续通过 navigate() 校验，避免改变录音、病历和导出流程。
+  if (view.value !== 'transcript') {
+    view.value = 'transcript'
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 }
 
 function showWorkflowStep() {
@@ -2518,11 +2524,11 @@ defineExpose({ selectPatient })
         </div>
         <div v-if="readOnlyCurrentPatient" class="patient-actions read-only-actions">
            <span class="read-only-note"><Icon name="lock" />科室长只读查看接诊详情，接诊医生：{{ currentVisit?.doctor_name || '—' }}</span>
-            <button v-if="allTranscribed && view !== 'transcript'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
+            <button v-if="(allTranscribed || completed) && view !== 'transcript' && view !== 'audio'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
            <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
         </div>
         <div v-else class="patient-actions">
-           <button v-if="allTranscribed && view !== 'transcript'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
+           <button v-if="(allTranscribed || completed) && view !== 'transcript' && view !== 'audio'" class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
           <button v-if="departmentHead && currentPatient" class="btn danger" :disabled="busy || !!actionBusy" @click="modalError=''; deletePatientChecked=false; modal='delete-patient'"><Icon name="trash" />删除患者</button>
           <button v-if="waiting" class="btn primary" :disabled="busy" @click="startVisit"><Icon name="play" />开始接诊</button>
           <template v-else-if="!closed">
@@ -2799,7 +2805,7 @@ defineExpose({ selectPatient })
         'audio-view-completed': completed,
         'audio-view-asr-empty': !hasAsrPreviewContent && !asrPreviewError
       }">
-        <section class="card">
+        <section class="card audio-operation-card">
           <div class="card-head">
             <h2><Icon name="mic" />问诊录音</h2>
             <div class="audio-card-head-actions">
@@ -2862,12 +2868,12 @@ defineExpose({ selectPatient })
               </div>
               <div class="upload-footer"><span>完整录音上传后，点击“开始转写”</span></div>
               </template>
-              <div v-if="allTranscribed" class="info-banner audio-transcription-complete-banner">
-                <Icon name="check" />
-                <span>录音已全部转写完成，可直接查看医患对话和转写结果。</span>
-                <button class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
-              </div>
-              <div v-for="item in recordings" :key="item.id" class="audio-item">
+              <div class="audio-recordings-list">
+                <div v-if="allTranscribed" class="info-banner audio-transcription-complete-banner">
+                  <Icon name="check" />
+                  <span>录音已全部转写完成，可直接查看医患对话和转写结果。</span>
+                </div>
+                <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
@@ -2908,16 +2914,17 @@ defineExpose({ selectPatient })
                     <button class="btn soft" :disabled="locked" @click="requestTranscription"><Icon name="sparkle" />{{ recordings.some(recording => recording.status === 'FAILED') ? '重试转写' : '开始转写' }}</button>
                   </div>
                 </div>
+                </div>
               </div>
             </template>
             <template v-else-if="completed">
-              <div class="info-banner audio-completed-banner">
-                <Icon name="lock" />
-                <span>本次接诊已完成，以下录音仅供查看和播放，不能再上传或转写。</span>
-                <button class="btn primary audio-view-result-btn" @click="openTranscriptResult"><Icon name="text" />查看转写结果</button>
-              </div>
-              <div v-if="!recordings.length" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>没有保留的录音</h3><p>该已完成接诊未找到录音记录。</p></div>
-              <div v-for="item in recordings" :key="item.id" class="audio-item">
+              <div class="audio-recordings-list">
+                <div class="info-banner audio-completed-banner">
+                  <Icon name="lock" />
+                  <span>本次接诊已完成，以下录音仅供查看和播放，不能再上传或转写。</span>
+                </div>
+                <div v-if="!recordings.length" class="empty-state"><div class="empty-icon"><Icon name="mic" /></div><h3>没有保留的录音</h3><p>该已完成接诊未找到录音记录。</p></div>
+                <div v-for="item in recordings" :key="item.id" class="audio-item">
                 <div class="audio-info">
                   <div class="file-icon"><Icon name="file" /></div>
                   <div><div class="audio-name">{{ item.file_name }}</div><div class="audio-meta">{{ formatBytes(item.size_bytes) }} · {{ formatDuration(item.duration_ms) }}</div></div>
@@ -2951,6 +2958,7 @@ defineExpose({ selectPatient })
                   @ended="onAudioEnded"
                   @media-error="onAudioMediaError"
                 />
+                </div>
               </div>
             </template>
             <div v-else class="step-guard archived">
@@ -2965,7 +2973,7 @@ defineExpose({ selectPatient })
         <AsrPreviewCard
           :previews="asrPreviews"
           :error="asrPreviewError"
-          :show-view-action="completed || (allTranscribed && hasAsrPreviewContent)"
+          :show-view-action="false"
           @view-transcript="openTranscriptResult"
         />
       </div>

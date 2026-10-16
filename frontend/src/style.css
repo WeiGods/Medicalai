@@ -733,7 +733,7 @@ body.modal-open{overflow:hidden}
   .extraction-actions{padding:13px 14px 15px}
 }
 
-/* 问诊音频页：按接诊状态切换“操作优先”和“阅读优先”布局。 */
+/* 问诊音频页：录音操作与原文阅读分栏，避免 ASR 被长录音列表推到页面底部。 */
 .main.audio-page .page-heading{margin-bottom:14px}
 .main.audio-page .patient-summary{margin-top:14px;margin-bottom:12px}
 .main.audio-page .steps{padding:12px 18px;margin-bottom:14px}
@@ -746,13 +746,17 @@ body.modal-open{overflow:hidden}
 .audio-view .audio-completed-banner .audio-view-result-btn,
 .audio-view .audio-transcription-complete-banner .audio-view-result-btn{margin-left:auto}
 .audio-view .audio-card-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap}
-.audio-view .audio-view-result-btn{min-height:36px;padding:8px 12px;font-size:13px}
+.audio-view-result-btn{min-height:36px;padding:8px 12px;font-size:13px}
 .audio-view>.card{min-width:0}
+.audio-view>.audio-operation-card{min-height:0}
+.audio-view>.audio-operation-card>.card-body{min-height:0}
 .audio-view>.asr-preview-card{display:flex;flex-direction:column;min-height:0}
-.audio-view>.asr-preview-card .asr-preview-body{min-height:0;flex:1 1 auto;overflow-y:auto}
+.audio-view>.asr-preview-card .asr-preview-body{min-height:0;max-height:none;flex:1 1 auto;overflow-y:auto}
 .audio-view .asr-preview-actions{display:flex;align-items:center;justify-content:space-between;gap:14px;flex:0 0 auto;padding:12px 18px 14px;border-top:1px solid var(--line);background:#fff;color:#718a7d;font-size:11px;line-height:1.6}
 .audio-view .asr-preview-actions .audio-view-result-btn{flex:0 0 auto}
-.full-view.audio-view.audio-view-completed>.card{min-height:0}
+.audio-view .audio-recordings-list{min-width:0}
+.audio-view-active .audio-recordings-list,
+.audio-view-completed .audio-recordings-list{scrollbar-width:thin;scrollbar-color:#dce9e1 transparent;overscroll-behavior:contain}
 .audio-view-active.audio-view-asr-empty>.asr-preview-card,
 .audio-view-waiting.audio-view-asr-empty>.asr-preview-card{max-height:150px}
 .audio-view-active.audio-view-asr-empty>.asr-preview-card .asr-preview-body,
@@ -767,15 +771,81 @@ body.modal-open{overflow:hidden}
 @media(min-width:1400px){
   .main.audio-page .patient-summary{margin-top:10px;margin-bottom:10px}
   .main.audio-page .steps{padding-top:10px;padding-bottom:10px;margin-bottom:12px}
-  .full-view.audio-view.audio-view-completed{display:grid;grid-template-columns:minmax(320px,.72fr) minmax(440px,1.28fr);gap:18px;align-items:start}
-  .full-view.audio-view.audio-view-completed>.card{min-height:0;margin-bottom:0}
-  .full-view.audio-view.audio-view-completed>section.card>.card-body{padding:16px 20px 20px;min-height:0}
-  .full-view.audio-view.audio-view-completed>.asr-preview-card{height:clamp(240px,36vh,320px);max-height:320px;min-height:240px;margin-bottom:0}
-  .full-view.audio-view.audio-view-completed>.asr-preview-card .asr-preview-body{max-height:none}
+  .full-view.audio-view.audio-view-active,
+  .full-view.audio-view.audio-view-completed{
+    display:grid;
+    grid-template-columns:minmax(380px,.82fr) minmax(520px,1.18fr);
+    height:clamp(430px,46vh,540px);
+    gap:18px;
+    align-items:stretch;
+  }
+  .full-view.audio-view.audio-view-active>.audio-operation-card,
+  .full-view.audio-view.audio-view-completed>.audio-operation-card{
+    display:flex;
+    flex-direction:column;
+    height:100%;
+    margin-bottom:0;
+    overflow:hidden;
+  }
+  .full-view.audio-view.audio-view-active>.audio-operation-card>.card-body,
+  .full-view.audio-view.audio-view-completed>.audio-operation-card>.card-body{
+    display:flex;
+    flex-direction:column;
+    flex:1 1 auto;
+    min-height:0;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+    scrollbar-width:thin;
+    scrollbar-color:#dce9e1 transparent;
+    padding:16px 20px 20px;
+  }
+  .full-view.audio-view.audio-view-active>.asr-preview-card,
+  .full-view.audio-view.audio-view-completed>.asr-preview-card{
+    align-self:stretch;
+    height:100%;
+    min-height:0;
+    max-height:none;
+    margin-bottom:0;
+  }
+  .full-view.audio-view.audio-view-active.audio-view-asr-empty>.asr-preview-card{
+    align-self:start;
+    height:auto;
+    min-height:0;
+    max-height:150px;
+  }
+  .full-view.audio-view.audio-view-active .audio-recordings-list{
+    max-height:none;
+    overflow:visible;
+  }
+  .full-view.audio-view.audio-view-completed .audio-recordings-list{
+    max-height:none;
+    overflow:visible;
+  }
+  .full-view.audio-view.audio-view-active .audio-route-note{margin-bottom:12px}
+  .full-view.audio-view.audio-view-active .audio-source-grid{gap:14px}
+  .full-view.audio-view.audio-view-active .upload-method,
+  .full-view.audio-view.audio-view-active .recorder-card{padding:14px}
+  .full-view.audio-view.audio-view-active .method-heading{margin-bottom:10px}
+  .full-view.audio-view.audio-view-active .compact-dropzone,
+  .full-view.audio-view.audio-view-active .recorder-live{
+    min-height:138px;
+    padding:14px 10px;
+  }
+  .full-view.audio-view.audio-view-active .upload-footer{margin-top:8px}
 }
 
 @media(max-width:1399px){
-  .audio-view-completed>.asr-preview-card{max-height:320px}
+  .full-view.audio-view.audio-view-active,
+  .full-view.audio-view.audio-view-completed,
+  .full-view.audio-view.audio-view-waiting{
+    display:flex;
+    flex-direction:column;
+    gap:14px;
+  }
+  .full-view.audio-view.audio-view-active>.asr-preview-card,
+  .full-view.audio-view.audio-view-completed>.asr-preview-card{order:-1}
+  .audio-view-completed>.asr-preview-card{height:clamp(360px,58vh,560px);min-height:360px;max-height:none}
+  .audio-view-active:not(.audio-view-asr-empty)>.asr-preview-card{height:clamp(360px,58vh,560px);min-height:360px;max-height:none}
 }
 
 @media(max-width:760px){
@@ -788,8 +858,86 @@ body.modal-open{overflow:hidden}
   .audio-view .audio-completed-banner .audio-view-result-btn,
   .audio-view .audio-transcription-complete-banner .audio-view-result-btn{width:calc(100% - 24px);margin-left:24px}
   .audio-view .audio-card-head-actions{align-items:flex-end;gap:6px}
+  .main .patient-actions{width:100%;margin-left:0;flex-wrap:wrap;justify-content:flex-end}
+  .main .patient-actions .read-only-note{flex:1 1 100%}
+  .main .patient-actions .audio-view-result-btn{flex:1 1 100%;width:100%;min-height:44px}
   .audio-view .audio-view-result-btn{min-height:44px;padding:9px 11px;font-size:12px}
+  .audio-view .audio-info{flex-wrap:wrap;row-gap:8px}
+  .audio-view .audio-info>.btn{flex:1 1 auto;min-height:44px;margin-top:0}
+  .audio-view .transcribe-action .btn{min-height:44px}
   .audio-view .asr-preview-actions{align-items:stretch;flex-direction:column;gap:9px;padding:12px 14px 14px}
   .audio-view .asr-preview-actions .audio-view-result-btn{width:100%;min-height:44px}
-  .audio-view-completed>.asr-preview-card{max-height:320px;min-height:220px}
+  .audio-view-completed>.asr-preview-card,
+  .audio-view-active:not(.audio-view-asr-empty)>.asr-preview-card{height:clamp(300px,48vh,420px);min-height:300px}
+  .full-view.audio-view.audio-view-active .compact-dropzone,
+  .full-view.audio-view.audio-view-active .recorder-live{min-height:150px}
+}
+
+/* 桌面端问诊页与左侧“今日接诊”共用同一网格高度，避免右侧工作区提前结束。 */
+@media(min-width:1400px){
+  .main.audio-page{
+    display:grid;
+    grid-template-columns:280px minmax(0,1fr);
+    grid-template-rows:auto auto auto auto minmax(0,1fr);
+    column-gap:18px;
+    height:calc(100vh / var(--desktop-ui-scale) - 77px);
+    min-height:0;
+    padding-bottom:80px;
+    overflow:hidden;
+  }
+  .main.audio-page>.page-heading{grid-column:1/-1;grid-row:1}
+  .main.audio-page>.queue{
+    float:none;
+    grid-column:1;
+    grid-row:2/6;
+    display:flex;
+    flex-direction:column;
+    min-height:0;
+    margin:0;
+  }
+  .main.audio-page>.queue .queue-head{flex:0 0 auto}
+  .main.audio-page>.queue .queue-cards{
+    flex:1 1 0;
+    min-height:0;
+    max-height:none;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+  }
+  .main.audio-page>.queue .queue-load-more{flex:0 0 auto}
+  .main.audio-page>.patient-summary{
+    grid-column:2;
+    grid-row:2;
+    min-width:0;
+    max-width:none;
+    margin:0 0 12px;
+  }
+  .main.audio-page>.steps{
+    grid-column:2;
+    grid-row:3;
+    min-width:0;
+    max-width:none;
+    margin:0 0 12px;
+  }
+  .main.audio-page>.transcript-notices{
+    grid-column:2;
+    grid-row:4;
+    min-height:0;
+  }
+  .main.audio-page>.transcript-notices:empty{display:none}
+  .main.audio-page>.transcript-notices>.info-banner{margin:0 0 10px}
+  .main.audio-page>.audio-view{
+    grid-column:2;
+    grid-row:5;
+    width:auto;
+    max-width:none;
+    min-width:0;
+    min-height:0;
+    height:100%;
+    margin:0;
+  }
+  .main.audio-page>.audio-view.audio-view-active,
+  .main.audio-page>.audio-view.audio-view-completed{
+    height:100%;
+    min-height:0;
+  }
 }
